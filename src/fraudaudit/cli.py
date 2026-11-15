@@ -4,6 +4,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from fraudaudit import __version__
@@ -32,6 +33,15 @@ def build_parser() -> argparse.ArgumentParser:
     skew.add_argument("--seed", type=int, default=42)
     skew.add_argument("--atol", type=float, default=1e-4, help="tolerance of the mean_amt_* columns only")
     skew.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+
+    audit = sub.add_parser("audit", help="episode audit: VER of normal fraud vs VER under attack")
+    audit.add_argument("--data", type=Path, default=Path("data"))
+    audit.add_argument("--model", type=Path, default=Path("models"), help="artifact directory")
+    audit.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
+    audit.add_argument("--attack", choices=["random"], default="random")
+    audit.add_argument("--out", type=Path, default=Path("out"), help="writes audit.json and summary.md")
+    audit.add_argument("--seed", type=int, default=42)
+    audit.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -94,6 +104,33 @@ def cmd_skew(args: argparse.Namespace) -> int:
         with open(summary, "a", encoding="utf-8") as f:
             f.write(summary_markdown(rep, args.atol))
     return 0 if rep.passed else 1
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    from fraudaudit.attacks.random_search import RandomSearch
+    from fraudaudit.audit import run_audit, write_outputs
+    from fraudaudit.data import load_raw
+    from fraudaudit.model.artifacts import load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.threat import MerchantTable, ThreatModel
+
+    attacks = {"random": RandomSearch}
+    t0 = time.perf_counter()
+    tm = ThreatModel.from_yaml(args.threat)
+    df = load_raw(args.data)
+    model = FraudModel.from_artifacts(load_artifacts(args.model))
+    result = run_audit(df, model, tm, attacks[args.attack](), seed=args.seed, n_jobs=args.n_jobs,
+                       model_dir=args.model, threat_path=args.threat)
+    result.meta["wall_seconds_with_loading"] = round(time.perf_counter() - t0, 1)  # + load_raw, model load
+    data = write_outputs(result, args.out, MerchantTable.from_df(df))
+    print(json.dumps({k: data[k] for k in ("ver_clean", "ver_adv", "asr", "asr_upper", "n_targets",
+                                           "recon_ops", "feasible_share")}
+                     | {"wall_seconds": result.meta["wall_seconds"], "out": str(args.out)}, indent=2), flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write((args.out / "summary.md").read_text(encoding="utf-8"))
+    return 0
 
 
 def cmd_decide(args: argparse.Namespace) -> int:
@@ -163,6 +200,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train(args)
     if args.command == "skew":
         return cmd_skew(args)
+    if args.command == "audit":
+        return cmd_audit(args)
     if args.command == "decide":
         return cmd_decide(args)
     return 0
