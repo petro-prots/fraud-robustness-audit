@@ -114,6 +114,7 @@ class ThreatModel:
     merchant_coord_radius: float
     min_gap_secs: int
     es: ESParams = ESParams()  # attacker search parameters (YAML ``attack.es``), not threat limits
+    tau_after_decline: float | None = None  # card-level escalation after the first decline; None = off
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ThreatModel":
@@ -142,7 +143,10 @@ class ThreatModel:
                  max_declines=int(raw["max_declines"]), knowledge=str(raw["knowledge"]),
                  recon_budget_ops=int(raw["recon_budget_ops"]), cards_per_eval=int(raw["cards_per_eval"]),
                  merchant_coord_radius=float(raw["merchant_coord_radius"]),
-                 min_gap_secs=int(raw["min_gap_secs"]), es=es)
+                 min_gap_secs=int(raw["min_gap_secs"]), es=es,
+                 tau_after_decline=None if raw["tau_after_decline"] is None else float(raw["tau_after_decline"]))
+        if tm.tau_after_decline is not None and not 0 < tm.tau_after_decline < 1:
+            raise ValueError(f"{path}: tau_after_decline must be null or in (0, 1)")
         if not (0 < tm.rho <= 1 and tm.k_max >= 1 and 0 < tm.amount_min <= tm.amount_max
                 and tm.window_days >= 1 and tm.merchant_coord_radius >= 0 and tm.min_gap_secs >= 0):
             raise ValueError(f"{path}: inconsistent threat model {tm}")

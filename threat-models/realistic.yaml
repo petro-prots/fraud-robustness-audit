@@ -16,3 +16,4 @@ attack:
     sigma: 0.15            # mutation std, share of the field's range
     p_merchant: 0.1        # probability of replacing the merchant with a random one
     p_k: 0.2               # probability of k ± 1
+tau_after_decline: null    # card-level threshold after the first decline (< model tau); null = no escalation

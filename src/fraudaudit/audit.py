@@ -86,7 +86,7 @@ def episode_txs(df: pd.DataFrame, episode) -> list[Tx]:
 
 
 def clean_ver(serving, targets: list[EpisodeContext], df: pd.DataFrame, max_declines: int | None,
-              rho: float) -> np.ndarray:
+              rho: float, *, tau_after_decline: float | None = None) -> np.ndarray:
     """VER of the real (non-adversarial) operations of every target episode, replayed through
     ``run_episode`` from the same pre-episode context with the same bank reaction.
 
@@ -94,7 +94,8 @@ def clean_ver(serving, targets: list[EpisodeContext], df: pd.DataFrame, max_decl
     (episode rows excluded); the card's legitimate operations inside the episode window are not
     replayed, in this clean run as in the adversarial one. So this is VER of the fraud operations
     alone, not the bank's historical outcome."""
-    return np.array([_clean_outcome(serving, ctx, episode_txs(df, ctx.episode), max_declines, rho).ver
+    return np.array([_clean_outcome(serving, ctx, episode_txs(df, ctx.episode), max_declines, rho,
+                               tau_after_decline).ver
                      for ctx in targets], dtype=np.float64)
 
 
@@ -102,20 +103,21 @@ REPLAY = {"context": "history ts < episode.start (episode rows excluded)",
           "in_window_legit_ops": "excluded in both runs"}
 
 
-def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_declines: int | None, rho: float):
+def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_declines: int | None, rho: float,
+                   tau_after_decline: float | None = None):
     """The clean leg: the episode's real operations through ``run_episode`` (used by ``clean_ver`` and
     by ``run_audit``)."""
-    return run_episode(serving, ctx, real_txs, max_declines, rho)
+    return run_episode(serving, ctx, real_txs, max_declines, rho, tau_after_decline=tau_after_decline)
 
 
 def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best: Strategy, tm: ThreatModel,
                     merchants: MerchantTable, seed: int, i: int) -> dict:
     """Adversarial and clean run of target ``i``; plain types only (crosses process boundaries)."""
     txs = realize(best, ctx, tm, merchants, np.random.default_rng([seed, _STREAM_TARGET, i]))
-    adv = run_episode(serving, ctx, txs, tm.max_declines, tm.rho)
+    adv = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
     executed = txs[:adv.n_ops]  # time-ordered prefix: the ops the bank actually saw
     n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
-    clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho)
+    clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline)
     return {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
             "amount": float(ctx.episode.amount),
             "ver_adv": float(adv.ver), "success": bool(adv.success), "n_ops": int(adv.n_ops),
@@ -393,8 +395,8 @@ def single_tx_target(serving, ctx: EpisodeContext, real_txs: list[Tx], tms: Sing
     order = np.argsort(offs, kind="stable")
     times = [start + pd.Timedelta(seconds=int(o)) for o in _spread(offs, tm)]
     replay = [dataclasses.replace(chosen[k]["tx"], ts=t) for t, k in zip(times, order)]
-    rep = run_episode(serving, ctx, replay, tm.max_declines, tm.rho)
-    clean = _clean_outcome(serving, ctx, real_txs, tm.max_declines, tm.rho)
+    rep = run_episode(serving, ctx, replay, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
+    clean = _clean_outcome(serving, ctx, real_txs, tm.max_declines, tm.rho, tm.tau_after_decline)
     return {"card": int(ctx.episode.card), "start": start.isoformat(), "amount": float(ctx.episode.amount),
             "n_ops": len(real_txs), "n_evaded": sum(c["evaded"] for c in chosen), "queries": int(queries),
             "chosen_amount": float(sum(c["tx"].amt for c in chosen if c["evaded"])),
@@ -472,7 +474,7 @@ def run_single_tx_baseline(df: pd.DataFrame, model, tm_single: SingleTxThreatMod
                                     "sha256": None if single_path is None else _sha256(Path(single_path)),
                                     "params": dataclasses.asdict(tm_single)},
             "episode_params": {k: getattr(tm_episode, k) for k in
-                               ("window_days", "min_gap_secs", "max_declines", "rho", "k_max")},
+                               ("window_days", "min_gap_secs", "max_declines", "rho", "k_max", "tau_after_decline")},
             "queries": int(sum(t["queries"] for t in per_target)),
             "n_wrapped_candidates": int(sum(t["n_wrapped_candidates"] for t in per_target)),
             "n_wrapped_earlier_than_original": int(sum(t["n_wrapped_earlier_than_original"] for t in per_target)),
@@ -553,6 +555,11 @@ def summary_markdown(data: dict) -> str:
         "",
         f"Attack: `{m['recon']['attack']}`, threat model: `{m['threat_model']['file']}`. "
         "No verdict: the gate rules are not applied yet.",
+        "",
+        "Bank reaction: " + ("no threshold escalation after a decline (`tau_after_decline` = null)."
+                             if m["threat_model"]["params"].get("tau_after_decline") is None else
+                             f"threshold escalates to `tau_after_decline` = {m['threat_model']['params']['tau_after_decline']} "
+                             "after the first decline on a card."),
         "",
         "| metric | value | 95 % interval |",
         "|---|---:|---|",

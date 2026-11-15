@@ -17,6 +17,8 @@ T0 = pd.Timestamp("2020-02-01 10:00:00")
 class StubServing:
     """Serving-compatible: p from a list in call order; declined iff p >= 0.5."""
 
+    tau = 0.5
+
     def __init__(self, ps):
         self.ps, self.calls = list(ps), []
 
@@ -131,3 +133,40 @@ def test_real_serving_and_context(sparkov_like):
     o = run_episode(Serving(model), ctx, txs, None, tm.rho)
     assert o.n_ops == 4 and o.decisions == (False, True, False, False)
     assert o.passed_amount == pytest.approx(txs[0].amt + txs[2].amt + txs[3].amt)
+
+
+# ---- card-level escalation (tau_after_decline) -------------------------------------------------
+
+def test_escalation_sequence_blocks_under_second_threshold():
+    s = StubServing([0.3, 0.6, 0.35, 0.2])
+    o = run_episode(s, _ctx(), _txs([1, 2, 3, 4]), 2, 0.8, tau_after_decline=0.3)
+    assert o.decisions == (False, True, True)  # op3: p=0.35 >= 0.3 declined under tau2
+    assert (o.n_ops, o.n_declines, o.blocked, o.escalated) == (3, 2, True, True)
+    assert len(s.calls) == 3  # op4 not executed
+
+
+def test_escalation_changes_later_decisions_only():
+    o = run_episode(StubServing([0.6, 0.35, 0.2]), _ctx(), _txs([1, 2, 3]), None, 0.8, tau_after_decline=0.3)
+    assert o.decisions == (True, True, False) and o.escalated
+    o = run_episode(StubServing([0.3, 0.35]), _ctx(), _txs([1, 2]), None, 0.8, tau_after_decline=0.3)
+    assert o.decisions == (False, False) and not o.escalated  # no decline yet: tau still applies
+
+
+def test_escalation_null_identical_to_before():
+    for ps in ([0, 1, 0, 1], [0.3, 0.6, 0.35, 0.2], [0, 0, 0]):
+        a = run_episode(StubServing(ps), _ctx(), _txs([1, 2, 3, 4][:len(ps)]), 2, 0.8)
+        b = run_episode(StubServing(ps), _ctx(), _txs([1, 2, 3, 4][:len(ps)]), 2, 0.8, tau_after_decline=None)
+        assert a == b and not a.escalated
+
+
+def test_escalation_validation():
+    for bad in (0.5, 0.7, 0.0, 1.0, -0.1):
+        with pytest.raises(ValueError):
+            run_episode(StubServing([0]), _ctx(), _txs([1]), 1, 0.8, tau_after_decline=bad)
+
+
+def test_escalation_is_per_episode():
+    ctx = _ctx()
+    a = run_episode(StubServing([0.6, 0.35]), ctx, _txs([1, 2]), None, 0.8, tau_after_decline=0.3)
+    b = run_episode(StubServing([0.35, 0.35]), ctx, _txs([1, 2]), None, 0.8, tau_after_decline=0.3)
+    assert a.escalated and b.decisions == (False, False) and not b.escalated

@@ -52,7 +52,7 @@ def _evaluate_cards(serving, spares: list[EpisodeContext], tm: ThreatModel, merc
     for j, c in enumerate(pick):
         ctx = spares[int(c)]
         txs = realize(strategy, ctx, tm, merchants, np.random.default_rng([seed, eval_idx, j]))
-        o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho)
+        o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
         out.append((o.ver, o.n_ops, o.blocked))
     return out
 

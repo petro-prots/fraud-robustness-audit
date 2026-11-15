@@ -392,3 +392,51 @@ def test_amount_rule_max(df, tm, tms):
     assert mx["chosen_amount"] >= first["chosen_amount"]
     with pytest.raises(ValueError):
         single_tx_target(serving, ctx, real, tms, tm, merchants, 3, 1, "median")
+
+
+# ---- tau_after_decline wiring ------------------------------------------------------------------
+
+def _spy_run_episode(monkeypatch, module):
+    seen = []
+    orig = module.run_episode
+
+    def spy(*a, **kw):
+        seen.append(kw.get("tau_after_decline", "missing"))
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(module, "run_episode", spy)
+    return seen
+
+
+def test_tau_after_decline_reaches_every_run_episode_call(df, model, tm, model_dir, monkeypatch):
+    from fraudaudit import oracle as oracle_mod
+    tm2 = dataclasses.replace(tm, tau_after_decline=1e-9)
+    seen_a, seen_o = _spy_run_episode(monkeypatch, audit_mod), _spy_run_episode(monkeypatch, oracle_mod)
+    r = run_audit(df, model, tm2, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                  target_periods=ALL, threat_path=TM_PATH)
+    assert seen_a and seen_o and set(seen_a) == {1e-9} and set(seen_o) == {1e-9}
+    assert r.meta["threat_model"]["params"]["tau_after_decline"] == 1e-9
+    assert "tau_after_decline" in audit_mod.summary_markdown(audit_mod.to_json(r))
+
+
+def test_tau_after_decline_reaches_baseline_replay(df, model, tm, tms, model_dir, monkeypatch):
+    seen = _spy_run_episode(monkeypatch, audit_mod)
+    run_single_tx_baseline(df, model, tms, dataclasses.replace(tm, tau_after_decline=1e-9), seed=7, n_jobs=1,
+                           model_dir=model_dir, target_periods=ALL, single_path=SINGLE_PATH)
+    assert seen and set(seen) == {1e-9}
+
+
+def test_audit_with_escalation_identical_for_n_jobs(df, model, tm, model_dir):
+    tm2 = dataclasses.replace(tm, tau_after_decline=1e-9)
+    r1, r2 = (run_audit(df, model, tm2, RandomSearch(), seed=7, n_jobs=j, model_dir=model_dir,
+                        target_periods=ALL, threat_path=TM_PATH) for j in (1, 2))
+    assert r1.per_target == r2.per_target
+    np.testing.assert_array_equal(r1.best.to_vector(), r2.best.to_vector())
+
+
+def test_clean_ver_passes_tau_after_decline(df, tm):
+    eps = fraud_episodes(df, set(ALL))[:5]
+    ctxs = contexts_for(df, eps)
+    s = Serving(LimitModel(BaseEncoder().fit(df), limit=60.0))
+    base = clean_ver(s, ctxs, df, None, tm.rho)
+    assert np.array_equal(base, clean_ver(s, ctxs, df, None, tm.rho, tau_after_decline=None))

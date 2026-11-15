@@ -39,7 +39,8 @@ def _random_txs(ctx, tm, merchants, seed):
 def test_threat_model_from_yaml(tm):
     assert tm == ThreatModel(rho=0.8, k_max=20, amount_min=1.00, amount_max=1376.04, window_days=7,
                              max_declines=1, knowledge="decision", recon_budget_ops=2000,
-                             cards_per_eval=5, merchant_coord_radius=1.0, min_gap_secs=60)
+                             cards_per_eval=5, merchant_coord_radius=1.0, min_gap_secs=60,
+                             tau_after_decline=None)
     with pytest.raises(dataclasses.FrozenInstanceError):
         tm.rho = 0.5
 
