@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from fraudaudit.metrics import clopper_pearson_upper, threshold_at_fpr
+from fraudaudit.metrics import clopper_pearson_upper, threshold_at_fpr, uplift_ci, ver_ci
 
 
 def test_cp_upper():
@@ -29,3 +29,22 @@ def test_threshold_at_fpr_separable():
     p = np.array([0.1, 0.2, 0.3, 0.8, 0.9])
     tau = threshold_at_fpr(y, p, 0.01)
     assert tau == pytest.approx(0.8)
+
+
+def test_uplift_ci_paired():
+    rng = np.random.default_rng(0)
+    clean = rng.uniform(0, 1, 50)
+    assert uplift_ci(clean, clean) == (0.0, 0.0, 0.0)
+    assert uplift_ci(clean + 0.25, clean) == pytest.approx((0.25, 0.25, 0.25))
+    adv = clean + rng.normal(0.1, 0.05, 50)
+    mean, lo, hi = uplift_ci(adv, clean)
+    assert mean == pytest.approx((adv - clean).mean())
+    assert lo < mean < hi
+    # pairing: much narrower than the difference of two unpaired intervals
+    a, c = ver_ci(adv), ver_ci(clean)
+    assert hi - lo < (a[2] - a[1]) + (c[2] - c[1])
+    assert uplift_ci(adv, clean) == uplift_ci(adv, clean)
+    with pytest.raises(ValueError):
+        uplift_ci(adv, clean[:-1])
+    with pytest.raises(ValueError):
+        uplift_ci(np.array([]), np.array([]))

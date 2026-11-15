@@ -8,7 +8,7 @@ import pytest
 from fraudaudit.data import Episode, fraud_episodes
 from fraudaudit.serving.state import OWNER_FIELDS, Tx, profile_of
 from fraudaudit.threat import (
-    EpisodeContext, MerchantTable, Strategy, ThreatModel, context_for, contexts_for, feasible, realize,
+    EpisodeContext, MerchantTable, Strategy, ThreatModel, context_for, contexts_for, feasible, feasible_ops, realize,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -286,6 +286,30 @@ def test_feasible_rejects_violations(setup, tm):
     assert not feasible([tx] * (tm.k_max + 1), ctx, tm, merchants)
     other = dataclasses.replace(ctx, profile=dataclasses.replace(ctx.profile, gender="X"))
     assert not feasible(txs, other, tm, merchants)  # state profile must be the card's profile
+
+
+def test_feasible_ops_per_operation(setup, tm):
+    df, merchants, eps = setup
+    ctx = context_for(df, eps[0])
+    for seed in range(20):
+        _, txs = _random_txs(ctx, tm, merchants, seed)
+        flags = feasible_ops(txs, ctx, tm, merchants)
+        assert flags == [True] * len(txs) and feasible(txs, ctx, tm, merchants)
+    _, txs = _random_txs(ctx, tm, merchants, 5)
+    if len(txs) < 3:
+        _, txs = _random_txs(ctx, tm, merchants, 6)
+    bad = list(txs)
+    bad[1] = dataclasses.replace(bad[1], amt=tm.amount_max + 0.01)
+    flags = feasible_ops(bad, ctx, tm, merchants)
+    assert flags == [i != 1 for i in range(len(bad))]
+    assert not feasible(bad, ctx, tm, merchants)
+    two = realize(_strategy(tm, [1.0, 2.0], [12.0, 12.0]), ctx, tm, merchants, np.random.default_rng(0))
+    close = [two[0], dataclasses.replace(two[1], ts=two[0].ts + pd.Timedelta(seconds=30))]
+    assert feasible_ops(close, ctx, tm, merchants) == [True, False]  # the later op breaks the gap
+    assert feasible_ops([], ctx, tm, merchants) == []
+    assert feasible_ops([two[0]] * (tm.k_max + 1), ctx, tm, merchants)[tm.k_max] is False
+    other = dataclasses.replace(ctx, profile=dataclasses.replace(ctx.profile, gender="X"))
+    assert feasible_ops(two, other, tm, merchants) == [False, False]
 
 
 # ---- Strategy vector / clip / random ---------------------------------------------------------

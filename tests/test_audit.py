@@ -12,7 +12,7 @@ from fraudaudit.audit import AuditResult, clean_ver, episode_txs, run_audit, wri
 from fraudaudit.data import fraud_episodes
 from fraudaudit.features.base import BaseEncoder
 from fraudaudit.features.columns import FEATURE_COLUMNS
-from fraudaudit.metrics import ver_ci
+from fraudaudit.metrics import uplift_ci, ver_ci
 from fraudaudit.model.artifacts import load_artifacts
 from fraudaudit.model.pipeline import FraudModel
 from fraudaudit.serving.core import Serving
@@ -115,6 +115,15 @@ def test_audit_smoke(result, tm):
     assert r.feasible_share == 1.0
     assert np.mean([t["ver_adv"] for t in r.per_target]) == pytest.approx(r.ver_adv[0])
     assert np.mean([t["ver_clean"] for t in r.per_target]) == pytest.approx(r.ver_clean[0])
+    adv = np.array([t["ver_adv"] for t in r.per_target])
+    cl = np.array([t["ver_clean"] for t in r.per_target])
+    assert r.uplift == uplift_ci(adv, cl, seed=7)
+    assert r.uplift[0] == pytest.approx(r.ver_adv[0] - r.ver_clean[0])
+    assert r.meta["n_ver_adv_gt_1"] == int((adv > 1).sum()) and r.meta["max_ver_adv"] == adv.max()
+    assert r.meta["n_ver_clean_gt_1"] == int((cl > 1).sum()) and r.meta["max_ver_clean"] == cl.max()
+    assert r.meta["replay"] == {"context": "history ts < episode.start (episode rows excluded)",
+                                "in_window_legit_ops": "excluded in both runs"}
+    assert sum(t["n_feasible_ops"] for t in r.per_target) == sum(t["n_ops"] for t in r.per_target)
     for p in ("val", "test"):
         assert {"recall", "fpr", "precision"} <= set(r.clean_quality[p])
     m = r.meta
@@ -123,6 +132,14 @@ def test_audit_smoke(result, tm):
         assert key in m, key
     assert m["seed"] == 7 and m["n_jobs"] == 1
     assert len(m["threat_model"]["sha256"]) == 64 and len(m["model"]["model_json_sha256"]) == 64
+
+
+def test_clean_ver_equals_audit_clean_leg(df, model, tm, result):
+    key = {(t["card"], t["start"]): t for t in result.per_target}
+    eps = [e for e in fraud_episodes(df, set(ALL)) if (e.card, e.start.isoformat()) in key]
+    assert len(eps) == result.n_targets
+    got = clean_ver(Serving(model), contexts_for(df, eps), df, tm.max_declines, tm.rho)
+    assert list(got) == [key[(e.card, e.start.isoformat())]["ver_clean"] for e in eps]
 
 
 def test_targets_and_spares_disjoint_in_audit(df, model, tm, model_dir, monkeypatch):
@@ -159,10 +176,12 @@ def test_write_outputs(result, tm, tmp_path):
     data = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
     assert data["ver_adv"]["mean"] == pytest.approx(result.ver_adv[0])
     assert data["feasible_share"] == 1.0
+    assert data["uplift"]["upper"] == pytest.approx(result.uplift[2])
     assert data["best"]["k"] == result.best.k and len(data["best"]["shares"]) == tm.k_max
     assert data["n_targets"] == result.n_targets and len(data["per_target"]) == result.n_targets
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
-    for s in ("VER_clean", "VER_adv", "ASR", "95 %", "Найкраща стратегія", result.meta["git_sha"]):
+    for s in ("VER_clean", "VER_adv", "ASR", "95 %", "Найкраща стратегія", result.meta["git_sha"],
+              "Приріст", "легітимн", "до перенесення"):
         assert s in md, s
 
 

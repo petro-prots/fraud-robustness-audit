@@ -282,28 +282,56 @@ def feasible(txs: list[Tx], ctx: EpisodeContext, tm: ThreatModel, merchants: Mer
     """
     if not 1 <= len(txs) <= tm.k_max:
         return False
-    if ctx.state.profile != ctx.profile or ctx.profile.cc_num != ctx.episode.card:
+    if not _ctx_ok(ctx):
         return False
-    start = pd.Timestamp(ctx.episode.start)
-    end = start + pd.Timedelta(days=tm.window_days)
-    r = tm.merchant_coord_radius + _COORD_TOL
-    for tx in txs:
-        if not isinstance(tx, Tx):
-            return False
-        a = float(tx.amt)
-        if not (np.isfinite(a) and tm.amount_min <= a <= tm.amount_max):
-            return False
-        if abs(a * 100 - round(a * 100)) > 1e-6:
-            return False
-        ts = pd.Timestamp(tx.ts)
-        if not start <= ts < end:
-            return False
-        if not (abs(tx.merch_lat - ctx.profile.lat) <= r and abs(tx.merch_long - ctx.profile.long) <= r):
-            return False
-        if merchants is not None:
-            j = merchants.index(tx.merchant)
-            if j is None or merchants.category[j] != tx.category:
-                return False
+    if not all(_tx_ok(tx, ctx, tm, merchants) for tx in txs):
+        return False
     ts = sorted(pd.Timestamp(tx.ts) for tx in txs)
     gap = pd.Timedelta(seconds=tm.min_gap_secs)
     return all(b - a >= gap for a, b in zip(ts, ts[1:]))
+
+
+def _ctx_ok(ctx: EpisodeContext) -> bool:
+    return ctx.state.profile == ctx.profile and ctx.profile.cc_num == ctx.episode.card
+
+
+def _tx_ok(tx, ctx: EpisodeContext, tm: ThreatModel, merchants: MerchantTable | None) -> bool:
+    """One operation's own checks: type, amount bounds and cents, window, coordinates, merchant."""
+    if not isinstance(tx, Tx):
+        return False
+    a = float(tx.amt)
+    if not (np.isfinite(a) and tm.amount_min <= a <= tm.amount_max):
+        return False
+    if abs(a * 100 - round(a * 100)) > 1e-6:
+        return False
+    start = pd.Timestamp(ctx.episode.start)
+    if not start <= pd.Timestamp(tx.ts) < start + pd.Timedelta(days=tm.window_days):
+        return False
+    r = tm.merchant_coord_radius + _COORD_TOL
+    if not (abs(tx.merch_lat - ctx.profile.lat) <= r and abs(tx.merch_long - ctx.profile.long) <= r):
+        return False
+    if merchants is not None:
+        j = merchants.index(tx.merchant)
+        if j is None or merchants.category[j] != tx.category:
+            return False
+    return True
+
+
+def feasible_ops(txs: list[Tx], ctx: EpisodeContext, tm: ThreatModel,
+                 merchants: MerchantTable | None = None) -> list[bool]:
+    """Per-operation version of ``feasible`` (flags in the order of ``txs``).
+
+    Operation i is feasible iff the context is consistent (else every flag is False), it passes the
+    single-operation checks of ``feasible``, it is among the first ``k_max`` operations, and – in
+    time order – it is at least ``min_gap_secs`` after the previous operation (the first has no gap
+    constraint). ``feasible(txs) == bool(txs) and all(feasible_ops(txs))``.
+    """
+    if not _ctx_ok(ctx):
+        return [False] * len(txs)
+    flags = [_tx_ok(tx, ctx, tm, merchants) and i < tm.k_max for i, tx in enumerate(txs)]
+    gap = pd.Timedelta(seconds=tm.min_gap_secs)
+    order = sorted((i for i, tx in enumerate(txs) if isinstance(tx, Tx)), key=lambda i: pd.Timestamp(txs[i].ts))
+    for prev, cur in zip(order, order[1:]):
+        if pd.Timestamp(txs[cur].ts) - pd.Timestamp(txs[prev].ts) < gap:
+            flags[cur] = False
+    return flags

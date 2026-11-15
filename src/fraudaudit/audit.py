@@ -39,11 +39,11 @@ import pandas as pd
 from .attacks.random_search import Attack
 from .data import fraud_episodes, period, split_cards
 from .episode import run_episode
-from .metrics import clopper_pearson_upper, ver_ci
+from .metrics import clopper_pearson_upper, uplift_ci, ver_ci
 from .oracle import ReconOracle
 from .serving.core import Serving
 from .serving.state import Tx
-from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel, contexts_for, feasible, realize
+from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel, contexts_for, feasible_ops, realize
 
 CONFIDENCE = 0.95
 N_BOOT = 2000
@@ -54,6 +54,7 @@ _STREAM_ORACLE, _STREAM_ATTACK, _STREAM_TARGET = 1, 2, 3
 class AuditResult:
     ver_adv: tuple[float, float, float]    # (mean, lower, upper), 95 % bootstrap over target episodes
     ver_clean: tuple[float, float, float]  # the same for the real operations of the target episodes
+    uplift: tuple[float, float, float]     # paired bootstrap of ver_adv_i − ver_clean_i (gate: upper ≤ δ)
     asr: float                             # share of target episodes with success (passed >= rho·A)
     asr_upper: float                       # Clopper-Pearson upper bound of asr (95 %)
     n_targets: int
@@ -61,7 +62,7 @@ class AuditResult:
     best: Strategy
     clean_quality: dict                    # {"val": quality(...), "test": quality(...)} at tau
     meta: dict
-    feasible_share: float                  # executed adversarial ops on target cards passing feasible
+    feasible_share: float                  # executed adversarial ops on target cards passing feasible_ops
     per_target: list[dict]                 # card, A, ver_adv, ver_clean, success, ops, declines, blocked
     spare_cards: list[int]
 
@@ -78,9 +79,24 @@ def episode_txs(df: pd.DataFrame, episode) -> list[Tx]:
 def clean_ver(serving, targets: list[EpisodeContext], df: pd.DataFrame, max_declines: int | None,
               rho: float) -> np.ndarray:
     """VER of the real (non-adversarial) operations of every target episode, replayed through
-    ``run_episode`` from the same pre-episode context with the same bank reaction."""
-    return np.array([run_episode(serving, ctx, episode_txs(df, ctx.episode), max_declines, rho).ver
+    ``run_episode`` from the same pre-episode context with the same bank reaction.
+
+    Replay assumption (``REPLAY``): the context is the card history strictly before the episode start
+    (episode rows excluded); the card's legitimate operations inside the episode window are not
+    replayed, in this clean run as in the adversarial one. So this is VER of the fraud operations
+    alone, not the bank's historical outcome."""
+    return np.array([_clean_outcome(serving, ctx, episode_txs(df, ctx.episode), max_declines, rho).ver
                      for ctx in targets], dtype=np.float64)
+
+
+REPLAY = {"context": "history ts < episode.start (episode rows excluded)",
+          "in_window_legit_ops": "excluded in both runs"}
+
+
+def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_declines: int | None, rho: float):
+    """The clean leg: the episode's real operations through ``run_episode`` (used by ``clean_ver`` and
+    by ``run_audit``)."""
+    return run_episode(serving, ctx, real_txs, max_declines, rho)
 
 
 def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best: Strategy, tm: ThreatModel,
@@ -89,12 +105,13 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best: Str
     txs = realize(best, ctx, tm, merchants, np.random.default_rng([seed, _STREAM_TARGET, i]))
     adv = run_episode(serving, ctx, txs, tm.max_declines, tm.rho)
     executed = txs[:adv.n_ops]  # time-ordered prefix: the ops the bank actually saw
-    ok = feasible(executed, ctx, tm, merchants)
-    clean = run_episode(serving, ctx, clean_txs, tm.max_declines, tm.rho)
-    return {"card": int(ctx.episode.card), "amount": float(ctx.episode.amount),
+    n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
+    clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho)
+    return {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
+            "amount": float(ctx.episode.amount),
             "ver_adv": float(adv.ver), "success": bool(adv.success), "n_ops": int(adv.n_ops),
             "n_declines": int(adv.n_declines), "blocked": bool(adv.blocked),
-            "n_feasible_ops": int(adv.n_ops) if ok else 0,
+            "n_feasible_ops": int(n_ok),
             "ver_clean": float(clean.ver), "clean_success": bool(clean.success),
             "clean_n_ops": int(clean.n_ops), "clean_n_real_ops": len(clean_txs),
             "clean_blocked": bool(clean.blocked)}
@@ -227,9 +244,14 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         "n_success": int(k),
         "n_clean_success": int(sum(t["clean_success"] for t in per_target)),
         "n_executed_adv_ops": int(n_exec),
+        "replay": dict(REPLAY),
+        "n_ver_adv_gt_1": int((v_adv > 1).sum()), "max_ver_adv": float(v_adv.max()),
+        "n_ver_clean_gt_1": int((v_clean > 1).sum()), "max_ver_clean": float(v_clean.max()),
+        "median_amount": float(np.median([t["amount"] for t in per_target])),
     }
     result = AuditResult(
         ver_adv=ver_ci(v_adv, CONFIDENCE, N_BOOT, seed), ver_clean=ver_ci(v_clean, CONFIDENCE, N_BOOT, seed),
+        uplift=uplift_ci(v_adv, v_clean, CONFIDENCE, N_BOOT, seed),
         asr=k / n, asr_upper=clopper_pearson_upper(int(k), n, CONFIDENCE), n_targets=n,
         recon_ops=int(run.ops_used), best=best, clean_quality=quality, meta=meta,
         feasible_share=float(feasible_share), per_target=per_target,
@@ -263,7 +285,7 @@ def to_json(r: AuditResult, merchants: MerchantTable | None = None) -> dict:
     def ci(t):
         return {"mean": t[0], "lower": t[1], "upper": t[2]}
     best = strategy_dict(r.best, merchants)
-    return {"ver_adv": ci(r.ver_adv), "ver_clean": ci(r.ver_clean), "asr": r.asr, "asr_upper": r.asr_upper,
+    return {"ver_adv": ci(r.ver_adv), "ver_clean": ci(r.ver_clean), "uplift": ci(r.uplift), "asr": r.asr, "asr_upper": r.asr_upper,
             "n_targets": r.n_targets, "recon_ops": r.recon_ops, "feasible_share": r.feasible_share,
             "best": best, "clean_quality": r.clean_quality, "meta": r.meta, "per_target": r.per_target,
             "spare_cards": r.spare_cards}
@@ -280,7 +302,8 @@ def _num(x: float, d: int = 3) -> str:
 def summary_markdown(data: dict) -> str:
     """Ukrainian Markdown summary of ``to_json`` output (no verdict: the gate is a later step)."""
     m, b = data["meta"], data["best"]
-    va, vc = data["ver_adv"], data["ver_clean"]
+    va, vc, up = data["ver_adv"], data["ver_clean"], data["uplift"]
+    med = m["median_amount"]
     conf = int(round(100 * m["confidence"]))
     lines = [
         "# Аудит стійкості до епізодних атак (мінімальний)",
@@ -290,11 +313,23 @@ def summary_markdown(data: dict) -> str:
         "",
         "| показник | значення | 95 % інтервал |",
         "|---|---:|---|",
-        f"| VER_clean (реальні операції шахрайства) | {_pct(vc['mean'])} | [{_pct(vc['lower'])}; {_pct(vc['upper'])}] |",
+        f"| VER_clean – повтор реальних шахрайських операцій без легітимних операцій вікна | {_pct(vc['mean'])} | [{_pct(vc['lower'])}; {_pct(vc['upper'])}] |",
         f"| VER_adv (найкраща стратегія атаки) | {_pct(va['mean'])} | [{_pct(va['lower'])}; {_pct(va['upper'])}] |",
+        f"| Приріст VER_adv − VER_clean (парний bootstrap) | {_pct(up['mean'])} "
+        f"| [{_pct(up['lower'])}; {_pct(up['upper'])}] |",
         f"| ASR (частка успішних епізодів, ≥ ρ·A) | {_pct(data['asr'])} ({m['n_success']} з {data['n_targets']}) "
         f"| верхня межа {conf} %: {_pct(data['asr_upper'])} |",
         "",
+        "Обидва прогони (VER_clean і VER_adv) стартують зі стану картки до початку епізоду, а легітимні "
+        "операції картки всередині вікна епізоду не відтворюються, тож VER_clean – це повтор лише "
+        "шахрайських операцій, а не історичний результат банку.",
+        "",
+        f"- Приріст у доларах при медіанній сумі епізоду A = {_num(med, 2)} $: "
+        f"≈ {_num(up['mean'] * med, 0)} $ [{_num(up['lower'] * med, 0)}; {_num(up['upper'] * med, 0)}] "
+        "на епізод (частка × медіана A).",
+        f"- VER > 1 (через нижню межу суми операції): змагальних епізодів {m['n_ver_adv_gt_1']} "
+        f"(макс. VER_adv {_num(m['max_ver_adv'])}), реальних {m['n_ver_clean_gt_1']} "
+        f"(макс. VER_clean {_num(m['max_ver_clean'])}); значення не обрізаються.",
         f"- Цільових епізодів: {data['n_targets']} (карток: {m['n_target_cards']}); запасних карток для "
         f"розвідки: {len(data['spare_cards'])}.",
         f"- Інтервали VER: percentile bootstrap за епізодами, {m['n_boot']} повторів, seed {m['seed']}; "
@@ -308,7 +343,9 @@ def summary_markdown(data: dict) -> str:
         "",
         "## Найкраща стратегія",
         "",
-        f"Операцій k = {b['k']}, сумарно ≈ {_pct(b['u'])} від A; частки A по операціях, у порядку плану:",
+        f"Операцій k = {b['k']}, сумарно ≈ {_pct(b['u'])} від A. Таблиця – план стратегії в порядку "
+        "запланованого часу, до перенесення у вікно і розсування операцій (min_gap_secs), а не порядок "
+        "фактично виконаних операцій:",
         "",
         "| № | частка A | день | година | категорія |",
         "|---:|---:|---:|---:|---|",
