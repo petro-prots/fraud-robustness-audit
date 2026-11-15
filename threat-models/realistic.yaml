@@ -8,3 +8,4 @@ knowledge: decision        # decision | score (strong – поза цим пла
 recon_budget_ops: 2000     # операцій на запасних картках
 cards_per_eval: 5          # запасних карток на одну оцінку стратегії
 merchant_coord_radius: 1.0 # як у генераторі Sparkov: ±1° від дому
+min_gap_secs: 60          # мінімальний проміжок між операціями епізоду, с

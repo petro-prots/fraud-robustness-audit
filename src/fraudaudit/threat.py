@@ -10,12 +10,23 @@ Realisation rules (``realize``):
 
 * amounts ``u·A·shares[:k] / sum(shares[:k])`` (equal shares when they are all zero), clipped to
   ``[amount_min, amount_max]`` and rounded to cents with ``np.round`` (round half to even on the
-  binary value); the bounds are whole cents, so rounding keeps an amount in bounds;
-* time ``start.normalize() + day days + hour hours``, rounded to whole seconds; an operation before
-  ``start`` is moved to ``start`` and one at or after ``start + window_days`` is moved to the last
-  second of the window (``day < window_days`` alone does not keep ``day + hour`` inside it);
-* merchant ``merchant[i]`` is an index into ``MerchantTable`` (category from the data); merchant
-  coordinates are the card's home ``(lat, long)`` plus ``U(-r, r)`` each, drawn from ``rng``.
+  binary value); the bounds are whole cents, so rounding keeps an amount in bounds. The total is
+  therefore only approximately ``u·A``: clipping drops the excess above ``amount_max`` and lifts small
+  shares to the ``amount_min`` floor;
+* time ``start.normalize() + day days + hour hours`` in whole seconds, so the attacker controls the
+  time of day. An operation before ``start`` is moved one day later, one at or after
+  ``start + window_days`` one day earlier (whole-day wrapping keeps the time of day and always lands
+  in ``[start, start + window_days)``). After sorting, consecutive operations are at least
+  ``min_gap_secs`` apart: a forward pass pushes operations later; if the last one then leaves the
+  window, a backward pass from the last second of the window pulls them earlier. Without the gap the
+  attacker could stack operations in one second, where the windowed aggregates (``t_j < t``) do not
+  see each other – an artefact of the generator, not a realistic attack (Sparkov has 44 same-second
+  operations in 1.85 M rows);
+* merchant ``merchant[i]`` is an index into ``MerchantTable``, ordered by (category, raw name), so
+  neighbouring indices are mostly merchants of the same category (locality for the evolution
+  strategy); merchant coordinates are the card's home ``(lat, long)`` plus ``U(-r, r)`` each, drawn
+  from ``rng`` as a fixed ``(k_max, 2)`` block (the first ``k`` rows are used), so the ``rng``
+  consumption does not depend on the strategy (common random numbers).
 
 ``feasible`` checks the threat model only, not success (``sum >= rho·A``): a strategy whose target is
 physically unreachable (``k_max·amount_max < rho·A``) is still a valid, merely unsuccessful episode.
@@ -33,7 +44,7 @@ import yaml
 from .data import Episode
 from .serving.state import CardProfile, CardState, Tx, profile_of
 
-_SEC = pd.Timedelta(seconds=1)
+_DAY_S = 86_400
 _COORD_TOL = 1e-9  # home + U(-r, r) minus home may exceed r by float rounding
 
 
@@ -49,6 +60,7 @@ class ThreatModel:
     recon_budget_ops: int
     cards_per_eval: int
     merchant_coord_radius: float
+    min_gap_secs: int
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ThreatModel":
@@ -66,9 +78,10 @@ class ThreatModel:
                  amount_max=float(raw["amount_max"]), window_days=int(raw["window_days"]),
                  max_declines=int(raw["max_declines"]), knowledge=str(raw["knowledge"]),
                  recon_budget_ops=int(raw["recon_budget_ops"]), cards_per_eval=int(raw["cards_per_eval"]),
-                 merchant_coord_radius=float(raw["merchant_coord_radius"]))
+                 merchant_coord_radius=float(raw["merchant_coord_radius"]),
+                 min_gap_secs=int(raw["min_gap_secs"]))
         if not (0 < tm.rho <= 1 and tm.k_max >= 1 and 0 < tm.amount_min <= tm.amount_max
-                and tm.window_days >= 1 and tm.merchant_coord_radius >= 0):
+                and tm.window_days >= 1 and tm.merchant_coord_radius >= 0 and tm.min_gap_secs >= 0):
             raise ValueError(f"{path}: inconsistent threat model {tm}")
         if tm.knowledge not in ("decision", "score"):
             raise ValueError(f"{path}: knowledge must be 'decision' or 'score', got {tm.knowledge!r}")
@@ -77,7 +90,8 @@ class ThreatModel:
 
 @dataclass(frozen=True, eq=False)
 class MerchantTable:
-    """Merchants sorted by raw name (``fraud_`` prefix kept); category of the first occurrence in data."""
+    """Merchants ordered by (category, raw name) (``fraud_`` prefix kept); a merchant's category is
+    the one of its first occurrence in ``df`` order. Neighbouring indices share a category."""
     names: list[str]
     category: list[str]
 
@@ -88,7 +102,7 @@ class MerchantTable:
     def from_df(cls, df: pd.DataFrame) -> "MerchantTable":
         first = df.drop_duplicates("merchant", keep="first")
         cat = dict(zip(first["merchant"].astype(str), first["category"].astype(str)))
-        names = sorted(cat)
+        names = sorted(cat, key=lambda n: (cat[n], n))
         return cls(names=names, category=[cat[n] for n in names])
 
     def __len__(self) -> int:
@@ -195,11 +209,44 @@ class Strategy:
                    merchant=v[2 + 3 * n:2 + 4 * n]).clip(tm, n_merchants)
 
 
+def _wrapped_offsets(s: "Strategy", start: pd.Timestamp, tm: ThreatModel) -> np.ndarray:
+    """Seconds from ``start`` of the first ``k`` operations after whole-day wrapping, in ``[0, window)``."""
+    k = s.k
+    win = tm.window_days * _DAY_S
+    lead = int((start - start.normalize()) / pd.Timedelta(seconds=1))  # whole seconds, < 1 day
+    off = np.rint(s.day[:k] * _DAY_S + s.hour[:k] * 3600).astype(np.int64)
+    off = np.clip(off, 0, (tm.window_days + 1) * _DAY_S - 1) - lead
+    off = np.where(off < 0, off + _DAY_S, off)
+    off = np.where(off >= win, off - _DAY_S, off)
+    return off
+
+
+def _spread(off: np.ndarray, tm: ThreatModel) -> np.ndarray:
+    """Sorted offsets at least ``min_gap_secs`` apart, still in ``[0, window)``."""
+    k, gap, win = len(off), tm.min_gap_secs, tm.window_days * _DAY_S
+    if (k - 1) * gap > win - 1:
+        raise ValueError(f"{k} operations {gap} s apart do not fit into {tm.window_days} days")
+    off = np.sort(off, kind="stable")
+    for i in range(1, k):  # forward pass
+        off[i] = max(off[i], off[i - 1] + gap)
+    if off[-1] > win - 1:  # backward pass from the last second of the window
+        off[-1] = win - 1
+        for i in range(k - 2, -1, -1):
+            off[i] = min(off[i], off[i + 1] - gap)
+    assert off[0] >= 0 and off[-1] <= win - 1
+    return off
+
+
 def realize(strategy: Strategy, ctx: EpisodeContext, tm: ThreatModel, merchants: MerchantTable,
             rng: np.random.Generator) -> list[Tx]:
-    """Concrete operations of ``strategy`` on the episode of ``ctx``, sorted by ``ts`` (stable).
+    """Concrete operations of ``strategy`` on the episode of ``ctx``, sorted by ``ts``.
 
-    Deterministic for a given ``rng`` state; draws exactly ``2·k`` uniforms (merchant coordinates).
+    The total is approximately ``u·A`` (per-operation clipping to the amount bounds can drop the
+    excess or add ``amount_min`` floors). Deterministic for a given ``rng`` state; always draws one
+    ``(k_max, 2)`` block of uniforms (merchant coordinates), whatever ``k``. Operations keep the
+    strategy order of their (wrapped) times; amounts and merchants follow the operation, the gap
+    passes only move times. ``ValueError`` if ``k`` operations ``min_gap_secs`` apart do not fit
+    into the window.
     """
     s = strategy.clip(tm, len(merchants))
     k = s.k
@@ -209,26 +256,27 @@ def realize(strategy: Strategy, ctx: EpisodeContext, tm: ThreatModel, merchants:
     w = shares / total if total > 0 else np.full(k, 1.0 / k)
     amts = np.round(np.clip(s.u * ep.amount * w, tm.amount_min, tm.amount_max), 2)
 
-    start = pd.Timestamp(ep.start)
-    lo, hi = start, start + pd.Timedelta(days=tm.window_days) - _SEC
-    base = start.normalize()
     r = tm.merchant_coord_radius
-    off = rng.uniform(-r, r, size=(k, 2))
+    coords = rng.uniform(-r, r, size=(tm.k_max, 2))[:k]
+    start = pd.Timestamp(ep.start)
+    off = _wrapped_offsets(s, start, tm)
+    order = np.argsort(off, kind="stable")  # operations in time order; gap passes keep this order
+    times = [start + pd.Timedelta(seconds=int(o)) for o in _spread(off, tm)]
     txs = []
-    for i in range(k):
-        ts = (base + pd.Timedelta(days=float(s.day[i])) + pd.Timedelta(hours=float(s.hour[i]))).round("s")
-        ts = min(max(ts, lo), hi)
+    for ts, i in zip(times, order):
         j = int(s.merchant[i])
         txs.append(Tx(ts=ts, amt=float(amts[i]), merchant=merchants.names[j], category=merchants.category[j],
-                      merch_lat=ctx.profile.lat + float(off[i, 0]), merch_long=ctx.profile.long + float(off[i, 1])))
-    return sorted(txs, key=lambda t: t.ts)
+                      merch_lat=ctx.profile.lat + float(coords[i, 0]),
+                      merch_long=ctx.profile.long + float(coords[i, 1])))
+    return txs
 
 
 def feasible(txs: list[Tx], ctx: EpisodeContext, tm: ThreatModel, merchants: MerchantTable | None = None) -> bool:
     """Do ``txs`` respect the threat model on the episode of ``ctx``? Does not check success.
 
     Checks: 1..k_max operations; each amount in bounds and a whole number of cents; each ts in
-    ``[start, start + window_days)``; merchant coordinates within ``merchant_coord_radius`` of home;
+    ``[start, start + window_days)``; consecutive operations (in time order) at least ``min_gap_secs``
+    apart; merchant coordinates within ``merchant_coord_radius`` of home;
     the state's owner profile is the card's profile (``Tx`` carries no owner fields). With
     ``merchants`` also: merchant in the table with its category.
     """
@@ -256,4 +304,6 @@ def feasible(txs: list[Tx], ctx: EpisodeContext, tm: ThreatModel, merchants: Mer
             j = merchants.index(tx.merchant)
             if j is None or merchants.category[j] != tx.category:
                 return False
-    return True
+    ts = sorted(pd.Timestamp(tx.ts) for tx in txs)
+    gap = pd.Timedelta(seconds=tm.min_gap_secs)
+    return all(b - a >= gap for a, b in zip(ts, ts[1:]))

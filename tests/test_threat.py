@@ -39,7 +39,7 @@ def _random_txs(ctx, tm, merchants, seed):
 def test_threat_model_from_yaml(tm):
     assert tm == ThreatModel(rho=0.8, k_max=20, amount_min=1.00, amount_max=1376.04, window_days=7,
                              max_declines=1, knowledge="decision", recon_budget_ops=2000,
-                             cards_per_eval=5, merchant_coord_radius=1.0)
+                             cards_per_eval=5, merchant_coord_radius=1.0, min_gap_secs=60)
     with pytest.raises(dataclasses.FrozenInstanceError):
         tm.rho = 0.5
 
@@ -54,13 +54,14 @@ def test_threat_model_rejects_unknown_or_missing_keys(tmp_path):
         ThreatModel.from_yaml(p)
 
 
-def test_merchant_table_sorted_with_first_category(sparkov_like):
+def test_merchant_table_ordered_by_category_then_name(sparkov_like):
     df = sparkov_like
     mt = MerchantTable.from_df(df)
-    assert mt.names == sorted(df["merchant"].unique())
-    assert all(n.startswith("fraud_") for n in mt.names)
     first = df.drop_duplicates("merchant").set_index("merchant")["category"]
+    assert mt.names == sorted(df["merchant"].unique(), key=lambda n: (first[n], n))
+    assert all(n.startswith("fraud_") for n in mt.names)
     assert mt.category == [first[n] for n in mt.names]
+    assert mt.category == sorted(mt.category)  # one contiguous block per category
     assert len(mt) == len(mt.names) == df["merchant"].nunique()
 
 
@@ -69,19 +70,35 @@ def test_merchant_table_sorted_with_first_category(sparkov_like):
 def test_context_excludes_episode_and_later_ops(setup):
     df, _, eps = setup
     ep = eps[0]
-    ctx = context_for(df, ep)
-    assert isinstance(ctx, EpisodeContext)
-    assert ctx.episode is ep
-    assert ctx.profile == profile_of(df, ep.card)
-    assert ctx.state.profile == ctx.profile
     g = df[df["cc_num"] == ep.card]
-    expected = g[(g["ts"] < ep.start) & (g["ts"] >= ep.start - pd.Timedelta(days=30))]
-    assert not set(expected["row"]) & set(ep.rows)
-    assert len(ctx.state) == len(expected)
-    # same contexts in bulk (one index by card)
+    # leak bait: legit ops of the card after start and in the very second of start
+    later = g[(g["ts"] > ep.start) & ~g["row"].isin(ep.rows)]
+    assert len(later) > 0 and len(set(ep.rows)) > 1
+    bait = g[g["row"] == ep.rows[0]].assign(is_fraud=0, row=df["row"].max() + 1, amt=999.99)
+    df2 = pd.concat([df, bait], ignore_index=True).sort_values(["ts", "row"], kind="stable")
+    for d in (df, df2):
+        ctx = context_for(d, ep)
+        assert isinstance(ctx, EpisodeContext)
+        assert ctx.episode is ep
+        assert ctx.profile == profile_of(d, ep.card)
+        assert ctx.state.profile == ctx.profile
+        assert max(ctx.state._t) < ep.start.value
+        assert 999.99 not in ctx.state._a
+        expected = g[(g["ts"] < ep.start) & (g["ts"] >= ep.start - pd.Timedelta(days=30))]
+        assert not set(expected["row"]) & set(ep.rows)
+        assert len(ctx.state) == len(expected)
+        assert ctx.state._a == expected["amt"].tolist()
+
+
+def test_contexts_for_equals_context_for(setup):
+    df, _, eps = setup
     bulk = contexts_for(df, eps)
     assert [c.episode for c in bulk] == eps
-    assert len(bulk[0].state) == len(ctx.state) and bulk[0].profile == ctx.profile
+    for b, e in zip(bulk, eps):
+        c = context_for(df, e)
+        assert b.profile == c.profile
+        assert b.state._t == c.state._t and b.state._a == c.state._a and b.state._now == c.state._now
+        np.testing.assert_array_equal(b.state.aggregates(e.start), c.state.aggregates(e.start))
 
 
 # ---- realize / feasible ----------------------------------------------------------------------
@@ -102,21 +119,89 @@ def test_realize_respects_bounds(setup, tm):
                 assert tx.category == merchants.category[j]
                 assert abs(tx.merch_lat - ctx.profile.lat) <= tm.merchant_coord_radius
                 assert abs(tx.merch_long - ctx.profile.long) <= tm.merchant_coord_radius
-            assert [t.ts for t in txs] == sorted(t.ts for t in txs)
+            ts = [t.ts for t in txs]
+            assert ts == sorted(ts) and len(set(ts)) == len(ts)
+            assert all(b - a >= pd.Timedelta(seconds=tm.min_gap_secs) for a, b in zip(ts, ts[1:]))
             assert feasible(txs, ctx, tm, merchants)
 
 
-def test_realize_extremes_clamped_to_window(setup, tm):
+def _strategy(tm, day, hour, k=None):
+    n = tm.k_max
+    k = len(day) if k is None else k
+    pad = lambda a, v: np.r_[np.asarray(a, dtype=float), np.full(n - len(a), v)]
+    return Strategy(k=k, u=1.0, shares=np.ones(n), day=pad(day, 0.0), hour=pad(hour, 0.0),
+                    merchant=np.zeros(n, dtype=int))
+
+
+def _shifted_ctx(df, ep, tod):
+    """Context of ``ep`` with the start moved to ``tod`` hours on its day."""
+    ep2 = dataclasses.replace(ep, start=ep.start.normalize() + pd.Timedelta(hours=tod))
+    return context_for(df, ep2), ep2.start
+
+
+def test_realize_wraps_whole_days_keeping_time_of_day(setup, tm):
+    df, merchants, eps = setup
+    ctx, start = _shifted_ctx(df, eps[0], 10.5)  # start at 10:30
+    d0 = start.normalize()
+    s = _strategy(tm, day=[0.0, 6.0, 6.99], hour=[9.5, 23.0, 23.5])
+    txs = realize(s, ctx, tm, merchants, np.random.default_rng(0))
+    end = start + pd.Timedelta(days=tm.window_days)
+    assert all(start <= t.ts < end for t in txs)
+    raw = [d0 + pd.Timedelta(hours=9.5),                      # before start -> +1 day
+           d0 + pd.Timedelta(days=6, hours=23),               # inside: unchanged
+           (d0 + pd.Timedelta(days=6.99) + pd.Timedelta(hours=23.5)).round("s")]  # after end -> -1 day
+    exp = sorted([raw[0] + pd.Timedelta(days=1), raw[1], raw[2] - pd.Timedelta(days=1)])
+    assert [t.ts for t in txs] == exp
+    tods = sorted((r - r.normalize()) for r in raw)
+    assert sorted(t.ts - t.ts.normalize() for t in txs) == tods
+    assert feasible(txs, ctx, tm, merchants)
+
+
+def test_equal_times_spread_min_gap(setup, tm):
+    df, merchants, eps = setup
+    ctx, start = _shifted_ctx(df, eps[0], 10.5)
+    k = tm.k_max
+    txs = realize(_strategy(tm, [3.0] * k, [12.0] * k), ctx, tm, merchants, np.random.default_rng(0))
+    ts = [t.ts for t in txs]
+    assert len(set(ts)) == k
+    assert ts[0] == start.normalize() + pd.Timedelta(days=3, hours=12)
+    assert all(b - a == pd.Timedelta(seconds=tm.min_gap_secs) for a, b in zip(ts, ts[1:]))
+    assert feasible(txs, ctx, tm, merchants)
+
+
+def test_overflow_at_window_end_backward_pass(setup, tm):
+    df, merchants, eps = setup
+    ctx, start = _shifted_ctx(df, eps[0], 10.5)
+    k = tm.k_max
+    # day 6.999 + 10.4 h = day 7 10:22:34, ~7 min before the window end (day 7 10:30):
+    # the forward pass would push the last ops past the end -> backward pass from end - 1 s
+    txs = realize(_strategy(tm, [6.999] * k, [10.4] * k), ctx, tm, merchants, np.random.default_rng(0))
+    ts = [t.ts for t in txs]
+    end = start + pd.Timedelta(days=tm.window_days)
+    assert ts[-1] == end - pd.Timedelta(seconds=1)
+    assert all(b - a == pd.Timedelta(seconds=tm.min_gap_secs) for a, b in zip(ts, ts[1:]))
+    assert all(start <= t < end for t in ts)
+    assert feasible(txs, ctx, tm, merchants)
+
+
+def test_gap_that_cannot_fit_raises(setup, tm):
     df, merchants, eps = setup
     ctx = context_for(df, eps[0])
-    k = tm.k_max
-    s = Strategy(k=k, u=1.0, shares=np.ones(k), day=np.r_[np.zeros(k // 2), np.full(k - k // 2, 6.999999)],
-                 hour=np.r_[np.zeros(k // 2), np.full(k - k // 2, 23.99999)], merchant=np.zeros(k, dtype=int))
-    txs = realize(s, ctx, tm, merchants, np.random.default_rng(0))
-    start = eps[0].start
-    assert min(t.ts for t in txs) == start  # before start -> moved to start
-    assert max(t.ts for t in txs) < start + pd.Timedelta(days=tm.window_days)
-    assert feasible(txs, ctx, tm, merchants)
+    tm2 = dataclasses.replace(tm, min_gap_secs=86_400)
+    with pytest.raises(ValueError, match="do not fit"):
+        realize(_strategy(tm2, [0.0] * tm.k_max, [0.0] * tm.k_max), ctx, tm2, merchants, np.random.default_rng(0))
+
+
+def test_rng_consumption_independent_of_k(setup, tm):
+    df, merchants, eps = setup
+    ctx = context_for(df, eps[0])
+    s = Strategy.random(tm, len(merchants), np.random.default_rng(0))
+    nxt = []
+    for k in (1, 7, tm.k_max):
+        rng = np.random.default_rng(9)
+        realize(dataclasses.replace(s, k=k), ctx, tm, merchants, rng)
+        nxt.append(rng.random())
+    assert len(set(nxt)) == 1
 
 
 def test_realize_amounts_follow_shares(setup, tm):
@@ -194,6 +279,10 @@ def test_feasible_rejects_violations(setup, tm):
     for b in bad:
         assert not feasible([b] + txs[1:], ctx, tm, merchants), b
     assert not feasible([], ctx, tm, merchants)
+    two = realize(_strategy(tm, [1.0, 2.0], [12.0, 12.0]), ctx, tm, merchants, np.random.default_rng(0))
+    assert feasible(two, ctx, tm, merchants)
+    close = [two[0], dataclasses.replace(two[1], ts=two[0].ts + pd.Timedelta(seconds=30))]
+    assert not feasible(close, ctx, tm, merchants)  # 30 s < min_gap_secs
     assert not feasible([tx] * (tm.k_max + 1), ctx, tm, merchants)
     other = dataclasses.replace(ctx, profile=dataclasses.replace(ctx.profile, gender="X"))
     assert not feasible(txs, other, tm, merchants)  # state profile must be the card's profile
