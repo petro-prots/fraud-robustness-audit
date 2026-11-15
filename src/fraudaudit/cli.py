@@ -83,9 +83,11 @@ def cmd_skew(args: argparse.Namespace) -> int:
 
     df = load_raw(args.data)
     model = FraudModel.from_artifacts(load_artifacts(args.model))
-    rep = skew_check(df, model, n_cards=args.cards, seed=args.seed, atol=args.atol, n_jobs=args.n_jobs)
+    rep = skew_check(df, model, n_cards=args.cards, seed=args.seed, atol=args.atol, n_jobs=args.n_jobs,
+                     model_dir=args.model)
     print(json.dumps({"passed": rep.passed, "n_cards": rep.n_cards, "n_tx": rep.n_tx,
-                      "decision_mismatches": rep.decision_mismatches, "max_abs_diff": rep.max_abs_diff,
+                      "decision_mismatches": rep.decision_mismatches,
+                      "max_abs_p_diff": rep.max_abs_p_diff, "max_abs_diff": rep.max_abs_diff,
                       "seed": args.seed, "atol": args.atol, **git_info()}, indent=2, sort_keys=True), flush=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
@@ -96,10 +98,27 @@ def cmd_skew(args: argparse.Namespace) -> int:
 
 def cmd_decide(args: argparse.Namespace) -> int:
     expose = os.environ.get("EXPOSE_SCORE") == "1"
-    if expose and os.environ.get("ENV") == "production":
+    if expose and os.environ.get("ENV", "").strip().lower() in ("production", "prod"):
         print("error: EXPOSE_SCORE=1 is not allowed with ENV=production: the score p is never exposed "
               "in production (ATLAS AML.M0002)", file=sys.stderr)
         return 2
+    import pandas as pd
+
+    from fraudaudit.data import load_raw
+    from fraudaudit.model.artifacts import load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.serving.core import Serving
+    from fraudaudit.serving.state import CardState, Tx, profile_of
+
+    try:
+        return _decide(args, expose)
+    except (KeyError, ValueError, TypeError, OSError) as e:
+        msg = f"missing key {e}" if isinstance(e, KeyError) else str(e)
+        print(f"error: decide failed: {msg}", file=sys.stderr)
+        return 2
+
+
+def _decide(args: argparse.Namespace, expose: bool) -> int:
     import pandas as pd
 
     from fraudaudit.data import load_raw
@@ -115,13 +134,15 @@ def cmd_decide(args: argparse.Namespace) -> int:
     for r in rows:  # first ts of a card: its history ends strictly before
         card = int(r["cc_num"])
         if card not in states:
+            if not (df["cc_num"] == card).any():
+                raise ValueError(f"card {card} is not in the history data")
             states[card] = CardState.from_history(profile_of(df, card), df, at=pd.Timestamp(r["ts"]))
     out = []
     for r in rows:
         state = states[int(r["cc_num"])]
         tx = Tx(ts=pd.Timestamp(r["ts"]), amt=float(r["amt"]), merchant=str(r["merchant"]),
                 category=str(r["category"]), merch_lat=float(r["merch_lat"]), merch_long=float(r["merch_long"]))
-        d = serving.decide(state, tx)
+        d = serving.decide(state, tx)  # raises ValueError if the card's rows are out of time order
         state.push(tx)
         out.append(json.dumps({"p": d.p, "declined": d.declined} if expose else {"declined": d.declined}))
     text = "\n".join(out) + ("\n" if out else "")

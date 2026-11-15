@@ -35,6 +35,12 @@ def count_model(df):
     return CountModel(BaseEncoder().fit(df))
 
 
+def None_model(model_dir):
+    from fraudaudit.model.artifacts import load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    return FraudModel.from_artifacts(load_artifacts(model_dir))
+
+
 def test_skew_passes_on_consistent_paths(df, count_model):
     assert df.duplicated(["cc_num", "ts"]).sum() > 0  # same-second ops are in the sample
     rep = skew_check(df, count_model, n_cards=10, seed=42, n_jobs=1)
@@ -46,10 +52,11 @@ def test_skew_passes_on_consistent_paths(df, count_model):
     assert set(rep.max_abs_diff) == set(FEATURE_COLUMNS)
 
 
-def test_skew_identical_for_n_jobs(df, count_model):
-    a = skew_check(df, count_model, n_cards=6, seed=7, n_jobs=1)
-    b = skew_check(df, count_model, n_cards=6, seed=7, n_jobs=2)
+def test_skew_identical_for_n_jobs(df, real_model_dir):
+    a = skew_check(df, None_model(real_model_dir), n_cards=6, seed=7, n_jobs=1, model_dir=real_model_dir)
+    b = skew_check(df, None_model(real_model_dir), n_cards=6, seed=7, n_jobs=2, model_dir=real_model_dir)
     assert a == b
+    assert a.passed and a.decision_mismatches == 0 and a.max_abs_p_diff < 1e-5
 
 
 def test_skew_detects_injected_fault(df, count_model, monkeypatch):
@@ -135,6 +142,41 @@ def test_decide_cli_refuses_score_in_production(tmp_path, monkeypatch, capsys):
     assert "production" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("env", ["Production", " prod ", "PRODUCTION", "prod"])
+def test_decide_cli_refuses_score_in_production_any_spelling(env, tmp_path, monkeypatch, capsys):
+    inp = tmp_path / "tx.jsonl"
+    inp.write_text("")
+    monkeypatch.setenv("EXPOSE_SCORE", "1")
+    monkeypatch.setenv("ENV", env)
+    assert cli.main(["decide", "--data", "unused", "--model", "unused", "--input", str(inp)]) != 0
+    assert "production" in capsys.readouterr().err
+
+
+def _decide_err(rows, df, real_model_dir, tmp_path, monkeypatch, capsys):
+    inp = tmp_path / "bad.jsonl"
+    inp.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    monkeypatch.setattr("fraudaudit.data.load_raw", lambda d: df)
+    monkeypatch.delenv("EXPOSE_SCORE", raising=False)
+    monkeypatch.delenv("ENV", raising=False)
+    rc = cli.main(["decide", "--data", "unused", "--model", str(real_model_dir), "--input", str(inp)])
+    return rc, capsys.readouterr().err
+
+
+def test_decide_cli_bad_input_is_clear_error(df, real_model_dir, tmp_path, monkeypatch, capsys):
+    rows = _input_rows(df)
+    missing = [{k: v for k, v in rows[0].items() if k != "amt"}]
+    rc, err = _decide_err(missing, df, real_model_dir, tmp_path, monkeypatch, capsys)
+    assert rc != 0 and "amt" in err and "Traceback" not in err
+    unknown = [dict(rows[0], cc_num=1)]
+    rc, err = _decide_err(unknown, df, real_model_dir, tmp_path, monkeypatch, capsys)
+    assert rc != 0 and "not in the history" in err
+    card = [r for r in rows if r["cc_num"] == rows[0]["cc_num"]]
+    assert len(card) > 2
+    rc, err = _decide_err([card[1], card[0]] if card[0]["ts"] != card[1]["ts"] else [card[2], card[0]],
+                          df, real_model_dir, tmp_path, monkeypatch, capsys)
+    assert rc != 0 and "time only moves forward" in err
+
+
 def test_skew_cli_writes_step_summary(df, real_model_dir, tmp_path, monkeypatch):
     summary = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
@@ -142,4 +184,4 @@ def test_skew_cli_writes_step_summary(df, real_model_dir, tmp_path, monkeypatch)
     rc = cli.main(["skew", "--data", "unused", "--model", str(real_model_dir), "--cards", "5", "--n-jobs", "1"])
     text = summary.read_text(encoding="utf-8")
     assert "Звірка навчального і продуктивного шляхів ознак" in text
-    assert ("PASS" in text) == (rc == 0)
+    assert rc == 0 and "PASS" in text and "max_abs_p_diff" not in text

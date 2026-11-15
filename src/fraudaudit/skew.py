@@ -9,9 +9,9 @@ exactly equal; only the three float means (``mean_amt_*``) get ``atol`` (+ 1e-6 
 as ``np.allclose`` in ``tests/test_serving.py``), because float32 rounding of a float64 mean may
 differ by one ulp between a summation over a window and a running list.
 
-Decisions are compared on the same two feature matrices with one ``predict_proba`` call each
-(a batch call instead of one call per operation: the probabilities agree up to float32 kernel
-noise, and a per-operation call would dominate the runtime).
+Decisions: every replayed operation goes through ``Serving.decide`` (single-row compiled call)
+and is compared with the batch decision ``p_batch >= tau``; ``max_abs_p_diff`` is the largest
+|p_serving - p_batch|.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import multiprocessing as mp
 import os
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
-from types import SimpleNamespace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,32 +42,56 @@ class SkewReport:
     n_tx: int
     passed: bool
     n_cards: int = 0
+    max_abs_p_diff: float = 0.0
 
 
-def replay_card(g: pd.DataFrame, encoder) -> np.ndarray:
-    """Serving-path features of one card's rows (``g`` sorted by (ts, row)), in ``g`` order."""
-    # features need neither tau nor the network: a worker never loads the model
-    serving = Serving(SimpleNamespace(encoder=encoder, tau=0.0, predict_proba=None))
+_WORKER_MODEL = None  # per worker process: loaded once by _init_worker
+
+
+def _load_model(model_dir):
+    from .model.artifacts import load_artifacts
+    from .model.pipeline import FraudModel
+    return FraudModel.from_artifacts(load_artifacts(Path(model_dir)))
+
+
+def _init_worker(model_dir) -> None:
+    global _WORKER_MODEL
+    _WORKER_MODEL = _load_model(model_dir)
+
+
+def replay_card(g: pd.DataFrame, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Serving path of one card (``g`` sorted by (ts, row)): features, p and declined of every
+    operation, in ``g`` order. ``Serving.decide`` (single-row call) runs before each ``push``."""
+    serving = Serving(model)
     state = CardState.from_history(profile_of(g, g["cc_num"].iloc[0]), g.iloc[:0], at=g["ts"].iloc[0])
-    out = np.empty((len(g), len(FEATURE_COLUMNS)), dtype=np.float32)
+    F = np.empty((len(g), len(FEATURE_COLUMNS)), dtype=np.float32)
+    p = np.empty(len(g))
+    declined = np.empty(len(g), dtype=bool)
     for i, r in enumerate(g.itertuples(index=False)):
         tx = Tx(ts=pd.Timestamp(r.ts), amt=float(r.amt), merchant=str(r.merchant), category=str(r.category),
                 merch_lat=float(r.merch_lat), merch_long=float(r.merch_long))
-        out[i] = serving.features(state, tx)
+        F[i] = serving.features(state, tx)
+        d = serving.decide(state, tx)
+        p[i], declined[i] = d.p, d.declined
         state.push(tx)
-    return out
+    return F, p, declined
 
 
-def _replay_job(args) -> np.ndarray:
-    return replay_card(*args)
+def _replay_job(g: pd.DataFrame):
+    return replay_card(g, _WORKER_MODEL)
 
 
 def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1e-4,
-               n_jobs: int | None = None) -> SkewReport:
-    """Compare both feature paths on ``n_cards`` cards drawn with ``default_rng(seed)``.
+               n_jobs: int | None = None, model_dir: Path | str | None = None) -> SkewReport:
+    """Compare both paths on ``n_cards`` cards drawn with ``default_rng(seed)``.
 
-    Per-card replays run in a process pool (``n_jobs``, default ``os.cpu_count()``); a replay is
-    deterministic, so the result is identical for any ``n_jobs``.
+    Per card, every operation goes through ``Serving.decide`` (single-row compiled call) and is
+    compared with the batch path (``features`` + one batched ``predict_proba``): feature diffs,
+    decision mismatches (declined differs) and ``max_abs_p_diff``.
+
+    ``n_jobs > 1`` needs ``model_dir`` (artifact directory): each worker loads its own model, as
+    Keras models are not picklable. Without ``model_dir`` the given ``model`` object is used
+    in-process (stub models in tests). Results are identical for any ``n_jobs``.
     """
     cards = np.sort(df["cc_num"].unique())
     k = min(n_cards, len(cards))
@@ -75,17 +99,25 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
     sub = df[df["cc_num"].isin(chosen)].sort_values(["ts", "row"], kind="stable")
     sub = sub[_REPLAY_COLS].reset_index(drop=True)
     batch = features(sub, model.encoder)  # aggregates are per card: a card subset gives the same values
+    p_batch = np.asarray(model.predict_proba(batch), dtype=np.float64)
 
-    groups = [(g, model.encoder) for _, g in sub.groupby("cc_num", sort=True)]
+    groups = [g for _, g in sub.groupby("cc_num", sort=True)]
     jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs
-    if jobs <= 1 or len(groups) <= 1:
-        parts = [_replay_job(a) for a in groups]
-    else:
-        with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn")) as ex:
+    if jobs > 1 and len(groups) > 1:
+        if model_dir is None:
+            raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+        with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn"),
+                                 initializer=_init_worker, initargs=(str(model_dir),)) as ex:
             parts = list(ex.map(_replay_job, groups))
+    else:
+        m = model if model_dir is None else _load_model(model_dir)
+        parts = [replay_card(g, m) for g in groups]
     served = np.empty_like(batch)
-    for (g, _), part in zip(groups, parts):
-        served[g.index.to_numpy()] = part
+    p_served = np.empty(len(sub))
+    declined = np.empty(len(sub), dtype=bool)
+    for g, (F, p, dec) in zip(groups, parts):
+        ix = g.index.to_numpy()
+        served[ix], p_served[ix], declined[ix] = F, p, dec
 
     diff = np.abs(served.astype(np.float64) - batch.astype(np.float64))
     max_diff = {c: float(diff[:, i].max()) if len(diff) else 0.0 for i, c in enumerate(FEATURE_COLUMNS)}
@@ -93,11 +125,10 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
     tol[:, _MEAN_IDX] = atol + _RTOL * np.abs(batch[:, _MEAN_IDX].astype(np.float64))
     features_ok = bool((diff <= tol).all())
 
-    p_batch = np.asarray(model.predict_proba(batch))
-    p_served = np.asarray(model.predict_proba(served))
-    mismatches = int(((p_batch >= model.tau) != (p_served >= model.tau)).sum())
+    mismatches = int((declined != (p_batch >= model.tau)).sum())
+    p_diff = float(np.abs(p_served - p_batch).max()) if len(sub) else 0.0
     return SkewReport(max_abs_diff=max_diff, decision_mismatches=mismatches, n_tx=int(len(sub)),
-                      passed=features_ok and mismatches == 0, n_cards=int(k))
+                      passed=features_ok and mismatches == 0, n_cards=int(k), max_abs_p_diff=p_diff)
 
 
 def summary_markdown(rep: SkewReport, atol: float) -> str:
@@ -107,12 +138,13 @@ def summary_markdown(rep: SkewReport, atol: float) -> str:
         "## Звірка навчального і продуктивного шляхів ознак",
         "",
         f"- Карток: {rep.n_cards}, операцій: {rep.n_tx}",
-        f"- Найбільша розбіжність: `{worst[0]}` = {worst[1]:.3g} (допуск лише для середніх: {atol:g}, решта точно)",
-        f"- Розбіжностей рішень: {rep.decision_mismatches}",
+        f"- Найбільша розбіжність серед усіх {len(rep.max_abs_diff)} ознак: `{worst[0]}` = {worst[1]:.3g} "
+        f"(допуск лише для середніх: {atol:g}, решта точно)",
+        f"- Розбіжностей рішень: {rep.decision_mismatches}; найбільша |Δp|: {rep.max_abs_p_diff:.3g}",
         f"- Результат: **{'PASS' if rep.passed else 'FAIL'}**",
         "",
         "| ознака | макс. розбіжність |",
         "|---|---|",
     ]
-    lines += [f"| `{c}` | {rep.max_abs_diff[c]:.3g} |" for c in AGG_COLUMNS]
+    lines += [f"| `{c}` | {v:.3g} |" for c, v in rep.max_abs_diff.items()]
     return "\n".join(lines) + "\n"
