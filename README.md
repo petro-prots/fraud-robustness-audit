@@ -28,3 +28,7 @@ The package is installed in editable mode (`pip install -e .`), so mounting the 
 ## Pinned versions
 
 All versions in `requirements.txt` are exact (`==`) and were resolved as specified (no deviations from the starting versions). Python 3.12; `jupyterlab==4.2.5` in the dev stage only.
+
+## Data periods and fraud episodes
+
+`fraudaudit.data`: `fit` = train before 2020-03-21, `val` = train from 2020-03-21, `test` = Sparkov test file. Fraud episodes are per-card fraud operations split at a gap > 7 days. Measured on the real data (1 852 394 rows, 9 651 fraud): `fit` 631 episodes, `val` 135, `test` 218 (one episode per card in every period; test median 10 ops, max 19).
