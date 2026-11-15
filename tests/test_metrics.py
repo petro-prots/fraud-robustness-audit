@@ -48,3 +48,23 @@ def test_uplift_ci_paired():
         uplift_ci(adv, clean[:-1])
     with pytest.raises(ValueError):
         uplift_ci(np.array([]), np.array([]))
+
+
+def test_uplift_ci_one_sided():
+    from fraudaudit.metrics import uplift_se
+    rng = np.random.default_rng(1)
+    clean = rng.uniform(0, 1, 80)
+    adv = clean + rng.normal(0.05, 0.3, 80)
+    two = uplift_ci(adv, clean, 0.95, 2000, 3)
+    one = uplift_ci(adv, clean, 0.95, 2000, 3, one_sided=True)
+    assert one[0] == two[0]                    # same mean
+    assert one[1] == two[1]                    # lower: the two-sided lower bound (documented)
+    assert one[2] <= two[2] and one[2] < two[2]  # one-sided 95 % upper = 95th percentile < 97.5th
+    d = adv - clean
+    means = d[np.random.default_rng(3).integers(0, d.size, size=(2000, d.size))].mean(axis=1)
+    assert one[2] == pytest.approx(float(np.quantile(means, 0.95)))
+    assert uplift_se(adv, clean, 2000, 3) == pytest.approx(float(means.std(ddof=1)))
+    assert uplift_ci(clean, clean, one_sided=True) == (0.0, 0.0, 0.0)
+    assert uplift_se(clean, clean) == 0.0
+    # the default is unchanged: two-sided
+    assert uplift_ci(adv, clean, 0.95, 2000, 3) == two

@@ -440,3 +440,103 @@ def test_clean_ver_passes_tau_after_decline(df, tm):
     s = Serving(LimitModel(BaseEncoder().fit(df), limit=60.0))
     base = clean_ver(s, ctxs, df, None, tm.rho)
     assert np.array_equal(base, clean_ver(s, ctxs, df, None, tm.rho, tau_after_decline=None))
+
+
+# --- R14: targets = every episode of the target periods, spares from the fit period -------------------------
+
+
+def _spy_spares(monkeypatch):
+    seen = {}
+    real = audit_mod.ReconOracle
+
+    def spy(serving, spares, *a, **kw):
+        seen["spares"] = list(spares)
+        return real(serving, spares, *a, **kw)
+
+    monkeypatch.setattr(audit_mod, "ReconOracle", spy)
+    return seen
+
+
+def test_fit_spares_targets_are_all_test_episodes(df, model, tm, model_dir, monkeypatch):
+    seen = _spy_spares(monkeypatch)
+    r = run_audit(df, model, tm, RandomSearch(), seed=3, n_jobs=1, model_dir=model_dir,
+                  target_periods=("test",), spares_period="fit")
+    want = fraud_episodes(df, {"test"})
+    assert [(t["card"], t["start"]) for t in r.per_target] == [(e.card, e.start.isoformat()) for e in want]
+    assert r.n_targets == len(want)
+    fit = fraud_episodes(df, {"fit"})
+    assert [(c.episode.card, c.episode.start) for c in seen["spares"]] == [(e.card, e.start) for e in fit]
+    per = audit_mod.period(df)
+    spare_rows = [row for c in seen["spares"] for row in c.episode.rows]
+    assert set(per[df["row"].isin(spare_rows)]) == {"fit"}
+    assert r.meta["spares_period"] == "fit" and r.meta["target_periods"] == ["test"]
+    assert r.spare_cards == sorted({e.card for e in fit})
+    assert r.meta["recon"]["n_spare_episodes"] == len(fit)
+    # every spare context is the card's own history right before the fit-period spare episode
+    import pandas as pd
+    for c in seen["spares"]:
+        assert c.profile.cc_num == c.episode.card
+        start = pd.Timestamp(c.episode.start).value
+        assert c.state._now == start and all(t < start for t in c.state._t)
+    assert any(c.state._t for c in seen["spares"])  # history exists for fit-period spares
+
+
+def test_spares_period_test_reproduces_the_old_split(df, model, tm, model_dir, result):
+    from fraudaudit.data import split_cards
+    r = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                  target_periods=ALL, threat_path=TM_PATH, spares_period="test")
+    assert r.per_target == result.per_target and r.spare_cards == result.spare_cards
+    assert r.uplift == result.uplift and r.meta["spares_period"] == "test"
+    tgt, spare = split_cards(fraud_episodes(df, set(ALL)), 7)
+    assert [t["card"] for t in r.per_target] == [e.card for e in tgt]
+    assert r.spare_cards == sorted({e.card for e in spare})
+
+
+@pytest.mark.parametrize("bad", ["val", "train", "", None])
+def test_spares_period_strict(df, model, tm, model_dir, bad):
+    with pytest.raises(ValueError):
+        run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                  target_periods=("test",), spares_period=bad)
+
+
+def test_fit_spares_need_targets_outside_fit(df, model, tm, model_dir):
+    with pytest.raises(ValueError, match="fit"):
+        run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                  target_periods=ALL, spares_period="fit")
+
+
+@pytest.fixture(scope="module")
+def fit_result(df, model, tm, model_dir):
+    return run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                     target_periods=("val", "test"), threat_path=TM_PATH, spares_period="fit", one_sided=True)
+
+
+def test_fit_spares_identical_for_n_jobs(df, model, tm, model_dir, fit_result):
+    r2 = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=2, model_dir=model_dir,
+                   target_periods=("val", "test"), threat_path=TM_PATH, spares_period="fit", one_sided=True)
+    assert r2.per_target == fit_result.per_target
+    assert (r2.ver_adv, r2.ver_clean, r2.uplift, r2.recon_ops) == \
+           (fit_result.ver_adv, fit_result.ver_clean, fit_result.uplift, fit_result.recon_ops)
+    np.testing.assert_array_equal(r2.best.to_vector(), fit_result.best.to_vector())
+    assert r2.meta["recon"] == fit_result.meta["recon"] and r2.meta["uplift_se"] == fit_result.meta["uplift_se"]
+
+
+def test_one_sided_uplift_in_audit(fit_result):
+    from fraudaudit.metrics import uplift_se
+    adv = np.array([t["ver_adv"] for t in fit_result.per_target])
+    clean = np.array([t["ver_clean"] for t in fit_result.per_target])
+    assert fit_result.uplift == uplift_ci(adv, clean, 0.95, audit_mod.N_BOOT, 7, one_sided=True)
+    assert fit_result.uplift[2] <= uplift_ci(adv, clean, 0.95, audit_mod.N_BOOT, 7)[2]
+    assert fit_result.meta["one_sided"] is True
+    assert fit_result.meta["uplift_se"] == uplift_se(adv, clean, audit_mod.N_BOOT, 7)
+    assert fit_result.ver_adv == ver_ci(adv, 0.95, audit_mod.N_BOOT, 7)  # VER intervals stay two-sided
+
+
+def test_baseline_uses_the_audit_targets_with_fit_spares(df, model, tm, model_dir, fit_result):
+    from fraudaudit.audit import run_single_tx_baseline
+    from fraudaudit.threat import SingleTxThreatModel
+    b = run_single_tx_baseline(df, model, SingleTxThreatModel.from_yaml(SINGLE_PATH), tm, seed=7, n_jobs=1,
+                               model_dir=model_dir, target_periods=("val", "test"), spares_period="fit")
+    assert [(t["card"], t["start"]) for t in b.per_target] == \
+           [(t["card"], t["start"]) for t in fit_result.per_target]
+    assert b.meta["spares_period"] == "fit"

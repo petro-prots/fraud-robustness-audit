@@ -9,15 +9,15 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit import BaselineResult, _num, _pct, baseline_to_json, strategy_dict, to_json
+from .audit import BaselineResult, _num, _pct, baseline_to_json, spares_text, strategy_dict, to_json
 from .metrics import uplift_ci
 from .gate import Check, GateConfig, parse_run_key, passed
 
 VERDICT_OK, VERDICT_FAIL = "PASSED", "FAILED"
 
 _TITLE = {
-    "ver_uplift": "VER uplift under attack – upper {conf} % bound of the VER_adv − VER_clean interval, "
-                  "worst attack × seed",
+    "ver_uplift": "VER uplift under attack – {side} upper {conf} % bound of VER_adv − VER_clean (paired "
+                  "bootstrap), worst attack × seed",
     "recall_clean": "recall on clean test operations at τ",
     "feasibility": "share of executed adversarial operations within the threat model (minimum over runs)",
     "skew": "decision mismatches between the training and serving feature paths",
@@ -56,6 +56,17 @@ def _threshold(c: Check) -> str:
 
 def _ci(t) -> str:
     return f"{_pct(t[0])} [{_pct(t[1])}; {_pct(t[2])}]"
+
+
+def _side(r) -> str:
+    return "one-sided" if r.meta.get("one_sided") else "two-sided"
+
+
+def _uplift(r) -> str:
+    """The uplift of run ``r``: mean and its upper bound (one-sided) or the two-sided interval."""
+    if r.meta.get("one_sided"):
+        return f"{_pct(r.uplift[0])} (upper {_pct(r.uplift[2])})"
+    return _ci(r.uplift)
 
 
 def baseline_comparison(b: BaselineResult, results: dict, worst_key: str) -> dict:
@@ -128,11 +139,11 @@ def _baseline_section(baselines: dict, results: dict, worst_key: str, conf: int,
                      f"| {_pct(x.replay_ver[0])} [{_pct(x.replay_ver[1])}; {_pct(x.replay_ver[2])}] "
                      f"| {_pct(x.replay_uplift[0])} [{_pct(x.replay_uplift[1])}; {_pct(x.replay_uplift[2])}] "
                      f"| {x.meta['queries']} |")
-    va, wu, d = cmp["worst_ver_adv"], cmp["worst_uplift"], cmp["adv_minus_replay"]
+    va, d = cmp["worst_ver_adv"], cmp["adv_minus_replay"]
     lines += [
         "",
         f"Episode audit: worst run `{worst_key}` – VER_adv {_pct(va[0])} [{_pct(va[1])}; {_pct(va[2])}], "
-        f"uplift {_pct(wu[0])} [{_pct(wu[1])}; {_pct(wu[2])}]; mean uplift over {cmp['n_runs']} "
+        f"uplift {_uplift(results[worst_key])}; mean uplift over {cmp['n_runs']} "
         f"attack × seed runs {_pct(cmp['uplift_mean_runs'])} (from {_pct(cmp['uplift_min_runs'])} to "
         f"{_pct(cmp['uplift_max_runs'])}). Paired difference VER_adv (`{worst_key}`) − VER of replay (`{b.amount_rule}`): "
         f"{_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}].",
@@ -154,7 +165,7 @@ def _baseline_section(baselines: dict, results: dict, worst_key: str, conf: int,
         f"`max_declines` = {ep['max_declines']} and ρ = {_num(ep['rho'], 2)}; for rule `{b.amount_rule}` the "
         f"ρ·A threshold was reached in {b.meta['n_replay_success']} of {b.n_targets} episodes, cards blocked: "
         f"{b.meta['n_replay_blocked']}.",
-        f"- The same {b.n_targets} target episodes as in the episode audit (split seed {b.meta['seed']}); "
+        f"- The same {b.n_targets} target episodes as in the episode audit (seed {b.meta['seed']}); "
         "time: " + ", ".join(f"`{r}` {x.meta['wall_seconds']} s" for r, x in baselines.items()) + ".",
     ]
     return lines
@@ -186,8 +197,8 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
         lines.append("Failed: " + ", ".join(f"`{c.name}`" for c in failed) + ". What to do – see the "
                      "\"Recommendations\" section.")
     lines += ["",
-              f"Worst case: attack `{w_attack}`, attack seed {w_seed}; upper {conf} % bound of the "
-              f"VER_adv − VER_clean uplift interval {_pct(up.value)} against "
+              f"Worst case: attack `{w_attack}`, attack seed {w_seed}; {_side(w)} upper {conf} % bound of the "
+              f"VER_adv − VER_clean uplift {_pct(up.value)} against "
               + (f"δ = {_pct(delta)}." if delta is not None else "an unset δ."),
               ""]
     per_card = int(wm["n_target_cards"]) == int(w.n_targets)
@@ -203,7 +214,7 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
                      "amount is not set.")
     lines += ["", "## Checks", "", "| check | value | threshold | result |", "|---|---:|---|---|"]
     for c in checks:
-        title = _TITLE[c.name].format(conf=conf)
+        title = _TITLE[c.name].format(conf=conf, side=_side(w))
         show = c.name == "ver_uplift" or (not c.passed and c.name == "feasibility")
         where = f" (run `{c.worst}`)" if show and c.worst and len(results) > 1 else ""
         lines.append(f"| `{c.name}` – {title}{where} | {_value(c)} | {_threshold(c)} "
@@ -217,15 +228,17 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
             lines.append(f"- `{c.name}`: {c.recommendation}")
 
     lines += ["", "## Attacks × seed", "",
-              f"The split of cards into target and spare is the same for all runs (seed {wm['seed']}); only the "
+              f"The target and spare episodes are the same for all runs (seed {wm['seed']}); only the "
               "attack's random stream changes. The gate takes the worst run.", "",
-              f"| attack | attack seed | VER_adv [{conf} %] | uplift [{conf} %] | ASR | recon operations "
+              f"| attack | attack seed | VER_adv [{conf} %, two-sided] | uplift "
+              + (f"(one-sided upper {conf} % bound)" if w.meta.get("one_sided") else f"[{conf} %]")
+              + " | ASR | recon operations "
               "| strategy evaluations | |",
               "|---|---:|---|---|---|---:|---:|---|"]
     for key, r in results.items():
         a, s = parse_run_key(key)
         mark = "**⚠ worst**" if key == worst_key else ""
-        lines.append(f"| {a} | {s} | {_ci(r.ver_adv)} | {_ci(r.uplift)} | {_pct(r.asr)} "
+        lines.append(f"| {a} | {s} | {_ci(r.ver_adv)} | {_uplift(r)} | {_pct(r.asr)} "
                      f"({r.meta['n_success']} of {r.n_targets}) | {r.recon_ops} | {r.meta['recon']['evals']} | {mark} |")
 
     lines += ["", "## Baseline and assumptions", "",
@@ -238,10 +251,12 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               f"- VER > 1 (because of the lower bound of the operation amount) in the worst run: adversarial episodes "
               f"{wm['n_ver_adv_gt_1']} (max {_num(wm['max_ver_adv'])}), real {wm['n_ver_clean_gt_1']} "
               f"(max {_num(wm['max_ver_clean'])}); values are not clipped.",
-              f"- Target episodes: {w.n_targets} (cards: {wm['n_target_cards']}); spare cards for reconnaissance: "
-              f"{len(w.spare_cards)}; reconnaissance budget {wm['recon_budget_ops']} operations per run.",
-              f"- Intervals: percentile bootstrap over episodes ({wm['n_boot']} resamples, uplift paired); ASR "
-              f"bound – Clopper–Pearson."]
+              f"- Target episodes: {w.n_targets} (cards: {wm['n_target_cards']}); {spares_text(wm, w.spare_cards)} "
+              f"Reconnaissance budget {wm['recon_budget_ops']} operations per run.",
+              f"- Intervals: percentile bootstrap over episodes ({wm['n_boot']} resamples); VER intervals two-sided; "
+              + (f"uplift paired, one-sided upper {conf} % bound (the gate tests only uplift ≤ δ)"
+                 if w.meta.get("one_sided") else "uplift paired, two-sided")
+              + "; ASR bound – Clopper–Pearson."]
 
     if baseline or baseline_error is not None:
         lines += _baseline_section(baseline or {}, results, worst_key, conf, baseline_error)

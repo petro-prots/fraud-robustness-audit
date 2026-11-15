@@ -9,6 +9,7 @@ import pandas as pd
 
 VAL_START = pd.Timestamp("2020-03-21")
 EPISODE_GAP = pd.Timedelta(days=7)
+SPARES_PERIODS = ("fit", "test")  # where the reconnaissance spares come from (ruling R14), see audit.select_episodes
 
 
 def finalize(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:

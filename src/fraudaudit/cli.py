@@ -52,6 +52,21 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--seed", type=int, default=42)
     audit.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
 
+    cal = sub.add_parser("calibrate", help="resolution of the gate on the baseline model: the gate's ensemble, "
+                                           "uplift mean / upper bound / SE per run and the verdict for several δ; "
+                                           "never changes gate.yaml")
+    cal.add_argument("--data", type=Path, default=Path("data"))
+    cal.add_argument("--model", type=Path, default=Path("models"), help="artifact directory (baseline model)")
+    cal.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
+    cal.add_argument("--gate", type=Path, default=Path("gate.yaml"),
+                     help="attacks, attack seeds, confidence, one_sided, spares_period (read only)")
+    cal.add_argument("--out", type=Path, default=Path("out/calibration"),
+                     help="writes calibration.json and calibration.md")
+    cal.add_argument("--deltas", type=_deltas, default=[0.02, 0.05, 0.10, 0.15, 0.20],
+                     help="comma-separated δ values for the verdict table (default 0.02,0.05,0.10,0.15,0.20)")
+    cal.add_argument("--seed", type=int, default=42)
+    cal.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -59,6 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
                         help="JSONL: cc_num, ts, amt, merchant, category, merch_lat, merch_long; in time order")
     decide.add_argument("--output", type=Path, default=None, help="JSONL output (default: stdout)")
     return parser
+
+
+def _deltas(text: str) -> list[float]:
+    """``--deltas``: comma-separated non-negative numbers."""
+    try:
+        vals = [float(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected comma-separated numbers, got {text!r}") from None
+    if not vals or any(not (v >= 0) or v == float("inf") for v in vals):
+        raise argparse.ArgumentTypeError(f"expected finite numbers >= 0, got {text!r}")
+    return vals
 
 
 def git_info(cwd: Path | None = None) -> dict:
@@ -148,11 +174,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
             if want != got:
                 raise ValueError(f"skew report {args.skew_report} was made for another model "
                                  f"(model_sha256 {want}, audited model {got}): rerun `fraudaudit skew --out`")
-        model_meta = json.loads((args.model / "model.json").read_text(encoding="utf-8")).get("meta", {})
-        model_fpr = model_meta.get("target_fpr")
-        if model_fpr is not None and abs(float(model_fpr) - cfg.target_fpr) > 1e-12:
-            raise ValueError(f"model τ was chosen for target_fpr {model_fpr}, "
-                             f"{args.gate} asks for {cfg.target_fpr}")
+        model_fpr = _check_model_fpr(args.model, cfg, args.gate)
         df = load_raw(args.data)
         model = FraudModel.from_artifacts(load_artifacts(args.model))  # SHA-256 before deserialisation
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
@@ -177,7 +199,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
             for rule in rules:
                 b = audit_mod.run_single_tx_baseline(df, model, tms, tm, args.seed, n_jobs=args.n_jobs,
                                                      model_dir=args.model, single_path=args.single_threat,
-                                                     confidence=cfg.confidence, amount_rule=rule)
+                                                     confidence=cfg.confidence, amount_rule=rule,
+                                                     spares_period=cfg.spares_period)
                 baseline[rule] = b
                 print(f"baseline {rule}: evaded ops {b.evaded_tx_share:.4f}, amount {b.evaded_amount_share:.4f}, "
                       f"chosen/A {b.chosen_amount_ratio:.4f}, replay VER {b.replay_ver[0]:.4f}, "
@@ -205,6 +228,56 @@ def cmd_audit(args: argparse.Namespace) -> int:
         with open(summary, "a", encoding="utf-8") as f:
             f.write((args.out / "summary.md").read_text(encoding="utf-8"))
     return 0 if passed(checks) else 1
+
+
+def _check_model_fpr(model_dir: Path, cfg, gate_path: Path):
+    """The model's ``target_fpr`` (``model.json`` meta, may be None); ValueError if it differs from the gate."""
+    model_meta = json.loads((model_dir / "model.json").read_text(encoding="utf-8")).get("meta", {})
+    model_fpr = model_meta.get("target_fpr")
+    if model_fpr is not None and abs(float(model_fpr) - cfg.target_fpr) > 1e-12:
+        raise ValueError(f"model τ was chosen for target_fpr {model_fpr}, {gate_path} asks for {cfg.target_fpr}")
+    return model_fpr
+
+
+def cmd_calibrate(args: argparse.Namespace) -> int:
+    import hashlib
+
+    import yaml
+
+    from fraudaudit.calibrate import calibration, write_calibration
+    from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig, run_ensemble
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.threat import ThreatModel
+
+    t0 = time.perf_counter()
+    try:
+        gate_bytes = args.gate.read_bytes()
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        _check_model_fpr(args.model, cfg, args.gate)
+        df = load_raw(args.data)
+        model = FraudModel.from_artifacts(load_artifacts(args.model))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        print(f"error: calibration configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    t1 = time.perf_counter()
+    results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
+                           threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
+    meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
+            "gate_sha256": hashlib.sha256(gate_bytes).hexdigest(),
+            "wall_seconds": round(time.perf_counter() - t1, 1),
+            "wall_seconds_with_loading": round(time.perf_counter() - t0, 1)}
+    data = calibration(results, cfg, args.deltas, meta)
+    write_calibration(args.out, data)
+    if args.gate.read_bytes() != gate_bytes:  # this command only reads the gate
+        raise RuntimeError(f"{args.gate} changed during calibration")
+    print(json.dumps({"resolution": data["resolution"], "worst_run": data["worst_run"],
+                      "worst_upper": data["worst_upper"],
+                      "verdict_vs_delta": {str(r["delta"]): r["baseline_verdict"] for r in data["verdict_vs_delta"]},
+                      "wall_seconds": meta["wall_seconds"], "out": str(args.out)}, indent=2), flush=True)
+    return 0
 
 
 def _baseline_brief(b: dict | None) -> dict | None:
@@ -285,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_skew(args)
     if args.command == "audit":
         return cmd_audit(args)
+    if args.command == "calibrate":
+        return cmd_calibrate(args)
     if args.command == "decide":
         return cmd_decide(args)
     return 0

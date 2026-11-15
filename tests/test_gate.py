@@ -50,12 +50,12 @@ def model(model_dir):
 @pytest.fixture(scope="module")
 def base(df, model, tm, model_dir):
     return run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                     target_periods=ALL, threat_path=TM_PATH, attack_seed=1)
+                     target_periods=ALL, threat_path=TM_PATH, attack_seed=1, one_sided=True)
 
 
 def cfg(**kw):
     d = dict(target_fpr=0.01, recall_clean_min=0.5, delta=0.05, attacks=["random", "es"],
-             attack_seeds=[1, 2, 3], confidence=0.95)
+             attack_seeds=[1, 2, 3], confidence=0.95, one_sided=True, spares_period="test")
     d.update(kw)
     return GateConfig(**d)
 
@@ -76,7 +76,7 @@ def by_name(checks):
 def test_gate_yaml_committed_values():
     c = GateConfig.from_yaml(GATE_PATH)
     assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.05, attacks=["random", "es"],
-                           attack_seeds=[1, 2, 3], confidence=0.95)
+                           attack_seeds=[1, 2, 3], confidence=0.95, one_sided=True, spares_period="fit")
 
 
 @pytest.mark.parametrize("change", [
@@ -92,6 +92,14 @@ def test_gate_yaml_committed_values():
     {"recall_clean_min": 1.5},
     {"confidence": 1.0},
     {"target_fpr": 0.0},
+    {"one_sided": "drop"},
+    {"one_sided": "yes"},
+    {"one_sided": 1},
+    {"one_sided": None},
+    {"spares_period": "drop"},
+    {"spares_period": "val"},
+    {"spares_period": "Fit"},
+    {"spares_period": None},
 ])
 def test_gate_yaml_strict(tmp_path, change):
     raw = yaml.safe_load(GATE_PATH.read_text())
@@ -231,6 +239,12 @@ def test_attack_seed_changes_attack_only(df, model, tm, model_dir, base):
 # --- CLI: exit codes on the synthetic fixture with a tiny model --------------------------------------------
 
 
+def _fixture_periods(kw):
+    """sparkov_like has 2 test episodes: the legacy 50/50 split uses every period; fit-period spares need
+    targets outside fit (val + test)."""
+    return ALL if kw.get("spares_period", "test") == "test" else ("val", "test")
+
+
 @pytest.fixture
 def cli_env(df, model_dir, tmp_path, monkeypatch):
     import fraudaudit.data as data_mod
@@ -238,14 +252,14 @@ def cli_env(df, model_dir, tmp_path, monkeypatch):
     real = audit_mod.run_audit
 
     def all_periods(*a, **kw):
-        kw["target_periods"] = ALL
+        kw["target_periods"] = _fixture_periods(kw)
         return real(*a, **kw)
 
     monkeypatch.setattr(audit_mod, "run_audit", all_periods)
     real_baseline = audit_mod.run_single_tx_baseline
 
     def baseline_all_periods(*a, **kw):
-        kw["target_periods"] = ALL
+        kw["target_periods"] = _fixture_periods(kw)
         return real_baseline(*a, **kw)
 
     monkeypatch.setattr(audit_mod, "run_single_tx_baseline", baseline_all_periods)
@@ -256,19 +270,19 @@ def cli_env(df, model_dir, tmp_path, monkeypatch):
     summary = tmp_path / "step_summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
-    def run(gate, *extra, model=None):
+    def run(gate, *extra, model=None, command="audit"):
         from fraudaudit.cli import main
         g = tmp_path / "gate.yaml"
         g.write_text(gate if isinstance(gate, str) else yaml.safe_dump(gate))
         out = tmp_path / "out"
-        code = main(["audit", "--data", "unused", "--model", str(model or model_dir), "--threat", str(threat),
+        code = main([command, "--data", "unused", "--model", str(model or model_dir), "--threat", str(threat),
                      "--gate", str(g), "--out", str(out), "--seed", "7", "--n-jobs", "1", *extra])
         return code, out, summary
     return run
 
 
 GATE_LOOSE = dict(target_fpr=0.01, recall_clean_min=0.0, delta=10.0, attacks=["random"], attack_seeds=[1],
-                  confidence=0.95)
+                  confidence=0.95, one_sided=True, spares_period="fit")
 
 
 def test_cli_audit_exit_0_when_all_checks_pass(cli_env):
@@ -566,3 +580,119 @@ def test_cli_audit_bad_single_threat_exit_2(cli_env, tmp_path):
     code, out, _ = cli_env(GATE_LOOSE, "--single-threat", str(bad))
     assert code == 2
     assert "configuration/artifact error" in (out / "summary.md").read_text(encoding="utf-8")
+
+
+# --- R14: one-sided uplift bound and the spares period in the gate --------------------------------------------
+
+
+def test_decide_rejects_runs_of_another_method(base):
+    res = {run_key("random", 1): base}
+    decide(cfg(attacks=["random"], attack_seeds=[1]), res, None)  # base: one-sided, legacy split
+    with pytest.raises(ValueError, match="one_sided"):
+        decide(cfg(attacks=["random"], attack_seeds=[1], one_sided=False), res, None)
+    with pytest.raises(ValueError, match="spares_period"):
+        decide(cfg(attacks=["random"], attack_seeds=[1], spares_period="fit"), res, None)
+
+
+def test_run_ensemble_passes_method(df, model, tm, model_dir, monkeypatch):
+    from fraudaudit.gate import run_ensemble
+    seen = []
+
+    def spy(*a, **kw):
+        seen.append((kw["spares_period"], kw["one_sided"], kw["confidence"]))
+        return base_like
+
+    base_like = object()
+    monkeypatch.setattr(audit_mod, "run_audit", spy)
+    out = run_ensemble(df, model, tm, cfg(attacks=["random"], attack_seeds=[1, 2], spares_period="fit"), 7,
+                       n_jobs=1, log=None)
+    assert list(out) == ["random/1", "random/2"]
+    assert seen == [("fit", True, 0.95)] * 2
+
+
+def test_summary_names_the_one_sided_bound(base):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): base}
+    md = summary_markdown(decide(c, res, None), res, {"gate": dataclasses.asdict(c)})
+    assert "one-sided" in md and "two-sided" in md  # uplift one-sided, VER intervals two-sided
+
+
+def test_cli_audit_fit_spares(cli_env):
+    code, out, _ = cli_env(GATE_LOOSE)
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    run = data["runs"]["random/1"]
+    assert run["meta"]["spares_period"] == "fit" and run["meta"]["one_sided"] is True
+    assert data["gate"]["spares_period"] == "fit" and data["gate"]["one_sided"] is True
+    assert "fit period" in (out / "summary.md").read_text(encoding="utf-8")
+
+
+# --- calibrate: resolution of the gate on the baseline model --------------------------------------------------
+
+
+def _with_uplift(base, mean, upper, se, attack_seed=1):
+    return dataclasses.replace(base, uplift=(mean, mean - 0.1, upper),
+                               meta=dict(base.meta, attack_seed=attack_seed, uplift_se=se))
+
+
+def test_calibration_numbers(base):
+    from fraudaudit.calibrate import calibration
+    c = cfg(attacks=["random", "es"], attack_seeds=[1, 2])
+    res = {"random/1": _with_uplift(base, 0.30, 0.36, 0.035),
+           "random/2": _with_uplift(base, 0.40, 0.47, 0.04, 2),
+           "es/1": _with_uplift(base, 0.10, 0.18, 0.05),
+           "es/2": _with_uplift(base, 0.25, 0.30, 0.03, 2)}
+    data = calibration(res, c, [0.02, 0.2, 0.5], {"seed": 7})
+    r = data["resolution"]
+    assert r["max_upper_minus_mean"] == pytest.approx(0.08) and r["max_upper_minus_mean_run"] == "es/1"
+    assert r["seed_spread"] == {"random": pytest.approx(0.10), "es": pytest.approx(0.15)}
+    assert r["seed_spread_max"] == pytest.approx(0.15)
+    assert r["mean_range_all_runs"] == pytest.approx(0.30)
+    assert r["min_certifiable_delta"] == pytest.approx(0.08)
+    assert data["worst_run"] == "random/2" and data["worst_upper"] == pytest.approx(0.47)
+    assert data["runs"]["es/1"] == {"attack": "es", "attack_seed": 1, "mean": 0.10, "upper": 0.18,
+                                    "upper_minus_mean": pytest.approx(0.08), "se": 0.05,
+                                    "lower": pytest.approx(0.0), "ver_adv_mean": base.ver_adv[0],
+                                    "ver_clean_mean": base.ver_clean[0], "n_targets": base.n_targets}
+    rows = {row["delta"]: row for row in data["verdict_vs_delta"]}
+    assert rows[0.02]["baseline_verdict"] == "FAILED" and rows[0.5]["baseline_verdict"] == "PASSED"
+    assert rows[0.2]["baseline_verdict"] == "FAILED"
+    assert rows[0.02]["zero_uplift_model_passes"] is False and rows[0.2]["zero_uplift_model_passes"] is True
+    assert data["one_sided"] is True and data["gate"]["delta"] == 0.05
+
+
+def test_calibration_markdown(base):
+    from fraudaudit.calibrate import calibration, calibration_markdown
+    c = cfg(attacks=["random"], attack_seeds=[1, 2])
+    res = {"random/1": _with_uplift(base, 0.30, 0.36, 0.035), "random/2": _with_uplift(base, 0.40, 0.47, 0.04, 2)}
+    md = calibration_markdown(calibration(res, c, [0.02, 0.05, 0.10, 0.15, 0.20], {"seed": 7}))
+    assert md.startswith("# Gate resolution calibration")
+    assert "| δ |" in md and "| 2.0 % |" in md and "| 20.0 % |" in md
+    assert "Resolution" in md and "spread" in md and "minimal δ" in md.lower()
+    assert "| random | 2 |" in md
+    assert "gate.yaml" in md and "not changed" in md
+
+
+def test_cli_calibrate_writes_table(cli_env):
+    gate_text = yaml.safe_dump(dict(GATE_LOOSE, attack_seeds=[1, 2]))
+    code, out, _ = cli_env(gate_text, "--deltas", "0.02,0.05,0.1", command="calibrate")
+    assert code == 0
+    data = json.loads((out / "calibration.json").read_text(encoding="utf-8"))
+    assert list(data["runs"]) == ["random/1", "random/2"]
+    assert [row["delta"] for row in data["verdict_vs_delta"]] == [0.02, 0.05, 0.1]
+    for k, r in data["runs"].items():
+        assert r["upper"] >= r["mean"] and r["se"] >= 0
+    assert data["resolution"]["max_upper_minus_mean"] == pytest.approx(
+        max(r["upper"] - r["mean"] for r in data["runs"].values()))
+    md = (out / "calibration.md").read_text(encoding="utf-8")
+    assert "| 5.0 % |" in md and "| 10.0 % |" in md
+    assert data["meta"]["spares_period"] == "fit" and data["meta"]["git_sha"]
+    assert (out.parent / "gate.yaml").read_text() == gate_text  # never changes gate.yaml
+    assert not (out / "audit.json").exists()
+
+
+def test_cli_calibrate_parser_defaults():
+    from fraudaudit.cli import build_parser
+    a = build_parser().parse_args(["calibrate"])
+    assert str(a.out) == "out/calibration" and a.deltas == [0.02, 0.05, 0.10, 0.15, 0.20] and a.seed == 42
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["calibrate", "--deltas", "0.1,x"])

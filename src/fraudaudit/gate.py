@@ -8,11 +8,16 @@
     attacks: [random, es]   # the ensemble: every attack ...
     attack_seeds: [1, 2, 3] # ... with every attack seed, on the same target/spare split
     confidence: 0.95        # level of every interval
+    one_sided: true         # the uplift upper bound is one-sided (the gate tests only uplift ≤ δ); VER stays two-sided
+    spares_period: fit      # reconnaissance spares: fit-period episodes, targets = every test episode (R14);
+                            # test = legacy 50/50 card split of the test episodes
 
 Checks (``decide``):
 
 * ``ver_uplift`` – the worst case over attacks × seeds: max of ``AuditResult.uplift[2]`` (upper bound of
-  the paired bootstrap of per-episode VER_adv − VER_clean) must be ≤ δ. ``delta: null`` fails closed.
+  the paired bootstrap of per-episode VER_adv − VER_clean, one-sided when ``one_sided``) must be ≤ δ.
+  ``delta: null`` fails closed. Runs made with another ``confidence``, ``one_sided`` or ``spares_period``
+  are rejected.
 * ``recall_clean`` – recall on clean ``test`` operations at τ ≥ ``recall_clean_min``.
 * ``feasibility`` – every run's ``feasible_share`` == 1 (ruling R3): every executed adversarial operation
   passes the threat model; anything else is a bug of the tool and invalidates the audit.
@@ -26,8 +31,11 @@ from pathlib import Path
 
 import yaml
 
+from .data import SPARES_PERIODS
+
 ATTACKS = ("random", "es")
-GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence")
+GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence", "one_sided",
+             "spares_period")
 
 REC_VER_UPLIFT = ("Model owner: the model is vulnerable to the episode attack – retrain it with adversarial examples "
                   "(`fraudaudit harden`) and rerun the audit; do not weaken the attack or δ.")
@@ -52,6 +60,8 @@ class GateConfig:
     attacks: list[str]
     attack_seeds: list[int]
     confidence: float
+    one_sided: bool
+    spares_period: str
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> "GateConfig":
@@ -84,9 +94,15 @@ class GateConfig:
                                                            for s in seeds) or len(set(seeds)) != len(seeds):
             raise ValueError(f"{where}: attack_seeds must be a non-empty list of distinct integers >= 0, "
                              f"got {seeds!r}")
+        if not isinstance(raw["one_sided"], bool):
+            raise ValueError(f"{where}: one_sided must be true or false, got {raw['one_sided']!r}")
+        if raw["spares_period"] not in SPARES_PERIODS:
+            raise ValueError(f"{where}: spares_period must be one of {list(SPARES_PERIODS)}, "
+                             f"got {raw['spares_period']!r}")
         c = cls(target_fpr=num("target_fpr"), recall_clean_min=num("recall_clean_min"),
                 delta=None if raw["delta"] is None else num("delta"), attacks=list(attacks),
-                attack_seeds=[int(s) for s in seeds], confidence=num("confidence"))
+                attack_seeds=[int(s) for s in seeds], confidence=num("confidence"),
+                one_sided=raw["one_sided"], spares_period=str(raw["spares_period"]))
         if not 0 < c.target_fpr < 1:
             raise ValueError(f"{where}: target_fpr must be in (0, 1)")
         if not 0 <= c.recall_clean_min <= 1:
@@ -142,11 +158,12 @@ def run_ensemble(df, model, tm, cfg: GateConfig, seed: int, *, n_jobs: int | Non
         for s in cfg.attack_seeds:
             r = audit.run_audit(df, model, tm, make_attack(name, tm), seed=seed, n_jobs=n_jobs,
                                 model_dir=model_dir, threat_path=threat_path, attack_seed=s,
-                                confidence=cfg.confidence)
+                                confidence=cfg.confidence, one_sided=cfg.one_sided,
+                                spares_period=cfg.spares_period)
             results[run_key(name, s)] = r
             if log is not None:
-                log(f"{run_key(name, s)}: uplift upper {r.uplift[2]:.4f}, VER_adv {r.ver_adv[0]:.4f}, "
-                    f"{r.meta['wall_seconds']} s")
+                log(f"{run_key(name, s)}: uplift mean {r.uplift[0]:.4f}, upper {r.uplift[2]:.4f}, "
+                    f"VER_adv {r.ver_adv[0]:.4f}, {r.meta['wall_seconds']} s")
     return results
 
 
@@ -161,6 +178,10 @@ def decide(cfg: GateConfig, results: dict, skew=None) -> list:
         conf = r.meta.get("confidence")
         if conf is not None and not math.isclose(float(conf), cfg.confidence):
             raise ValueError(f"run {k}: confidence {conf} differs from the gate's {cfg.confidence}")
+        for key in ("one_sided", "spares_period"):
+            got = r.meta.get(key)
+            if got is not None and got != getattr(cfg, key):
+                raise ValueError(f"run {k}: {key} {got!r} differs from the gate's {getattr(cfg, key)!r}")
 
     per_run = {k: float(r.uplift[2]) for k, r in results.items()}
     bad_up = [k for k, v in per_run.items() if not math.isfinite(v)]  # max() over NaN is order-dependent
