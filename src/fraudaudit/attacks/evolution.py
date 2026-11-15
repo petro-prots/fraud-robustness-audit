@@ -19,7 +19,10 @@ Mutation (``mutate``), on the fields of ``Strategy.to_vector``:
 * ``u``, ``shares``, ``day``, ``hour``: + N(0, (sigma · range)²) per entry, with the ranges of
   ``Strategy.random``: ``u`` ∈ [rho, 1], ``shares`` ∈ [0, 1], ``day`` ∈ [0, window_days),
   ``hour`` ∈ [0, 24); shares are also clipped to [0, 1] so the noise keeps its scale (shares are
-  relative weights, the upper bound does not restrict the realised amounts);
+  relative weights, the upper bound does not restrict the realised amounts; if all of the first
+  ``k`` shares become 0, ``realize`` splits ``u·A`` equally). The time of day is circular:
+  ``hour`` is wrapped modulo 24 (23:30 + 1 h is 00:30), not clipped, so the search does not pile
+  up at 0 and 24;
 * ``merchant[i]``: with probability ``p_merchant`` a uniform index in [0, n_merchants), otherwise
   ``rint(merchant[i] + N(0, (sigma · n_merchants)²))`` – a local move, as ``MerchantTable`` orders
   merchants by (category, name);
@@ -69,7 +72,7 @@ class EvolutionStrategy:
         child = Strategy(k=int(parent.k) + (sign_k if change_k else 0), u=float(parent.u) + du,
                          shares=np.clip(np.asarray(parent.shares, dtype=np.float64) + dshares, 0.0, 1.0),
                          day=np.asarray(parent.day, dtype=np.float64) + dday,
-                         hour=np.asarray(parent.hour, dtype=np.float64) + dhour,
+                         hour=np.mod(np.asarray(parent.hour, dtype=np.float64) + dhour, 24.0),
                          merchant=merchant)
         return child.clip(tm, n_merchants)
 

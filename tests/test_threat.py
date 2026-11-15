@@ -54,12 +54,22 @@ def test_threat_model_es_params(tm, tmp_path):
     assert ThreatModel.from_yaml(p).es == ESParams()
     p.write_text(base + "attack:\n  es: {mu: 3, lam: 7, sigma: 0.2, p_merchant: 0.0, p_k: 0.5}\n")
     assert ThreatModel.from_yaml(p).es == ESParams(mu=3, lam=7, sigma=0.2, p_merchant=0.0, p_k=0.5)
+    p.write_text(base + "attack:\n  es: {mu: 3.0, lam: 7, sigma: 0.2, p_merchant: 0.0, p_k: 0.5}\n")
+    assert ThreatModel.from_yaml(p).es.mu == 3  # integral float accepted
+    for kw in ({"mu": True}, {"mu": 2.7}, {"lam": False}):
+        with pytest.raises(ValueError):
+            ESParams(**kw)
     for bad, match in [("attack:\n  es: {mu: 3}\n", "missing"),
                        ("attack:\n  es: {mu: 5, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2, x: 1}\n", "unknown"),
                        ("attack:\n  ga: {}\n", "unknown"),
                        ("attack:\n  es: {mu: 0, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "mu"),
                        ("attack:\n  es: {mu: 5, lam: 10, sigma: -1, p_merchant: 0.1, p_k: 0.2}\n", "sigma"),
                        ("attack:\n  es: {mu: 5, lam: 10, sigma: 0.15, p_merchant: 2, p_k: 0.2}\n", "p_merchant"),
+                       ("attack:\n  es: {mu: 2.7, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "mu"),
+                       ("attack:\n  es: {mu: true, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "mu"),
+                       ("attack:\n  es: {mu: 5, lam: 7.5, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "lam"),
+                       ("attack:\n  es: {mu: 5, lam: false, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "lam"),
+                       ("attack:\n  es: {mu: '5', lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "mu"),
                        ("attack: 3\n", "attack")]:
         p.write_text(base + bad)
         with pytest.raises(ValueError, match=match):

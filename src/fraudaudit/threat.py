@@ -60,10 +60,10 @@ class ESParams:
     p_k: float = 0.2
 
     def __post_init__(self) -> None:
-        if not (isinstance(self.mu, int) and self.mu >= 1):
-            raise ValueError(f"es.mu must be an integer >= 1, got {self.mu!r}")
-        if not (isinstance(self.lam, int) and self.lam >= 1):
-            raise ValueError(f"es.lam must be an integer >= 1, got {self.lam!r}")
+        for name in ("mu", "lam"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 1:
+                raise ValueError(f"es.{name} must be an integer >= 1, got {v!r}")
         if not (np.isfinite(self.sigma) and self.sigma >= 0):
             raise ValueError(f"es.sigma must be >= 0, got {self.sigma!r}")
         for name in ("p_merchant", "p_k"):
@@ -83,10 +83,18 @@ class ESParams:
         if missing:
             raise ValueError(f"{where}: missing keys in attack.es {missing}")
         try:
-            return cls(mu=int(raw["mu"]), lam=int(raw["lam"]), sigma=float(raw["sigma"]),
+            return cls(mu=_strict_int(raw["mu"], "mu"), lam=_strict_int(raw["lam"], "lam"),
+                       sigma=float(raw["sigma"]),
                        p_merchant=float(raw["p_merchant"]), p_k=float(raw["p_k"]))
         except ValueError as e:
             raise ValueError(f"{where}: {e}") from None
+
+
+def _strict_int(v, name: str) -> int:
+    """An integer YAML value; booleans and non-integral numbers (2.7) are rejected, 5.0 is 5."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not float(v).is_integer():
+        raise ValueError(f"es.{name} must be an integer, got {v!r}")
+    return int(v)
 
 
 _ATTACK_KEYS = ("es",)
