@@ -287,11 +287,12 @@ def test_cli_audit_exit_1_when_a_check_fails(cli_env):
     assert "❌ НЕ ПРОЙДЕНО" in summary.read_text(encoding="utf-8")
 
 
-def test_cli_audit_skew_report_fails_gate(cli_env, tmp_path):
+def test_cli_audit_skew_report_fails_gate(cli_env, tmp_path, model_dir):
     from fraudaudit.skew import skew_to_json
     bad = SkewReport(max_abs_diff={"amt": 0.5}, decision_mismatches=2, n_tx=10, passed=False, n_cards=2)
     p = tmp_path / "skew.json"
-    p.write_text(json.dumps(skew_to_json(bad)))
+    from fraudaudit.cli import _model_sha256
+    p.write_text(json.dumps(skew_to_json(bad, model_sha256=_model_sha256(model_dir))))
     code, out, _ = cli_env(GATE_LOOSE, "--skew-report", str(p))
     assert code == 1
     checks = {c["name"]: c for c in json.loads((out / "audit.json").read_text(encoding="utf-8"))["checks"]}
@@ -380,6 +381,19 @@ def test_cli_audit_tampered_model_exit_2_with_summary(cli_env, model_dir, tmp_pa
     assert "❌ НЕ ПРОЙДЕНО — помилка конфігурації/артефактів" in summary.read_text(encoding="utf-8")
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["passed"] is False and data["error"]
+
+
+@pytest.mark.parametrize("extra", [{"model_sha256": "0" * 64}, {}])
+def test_cli_audit_skew_report_of_another_model_exit_2(cli_env, tmp_path, extra):
+    from fraudaudit.skew import skew_to_json
+    ok = SkewReport(max_abs_diff={"amt": 0.0}, decision_mismatches=0, n_tx=10, passed=True, n_cards=2)
+    p = tmp_path / "skew.json"
+    p.write_text(json.dumps(skew_to_json(ok, **extra)))
+    code, out, summary = cli_env(GATE_LOOSE, "--skew-report", str(p))
+    assert code == 2
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "another model" in md and "помилка конфігурації/артефактів" in md
+    assert "another model" in summary.read_text(encoding="utf-8")
 
 
 def test_cli_audit_bad_yaml_exit_2_with_summary(cli_env):
@@ -500,6 +514,24 @@ def test_write_gate_outputs_with_baseline(base, baseline, tmp_path):
         "error": "RuntimeError: boom"}
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert SECTION in md and "RuntimeError: boom" in md and "✅ ПРОЙДЕНО" in md.split("\n## ")[0]
+
+
+def test_baseline_comparison_failure_is_a_note_not_a_verdict(base, baseline, tmp_path, monkeypatch):
+    from fraudaudit import report
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.01)}
+    checks = decide(c, res, None)
+
+    def boom(*a, **kw):
+        raise RuntimeError("comparison boom")
+
+    monkeypatch.setattr(report, "baseline_comparison", boom)
+    data = write_gate_outputs(tmp_path, c, checks, res, {"seed": 7}, baseline=baseline)
+    saved = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
+    assert saved["baseline"] == {"error": "RuntimeError: comparison boom"}
+    assert saved["passed"] is True and data["passed"] is True
+    md = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "comparison boom" in md and "✅ ПРОЙДЕНО" in md.split("\n## ")[0]
 
 
 def test_cli_audit_runs_baseline_informational(cli_env):

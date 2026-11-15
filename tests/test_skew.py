@@ -185,3 +185,15 @@ def test_skew_cli_writes_step_summary(df, real_model_dir, tmp_path, monkeypatch)
     text = summary.read_text(encoding="utf-8")
     assert "Звірка навчального і продуктивного шляхів ознак" in text
     assert rc == 0 and "PASS" in text and "max_abs_p_diff" not in text
+
+
+def test_skew_cli_out_binds_model_hash(df, real_model_dir, tmp_path, monkeypatch):
+    import hashlib
+    monkeypatch.setattr("fraudaudit.data.load_raw", lambda d: df)
+    out = tmp_path / "skew.json"
+    rc = cli.main(["skew", "--data", "unused", "--model", str(real_model_dir), "--cards", "5", "--n-jobs", "1",
+                   "--out", str(out)])
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert rc == 0
+    assert data["model_sha256"] == hashlib.sha256((real_model_dir / "model.json").read_bytes()).hexdigest()
+    assert "git_sha" in data

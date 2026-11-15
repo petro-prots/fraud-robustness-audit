@@ -78,6 +78,12 @@ def git_info(cwd: Path | None = None) -> dict:
         return {"git_sha": "unknown", "git_dirty": "unknown"}
 
 
+def _model_sha256(model_dir: Path) -> str:
+    """SHA-256 of ``model.json`` (it holds the manifest hashes of every artifact): identifies the model."""
+    import hashlib
+    return hashlib.sha256((model_dir / "model.json").read_bytes()).hexdigest()
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.model.pipeline import train_model
@@ -104,7 +110,8 @@ def cmd_skew(args: argparse.Namespace) -> int:
     model = FraudModel.from_artifacts(load_artifacts(args.model))
     rep = skew_check(df, model, n_cards=args.cards, seed=args.seed, atol=args.atol, n_jobs=args.n_jobs,
                      model_dir=args.model)
-    data = skew_to_json(rep, seed=args.seed, atol=args.atol, **git_info())
+    data = skew_to_json(rep, seed=args.seed, atol=args.atol, model_sha256=_model_sha256(args.model),
+                        **git_info())
     print(json.dumps(data, indent=2, sort_keys=True), flush=True)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,11 @@ def cmd_audit(args: argparse.Namespace) -> int:
         tms = None if args.no_baseline else SingleTxThreatModel.from_yaml(args.single_threat)
         skew_json = None if args.skew_report is None else json.loads(args.skew_report.read_text(encoding="utf-8"))
         skew = None if skew_json is None else skew_from_json(skew_json)
+        if skew_json is not None:
+            want, got = skew_json.get("model_sha256"), _model_sha256(args.model)
+            if want != got:
+                raise ValueError(f"skew report {args.skew_report} was made for another model "
+                                 f"(model_sha256 {want}, audited model {got}): rerun `fraudaudit skew --out`")
         model_meta = json.loads((args.model / "model.json").read_text(encoding="utf-8")).get("meta", {})
         model_fpr = model_meta.get("target_fpr")
         if model_fpr is not None and abs(float(model_fpr) - cfg.target_fpr) > 1e-12:

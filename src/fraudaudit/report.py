@@ -331,11 +331,17 @@ def write_gate_outputs(out_dir: Path | str, cfg: GateConfig, checks: list[Check]
     ok = passed(checks)
     meta = dict(meta, gate=dataclasses.asdict(cfg))
     worst = next(c.worst for c in checks if c.name == "ver_uplift")
+    try:  # informational: any failure of the comparison becomes a note, never a changed verdict
+        baseline_json = _baseline_json(baseline, results, worst, baseline_error)
+        summary = summary_markdown(checks, results, meta, merchants, baseline, baseline_error)
+    except Exception as e:  # noqa: BLE001
+        baseline_error = f"{type(e).__name__}: {e}"
+        baseline_json = _baseline_json(None, results, worst, baseline_error)
+        summary = summary_markdown(checks, results, meta, merchants, None, baseline_error)
     data = {"verdict": VERDICT_OK if ok else VERDICT_FAIL, "passed": ok,
             "checks": [dataclasses.asdict(c) for c in checks], "gate": dataclasses.asdict(cfg),
             "worst_run": worst, "runs": {k: to_json(r, merchants) for k, r in results.items()},
-            "skew": skew, "baseline": _baseline_json(baseline, results, worst, baseline_error), "meta": meta}
+            "skew": skew, "baseline": baseline_json, "meta": meta}
     (out / "audit.json").write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (out / "summary.md").write_text(summary_markdown(checks, results, meta, merchants, baseline,
-                                                                    baseline_error), encoding="utf-8")
+    (out / "summary.md").write_text(summary, encoding="utf-8")
     return data
