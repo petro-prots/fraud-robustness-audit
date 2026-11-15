@@ -51,12 +51,14 @@ Run of 2026-11-15, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Lin
 | `val` | 225 709 | 1 256 |
 | `test` | 555 719 | 2 145 |
 
-τ = 0.047462500631809235
+τ = 0.005090115591883659
 
 | at τ | recall | FPR | precision | TP | FP |
 |---|---:|---:|---:|---:|---:|
-| `val` | 0.9777 | 0.0098 | 0.3579 | 1 228 | 2 203 |
-| `test` | 0.9524 | 0.0086 | 0.3014 | 2 043 | 4 735 |
+| `val` | 0.9769 | 0.0089 | 0.3802 | 1 227 | 2 000 |
+| `test` | 0.9692 | 0.0083 | 0.3103 | 2 079 | 4 620 |
+
+The previous baseline without time of day (34 features, τ = 0.047462500631809235: test recall 0.9524, FPR 0.0086, precision 0.3014; val recall 0.9777, FPR 0.0098) is kept in `models-bachelor/` for comparison; the current code does not load it (see `models-bachelor/README.md`).
 
 Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SHA` / `GIT_DIRTY` if set, else from `git`, else `"unknown"`. The image has no git, so pass them in Docker:
 
@@ -64,9 +66,9 @@ Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SH
       -e GIT_DIRTY="$(test -z "$(git status --porcelain)" && echo 0 || echo 1)" \
       --entrypoint fraudaudit fraudaudit:dev train --data data --out models --seed 42
 
-The committed baseline was trained from uncommitted code on top of `c1625d0`; that code was committed with the artifacts in `f3adaea` (`meta.provenance_note`; the provenance fields were added afterwards by re-saving the same artifacts, predictions unchanged).
+The committed baseline was trained from the clean tree at `1a51b7b` (`meta.git_sha`, `git_dirty: false`).
 
-Wall time: 19 min 31 s in total (feature preparation 9 s, `mlp.fit` 19 min 19 s, ~57 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
+Wall time: 24 min 13 s in total (feature preparation 13 s, `mlp.fit` 23 min 56 s, ~72 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
 
 ## Audit gate
 

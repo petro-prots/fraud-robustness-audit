@@ -1,0 +1,101 @@
+{
+  "feature_columns": [
+    "merchant",
+    "amt",
+    "state",
+    "lat",
+    "long",
+    "city_pop",
+    "merch_lat",
+    "merch_long",
+    "age",
+    "trans_month",
+    "trans_year",
+    "latitudinal_distance",
+    "longitudinal_distance",
+    "category_food_dining",
+    "category_gas_transport",
+    "category_grocery_net",
+    "category_grocery_pos",
+    "category_health_fitness",
+    "category_home",
+    "category_kids_pets",
+    "category_misc_net",
+    "category_misc_pos",
+    "category_personal_care",
+    "category_shopping_net",
+    "category_shopping_pos",
+    "category_travel",
+    "gender_M",
+    "cnt_1d",
+    "cnt_7d",
+    "cnt_30d",
+    "mean_amt_1d",
+    "mean_amt_7d",
+    "mean_amt_30d",
+    "secs_since_prev"
+  ],
+  "meta": {
+    "batch_size": 32,
+    "epochs": 20,
+    "fraud_rows": {
+      "fit": 6250,
+      "test": 2145,
+      "val": 1256
+    },
+    "git_dirty": true,
+    "git_sha": "c1625d0",
+    "iforest_flag_share_train_balanced": 0.7802437543869019,
+    "n_base_features": 27,
+    "platform": {
+      "machine": "aarch64",
+      "platform": "Linux-6.10.14-linuxkit-aarch64-with-glibc2.41",
+      "system": "Linux"
+    },
+    "provenance_note": "trained from uncommitted code on top of c1625d0; that code was committed together with these artifacts in f3adaea",
+    "rows": {
+      "fit": 1070966,
+      "test": 555719,
+      "val": 225709
+    },
+    "sample_frac": null,
+    "seconds": {
+      "fit": 1158.6,
+      "prepare": 9.2,
+      "total": 1171.3
+    },
+    "seed": 42,
+    "target_fpr": 0.01,
+    "tau": 0.047462500631809235,
+    "test": {
+      "fp": 4735,
+      "fpr": 0.008553508654669474,
+      "n": 555719,
+      "n_fraud": 2145,
+      "precision": 0.30141634700501624,
+      "recall": 0.9524475524475524,
+      "tp": 2043
+    },
+    "train_balanced_rows": 2129432,
+    "val": {
+      "fp": 2203,
+      "fpr": 0.009814972399566947,
+      "n": 225709,
+      "n_fraud": 1256,
+      "precision": 0.35791314485572717,
+      "recall": 0.9777070063694268,
+      "tp": 1228
+    }
+  },
+  "tau": 0.047462500631809235,
+  "versions": {
+    "keras": "3.15.1",
+    "numpy": "2.0.2",
+    "pandas": "2.2.3",
+    "python": "3.12.16",
+    "scikit-learn": "1.5.2",
+    "scipy": "1.18.1",
+    "skops": "0.10.0",
+    "tensorflow": "2.18.0"
+  }
+}

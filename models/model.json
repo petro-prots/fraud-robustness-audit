@@ -27,6 +27,8 @@
     "category_shopping_pos",
     "category_travel",
     "gender_M",
+    "hour_sin",
+    "hour_cos",
     "cnt_1d",
     "cnt_7d",
     "cnt_30d",
@@ -38,21 +40,21 @@
   "meta": {
     "batch_size": 32,
     "epochs": 20,
+    "feature_set": "bachelor+hour",
     "fraud_rows": {
       "fit": 6250,
       "test": 2145,
       "val": 1256
     },
-    "git_dirty": true,
-    "git_sha": "c1625d0",
-    "iforest_flag_share_train_balanced": 0.7802437543869019,
-    "n_base_features": 27,
+    "git_dirty": false,
+    "git_sha": "1a51b7b9793e83d3ff759236b2badb54976afd7d",
+    "iforest_flag_share_train_balanced": 0.7391111850738525,
+    "n_base_features": 29,
     "platform": {
       "machine": "aarch64",
       "platform": "Linux-6.10.14-linuxkit-aarch64-with-glibc2.41",
       "system": "Linux"
     },
-    "provenance_note": "trained from uncommitted code on top of c1625d0; that code was committed together with these artifacts in f3adaea",
     "rows": {
       "fit": 1070966,
       "test": 555719,
@@ -60,34 +62,34 @@
     },
     "sample_frac": null,
     "seconds": {
-      "fit": 1158.6,
-      "prepare": 9.2,
-      "total": 1171.3
+      "fit": 1435.5,
+      "prepare": 12.6,
+      "total": 1453.1
     },
     "seed": 42,
     "target_fpr": 0.01,
-    "tau": 0.047462500631809235,
+    "tau": 0.005090115591883659,
     "test": {
-      "fp": 4735,
-      "fpr": 0.008553508654669474,
+      "fp": 4620,
+      "fpr": 0.00834576768417592,
       "n": 555719,
       "n_fraud": 2145,
-      "precision": 0.30141634700501624,
-      "recall": 0.9524475524475524,
-      "tp": 2043
+      "precision": 0.3103448275862069,
+      "recall": 0.9692307692307692,
+      "tp": 2079
     },
     "train_balanced_rows": 2129432,
     "val": {
-      "fp": 2203,
-      "fpr": 0.009814972399566947,
+      "fp": 2000,
+      "fpr": 0.008910551429475213,
       "n": 225709,
       "n_fraud": 1256,
-      "precision": 0.35791314485572717,
-      "recall": 0.9777070063694268,
-      "tp": 1228
+      "precision": 0.38022931515339325,
+      "recall": 0.9769108280254777,
+      "tp": 1227
     }
   },
-  "tau": 0.047462500631809235,
+  "tau": 0.005090115591883659,
   "versions": {
     "keras": "3.15.1",
     "numpy": "2.0.2",
