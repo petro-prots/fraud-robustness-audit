@@ -12,7 +12,8 @@ from fraudaudit.model.pipeline import FraudModel, build_datasets, build_mlp, tra
 
 def test_architecture_matches_listing():
     mlp = build_mlp(len(FEATURE_COLUMNS) + 1)
-    assert mlp.input_shape == (None, 35)
+    assert mlp.input_shape == (None, 37)
+    assert pipeline.N_INPUTS == 37
     layers = mlp.layers
     kinds = [type(l).__name__ for l in layers]
     assert kinds == ["Dense", "BatchNormalization", "Dense", "BatchNormalization",
@@ -38,7 +39,7 @@ def test_balancing_only_fit(sparkov_like):
     # fitted components saw only fit rows
     fit = df[per == "fit"]
     assert ds.scaler.n_samples_seen_ == int((per == "fit").sum())
-    assert ds.iforest.n_features_in_ == len(FEATURE_COLUMNS) == 34
+    assert ds.iforest.n_features_in_ == len(FEATURE_COLUMNS) == 36
     assert set(ds.encoder.merchants) == set(fit["merchant"].str.removeprefix("fraud_"))
     assert set(ds.encoder.states) == set(fit["state"])
     # val / test: unbalanced, every row exactly once
@@ -55,6 +56,7 @@ def test_train_smoke(sparkov_like, tmp_path):
     assert isinstance(model, FraudModel)
     for name in ("val", "test"):
         assert {"recall", "fpr", "precision", "n", "n_fraud"} <= set(report[name])
+    assert report["feature_set"] == "bachelor+hour" and report["n_base_features"] == 29
     assert 0.0 <= model.tau <= 1.0
     model.save(tmp_path, meta={"seed": 0})
     loaded = FraudModel.from_artifacts(load_artifacts(tmp_path))

@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -19,15 +20,16 @@ def _row(sparkov_like, **over):
     return r
 
 
-def test_27_columns(sparkov_like):
-    assert len(BASE_COLUMNS) == 27 and len(set(BASE_COLUMNS)) == 27
+def test_29_base_36_feature_columns(sparkov_like):
+    assert len(BASE_COLUMNS) == 29 and len(set(BASE_COLUMNS)) == 29
+    assert BASE_COLUMNS[-2:] == ("hour_sin", "hour_cos")
     enc = BaseEncoder().fit(_fit_df(sparkov_like))
     out = enc.transform(sparkov_like)
     assert list(out.columns) == list(BASE_COLUMNS)
     assert (out.dtypes == "float32").all()
     assert out.index.equals(sparkov_like.index)
     assert not out.isna().any().any()
-    assert len(FEATURE_COLUMNS) == 34
+    assert len(FEATURE_COLUMNS) == 36
 
 
 def test_age_rounding(sparkov_like):
@@ -38,6 +40,28 @@ def test_age_rounding(sparkov_like):
     b = enc.transform(_row(sparkov_like, dob="2000-06-15", ts=pd.Timestamp("2020-06-15 00:00:00")))
     assert b["age"].iloc[0] == 20
     assert b["trans_month"].iloc[0] == 6 and b["trans_year"].iloc[0] == 2020
+
+
+@pytest.mark.parametrize("ts, want_sin, want_cos", [
+    ("2020-06-14 00:00:00", 0.0, 1.0),
+    ("2020-06-14 06:00:00", 1.0, 0.0),
+    ("2020-06-14 12:00:00", 0.0, -1.0),
+    # h = 23 + 59/60: angle = 2*pi - 2*pi/1440
+    ("2020-06-14 23:59:00", -0.0043633093, 0.9999904807),
+])
+def test_hour_sin_cos(sparkov_like, ts, want_sin, want_cos):
+    enc = BaseEncoder().fit(_fit_df(sparkov_like))
+    out = enc.transform(_row(sparkov_like, ts=pd.Timestamp(ts)))
+    assert out["hour_sin"].iloc[0] == pytest.approx(want_sin, abs=1e-7)
+    assert out["hour_cos"].iloc[0] == pytest.approx(want_cos, abs=1e-7)
+
+
+def test_hour_uses_seconds(sparkov_like):
+    enc = BaseEncoder().fit(_fit_df(sparkov_like))
+    out = enc.transform(_row(sparkov_like, ts=pd.Timestamp("2020-06-14 03:20:15")))
+    h = 3 + 20 / 60 + 15 / 3600
+    assert out["hour_sin"].iloc[0] == np.float32(np.sin(2 * np.pi * h / 24))
+    assert out["hour_cos"].iloc[0] == np.float32(np.cos(2 * np.pi * h / 24))
 
 
 def test_distance_rounding(sparkov_like):

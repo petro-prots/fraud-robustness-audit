@@ -1,6 +1,6 @@
-"""Serving path: the 34 features of one operation from the card state, and the decision.
+"""Serving path: the 36 features of one operation from the card state, and the decision.
 
-The 27 base features come from a numpy path for a single operation that reproduces
+The 29 base features come from a numpy path for a single operation that reproduces
 ``BaseEncoder.transform`` value for value (pinned by ``tests/test_serving.py``); building a
 one-row DataFrame per operation would dominate the time of ``decide``.
 """
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..features.base import PREFIX
+from ..features.base import PREFIX, hour_features
 from ..features.columns import BASE_COLUMNS, FEATURE_COLUMNS
 from .state import CardState, Tx
 
@@ -73,10 +73,13 @@ class Serving:
         if cat > 0:
             out[self._cat0 + cat - 1] = 1.0
         out[_COL["gender_M"]] = gender == "M"
+        hs, hc = hour_features([tx.ts.hour], [tx.ts.minute], [tx.ts.second])
+        out[_COL["hour_sin"]] = hs[0]
+        out[_COL["hour_cos"]] = hc[0]
         return out
 
     def features(self, state: CardState, tx: Tx) -> np.ndarray:
-        """FEATURE_COLUMNS (float32, length 34) of ``tx`` given the card history in ``state``."""
+        """FEATURE_COLUMNS (float32, length 36) of ``tx`` given the card history in ``state``."""
         f = np.empty(len(FEATURE_COLUMNS), dtype=np.float32)
         f[:_N_BASE] = self._base(state, tx)
         f[_N_BASE:] = state.aggregates(tx.ts)

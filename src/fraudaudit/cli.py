@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"fraudaudit {__version__}")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    train = sub.add_parser("train", help="train the bachelor model and save its artifacts")
+    train = sub.add_parser("train", help="train the baseline model (bachelor architecture, bachelor+hour features) and save its artifacts")
     train.add_argument("--data", type=Path, default=Path("data"), help="directory with fraudTrain.csv, fraudTest.csv")
     train.add_argument("--out", type=Path, default=Path("models"), help="output directory for the artifacts")
     train.add_argument("--seed", type=int, default=42)

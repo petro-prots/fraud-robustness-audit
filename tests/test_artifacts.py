@@ -18,8 +18,8 @@ from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts, s
 @pytest.fixture
 def parts():
     rng = np.random.default_rng(0)
-    X = rng.normal(size=(200, 35)).astype("float32")
-    mlp = keras.Sequential([keras.Input(shape=(35,)), keras.layers.Dense(1, activation="sigmoid")])
+    X = rng.normal(size=(200, len(FEATURE_COLUMNS) + 1)).astype("float32")
+    mlp = keras.Sequential([keras.Input(shape=(len(FEATURE_COLUMNS) + 1,)), keras.layers.Dense(1, activation="sigmoid")])
     scaler = StandardScaler().fit(X)
     iforest = IsolationForest(n_estimators=5, random_state=0).fit(X)
     df = pd.DataFrame({"merchant": ["fraud_a", "fraud_b"], "state": ["NY", "CA"],

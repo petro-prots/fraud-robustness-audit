@@ -85,6 +85,21 @@ def test_fast_base_path_matches_transform_all_categories_and_genders(sparkov_lik
         np.testing.assert_array_equal(serving.features(state, _row_tx(r))[:N_BASE], want[i])
 
 
+@pytest.mark.parametrize("ts", ["2020-02-01 00:00:00", "2020-02-01 06:00:00", "2020-02-01 12:00:00",
+                                "2020-02-01 23:59:00", "2020-02-01 23:59:59", "2020-02-01 03:20:15"])
+def test_fast_path_hour_features_equal_transform(sparkov_like, ts):
+    df = sparkov_like.iloc[[0]].copy()
+    df["ts"] = pd.Timestamp(ts)
+    enc = BaseEncoder().fit(sparkov_like)
+    serving = Serving(StubModel(enc, tau=0.5, p=0.1))
+    r = next(df.itertuples(index=False))
+    got = serving.features(CardState(_row_profile(r)), _row_tx(r))[:N_BASE]
+    want = enc.transform(df).to_numpy()[0]
+    cols = [BASE_COLUMNS.index("hour_sin"), BASE_COLUMNS.index("hour_cos")]
+    np.testing.assert_array_equal(got[cols], want[cols])
+    np.testing.assert_array_equal(got, want)
+
+
 def test_from_history_takes_only_last_30d_before_at(sparkov_like):
     df = sparkov_like
     card = df["cc_num"].iloc[0]

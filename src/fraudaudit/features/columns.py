@@ -1,4 +1,5 @@
-"""Fixed feature order of the model (27 bachelor base features + 7 windowed aggregates)."""
+"""Fixed feature order of the model: 29 base features (the 27 of the bachelor model + time of day
+``hour_sin``/``hour_cos``) and 7 windowed aggregates."""
 from __future__ import annotations
 
 # The 14 Sparkov categories, sorted; the first one is the baseline dropped by
@@ -15,6 +16,7 @@ BASE_COLUMNS: tuple[str, ...] = (
     "age", "trans_month", "trans_year", "latitudinal_distance", "longitudinal_distance",
     *CATEGORY_DUMMIES,
     "gender_M",
+    "hour_sin", "hour_cos",  # time of day on the unit circle (not in the bachelor set; ruling R16)
 )
 
 AGG_COLUMNS: tuple[str, ...] = (

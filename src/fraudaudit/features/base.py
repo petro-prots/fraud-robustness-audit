@@ -1,6 +1,7 @@
-"""The 27 base features of the bachelor model and a JSON-serializable encoder.
+"""The 29 base features and a JSON-serializable encoder.
 
-Semantics follow Appendix B of the bachelor thesis. The encoder never looks at
+27 features follow Appendix B of the bachelor thesis; ``hour_sin``/``hour_cos`` add the time of
+day (``hour_features``), which the bachelor set lacks. The encoder never looks at
 other rows in ``transform``, so one-row frames (serving path) give the same
 values as batches.
 """
@@ -17,6 +18,18 @@ PASSTHROUGH = ("amt", "lat", "long", "city_pop", "merch_lat", "merch_long")
 
 def _merchant_names(s: pd.Series) -> pd.Series:
     return s.astype(str).str.removeprefix(PREFIX)
+
+
+def hour_features(hour, minute, second) -> tuple[np.ndarray, np.ndarray]:
+    """``sin(2*pi*h/24)``, ``cos(2*pi*h/24)`` for h = hour + minute/60 + second/3600, in float64.
+
+    The one implementation used by both ``BaseEncoder.transform`` and the serving fast path
+    (which passes one-element arrays), so the two paths give identical values.
+    """
+    h = (np.asarray(hour, dtype=np.float64) + np.asarray(minute, dtype=np.float64) / 60.0
+         + np.asarray(second, dtype=np.float64) / 3600.0)
+    angle = 2.0 * np.pi * h / 24.0
+    return np.sin(angle), np.cos(angle)
 
 
 def _unique(values) -> list[str]:
@@ -60,7 +73,8 @@ class BaseEncoder:
         out["state"] = self._codes(df["state"].astype(str), self.states, "state")
         for c in PASSTHROUGH:
             out[c] = df[c].to_numpy(dtype="float64")
-        trans_date = pd.to_datetime(df["ts"]).dt.normalize()
+        ts = pd.to_datetime(df["ts"])
+        trans_date = ts.dt.normalize()
         days = (trans_date - pd.to_datetime(df["dob"])).dt.days
         out["age"] = np.round(days / 365.25)  # half-to-even, as Python/numpy round
         out["trans_month"] = trans_date.dt.month
@@ -74,6 +88,8 @@ class BaseEncoder:
         gender = df["gender"].astype(str)
         self._codes(gender, self.genders, "gender")
         out["gender_M"] = (gender == "M").to_numpy()
+        out["hour_sin"], out["hour_cos"] = hour_features(ts.dt.hour.to_numpy(), ts.dt.minute.to_numpy(),
+                                                         ts.dt.second.to_numpy())
         return out[list(BASE_COLUMNS)].astype("float32")
 
     def to_json(self) -> dict:
