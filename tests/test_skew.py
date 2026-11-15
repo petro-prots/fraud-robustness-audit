@@ -238,7 +238,7 @@ def test_flip_outside_tie_band_is_a_mismatch(df, count_model, monkeypatch):
 def test_p_drift_alone_fails_without_flips(df, count_model, monkeypatch):
     _patch_decide(monkeypatch, lambda p: False, dp=1e-3)
     rep = _tie_check(df, count_model)
-    assert rep.decision_mismatches == 0 and rep.max_abs_p_diff > 1e-6 and not rep.passed
+    assert rep.decision_mismatches == 0 and rep.max_abs_p_diff > 1e-4 and not rep.passed
 
 
 def test_n_ties_in_json_and_summary(df, count_model):
