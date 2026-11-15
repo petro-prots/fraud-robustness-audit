@@ -10,9 +10,10 @@ as ``np.allclose`` in ``tests/test_serving.py``), because float32 rounding of a 
 differ by one ulp between a summation over a window and a running list.
 
 Decisions: every replayed operation goes through ``Serving.decide`` (single-row compiled call)
-and is compared with the batch decision ``p_batch >= tau`` (scores within float32 noise ``1e-6`` of tau are ties and
-not counted: tau is a validation quantile, so some score equals it exactly, and a one-ulp difference of p between the
-batch and the single-row call would flip the decision); ``max_abs_p_diff`` is the largest
+and is compared with the batch decision ``p_batch >= tau`` (a flip is a tie, counted in ``n_ties`` and not a
+mismatch, only if both |p_batch - tau| and |p_served - p_batch| are within float32 noise ``1e-6``: tau is a validation
+quantile, so some score equals it exactly, and a one-ulp difference of p would flip the decision). The check also fails
+if ``max_abs_p_diff`` exceeds the same bound; ``max_abs_p_diff`` is the largest
 |p_serving - p_batch|.
 """
 from __future__ import annotations
@@ -46,6 +47,7 @@ class SkewReport:
     passed: bool
     n_cards: int = 0
     max_abs_p_diff: float = 0.0
+    n_ties: int = 0  # decision flips ignored as ties: |p_batch - tau| and |p_served - p_batch| both <= _P_TIE
 
 
 _WORKER_MODEL = None  # per worker process: loaded once by _init_worker
@@ -128,10 +130,13 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
     tol[:, _MEAN_IDX] = atol + _RTOL * np.abs(batch[:, _MEAN_IDX].astype(np.float64))
     features_ok = bool((diff <= tol).all())
 
-    mismatches = int(((declined != (p_batch >= model.tau)) & (np.abs(p_batch - model.tau) > _P_TIE)).sum())
+    flip = declined != (p_batch >= model.tau)
+    tie = flip & (np.abs(p_batch - model.tau) <= _P_TIE) & (np.abs(p_served - p_batch) <= _P_TIE)
+    mismatches = int((flip & ~tie).sum())
     p_diff = float(np.abs(p_served - p_batch).max()) if len(sub) else 0.0
     return SkewReport(max_abs_diff=max_diff, decision_mismatches=mismatches, n_tx=int(len(sub)),
-                      passed=features_ok and mismatches == 0, n_cards=int(k), max_abs_p_diff=p_diff)
+                      passed=features_ok and mismatches == 0 and p_diff <= _P_TIE, n_cards=int(k),
+                      max_abs_p_diff=p_diff, n_ties=int(tie.sum()))
 
 
 def summary_markdown(rep: SkewReport, atol: float) -> str:
@@ -144,6 +149,7 @@ def summary_markdown(rep: SkewReport, atol: float) -> str:
         f"- Найбільша розбіжність серед усіх {len(rep.max_abs_diff)} ознак: `{worst[0]}` = {worst[1]:.3g} "
         f"(допуск лише для середніх: {atol:g}, решта точно)",
         f"- Розбіжностей рішень: {rep.decision_mismatches}; найбільша |Δp|: {rep.max_abs_p_diff:.3g}",
+        f"- Ties ignored (decision flips within float32 noise of tau, |dp| <= {_P_TIE:g}): {rep.n_ties}",
         f"- Результат: **{'PASS' if rep.passed else 'FAIL'}**",
         "",
         "| ознака | макс. розбіжність |",
@@ -157,6 +163,7 @@ def skew_to_json(rep: SkewReport, **extra) -> dict:
     """Every field of ``rep`` (plus ``extra``, e.g. seed, atol, git) as JSON; read back with ``skew_from_json``."""
     return {"passed": bool(rep.passed), "n_cards": int(rep.n_cards), "n_tx": int(rep.n_tx),
             "decision_mismatches": int(rep.decision_mismatches), "max_abs_p_diff": float(rep.max_abs_p_diff),
+            "n_ties": int(rep.n_ties),
             "max_abs_diff": {k: float(v) for k, v in rep.max_abs_diff.items()}, **extra}
 
 
@@ -165,4 +172,4 @@ def skew_from_json(d: dict) -> SkewReport:
     return SkewReport(max_abs_diff={k: float(v) for k, v in d["max_abs_diff"].items()},
                       decision_mismatches=int(d["decision_mismatches"]), n_tx=int(d["n_tx"]),
                       passed=bool(d["passed"]), n_cards=int(d["n_cards"]),
-                      max_abs_p_diff=float(d["max_abs_p_diff"]))
+                      max_abs_p_diff=float(d["max_abs_p_diff"]), n_ties=int(d.get("n_ties", 0)))

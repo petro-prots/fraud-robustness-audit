@@ -197,3 +197,53 @@ def test_skew_cli_out_binds_model_hash(df, real_model_dir, tmp_path, monkeypatch
     assert rc == 0
     assert data["model_sha256"] == hashlib.sha256((real_model_dir / "model.json").read_bytes()).hexdigest()
     assert "git_sha" in data
+
+
+# ---- tie tolerance of decision flips -----------------------------------------------------------
+
+def _patch_decide(monkeypatch, flip_if, dp=0.0):
+    """Serving.decide with injected drift: ``flip_if(p)`` flips the decision, ``dp`` shifts the served p."""
+    from types import SimpleNamespace
+    real = Serving.decide
+
+    def decide(self, state, tx):
+        d = real(self, state, tx)
+        return SimpleNamespace(p=d.p + dp, declined=(not d.declined) if flip_if(d.p) else d.declined)
+
+    monkeypatch.setattr(Serving, "decide", decide)
+
+
+def _tie_check(df, count_model):
+    return skew_check(df, count_model, n_cards=10, seed=42, n_jobs=1)  # CountModel: p == tau == 0.5 at cnt_1d == 1
+
+
+def test_tie_flip_with_tiny_dp_is_not_a_mismatch(df, count_model, monkeypatch):
+    _patch_decide(monkeypatch, lambda p: abs(p - 0.5) < 1e-9, dp=1e-9)
+    rep = _tie_check(df, count_model)
+    assert rep.n_ties > 0 and rep.decision_mismatches == 0 and rep.passed
+
+
+def test_tie_flip_with_large_dp_fails(df, count_model, monkeypatch):
+    _patch_decide(monkeypatch, lambda p: abs(p - 0.5) < 1e-9, dp=1e-3)
+    rep = _tie_check(df, count_model)
+    assert rep.n_ties == 0 and rep.decision_mismatches > 0 and not rep.passed
+
+
+def test_flip_outside_tie_band_is_a_mismatch(df, count_model, monkeypatch):
+    _patch_decide(monkeypatch, lambda p: abs(p - 0.5) > 0.1)
+    rep = _tie_check(df, count_model)
+    assert rep.decision_mismatches > 0 and not rep.passed
+
+
+def test_p_drift_alone_fails_without_flips(df, count_model, monkeypatch):
+    _patch_decide(monkeypatch, lambda p: False, dp=1e-3)
+    rep = _tie_check(df, count_model)
+    assert rep.decision_mismatches == 0 and rep.max_abs_p_diff > 1e-6 and not rep.passed
+
+
+def test_n_ties_in_json_and_summary(df, count_model):
+    from fraudaudit.skew import skew_from_json, skew_to_json, summary_markdown
+    rep = skew_check(df, count_model, n_cards=3, seed=1, n_jobs=1)
+    rep = type(rep)(**{**rep.__dict__, "n_ties": 2})
+    assert skew_from_json(skew_to_json(rep)).n_ties == 2
+    assert "Ties ignored" in summary_markdown(rep, 1e-4)
