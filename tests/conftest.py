@@ -13,8 +13,10 @@ from fraudaudit.features.columns import CATEGORIES
 START = pd.Timestamp("2020-01-01")
 
 
-def make_sparkov_like(n_cards: int = 40, days: int = 120, seed: int = 0) -> pd.DataFrame:
-    """Deterministic Sparkov-like set; same columns/dtypes as load_raw output."""
+def make_sparkov_like(n_cards: int = 40, days: int = 120, seed: int = 0, start: pd.Timestamp = START) -> pd.DataFrame:
+    """Deterministic Sparkov-like set; same columns/dtypes as load_raw output. ``start`` moves the first day
+    (an earlier start gives a longer fit period, which ends at ``VAL_START`` 2020-03-21)."""
+    START = pd.Timestamp(start)  # noqa: N806 – shadows the module default
     rng = np.random.default_rng(seed)
     cut = START + pd.Timedelta(days=int(days * 0.8))  # train/test boundary
     rows = []

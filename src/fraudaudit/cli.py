@@ -67,6 +67,23 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--seed", type=int, default=42)
     cal.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
 
+    hard = sub.add_parser("harden", help="round-based adversarial retraining (ES examples on the H half of the "
+                                          "fit episodes); writes every round's model and harden-report.json/.md")
+    hard.add_argument("--data", type=Path, default=Path("data"))
+    hard.add_argument("--model", type=Path, default=Path("models"), help="input model (artifact directory)")
+    hard.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
+    hard.add_argument("--gate", type=Path, default=Path("gate.yaml"),
+                      help="δ (early stop), confidence, one_sided; read only")
+    hard.add_argument("--out", type=Path, default=Path("models-harden"),
+                      help="round-{r}/ model directories and harden-report.json/.md")
+    hard.add_argument("--rounds", type=int, default=3)
+    hard.add_argument("--seed", type=int, default=42)
+    hard.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+    hard.add_argument("--epochs", type=int, default=20, help="20 as in train; lower only for probes")
+    hard.add_argument("--budget-ops", type=int, default=20000,
+                      help="ES reconnaissance budget per generation unit (harden_budget_ops)")
+    hard.add_argument("--no-baseline-audit", action="store_true", help="skip the round-0 mini-audit of the input model")
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -280,6 +297,52 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_harden(args: argparse.Namespace) -> int:
+    import hashlib
+
+    import yaml
+
+    from fraudaudit.audit import _versions
+    from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig
+    from fraudaudit.harden import harden, write_report
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.threat import ThreatModel
+
+    t0 = time.perf_counter()
+    try:
+        gate_bytes = args.gate.read_bytes()
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        _check_model_fpr(args.model, cfg, args.gate)
+        df = load_raw(args.data)
+        model = FraudModel.from_artifacts(load_artifacts(args.model))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        print(f"error: harden configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    final, reports, info = harden(df, model, tm, cfg, rounds=args.rounds, seed=args.seed, model_dir=args.model,
+                                  out_dir=args.out, n_jobs=args.n_jobs, budget_ops=args.budget_ops,
+                                  epochs=args.epochs, baseline_audit=not args.no_baseline_audit,
+                                  threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
+    meta = {"seed": int(args.seed), **git_info(), "input_model": str(args.model),
+            "input_model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),
+            "threat_sha256": hashlib.sha256(args.threat.read_bytes()).hexdigest(), "gate_file": str(args.gate),
+            "gate_sha256": hashlib.sha256(gate_bytes).hexdigest(), "delta": cfg.delta, "rounds": int(args.rounds),
+            "platform": platform.platform(), "versions": _versions(),
+            "wall_seconds": round(time.perf_counter() - t0, 1)}
+    data = write_report(args.out, reports, info, meta)
+    if args.gate.read_bytes() != gate_bytes:  # this command only reads the gate
+        raise RuntimeError(f"{args.gate} changed during hardening")
+    print(json.dumps({"final_model_dir": data["final_model_dir"],
+                      "rounds": [{"round": r["round"], "val_uplift_worst_upper": r["val_uplift_worst_upper"],
+                                  "val_uplift_mean": r["val_uplift_mean"], "n_adv_rows": r["n_adv_rows"],
+                                  "tau": r["tau"], "val_recall": r["val_quality"]["recall"],
+                                  "val_fpr": r["val_quality"]["fpr"]} for r in data["rounds"]],
+                      "wall_seconds": meta["wall_seconds"], "out": str(args.out)}, indent=2), flush=True)
+    return 0
+
+
 def _baseline_brief(b: dict | None) -> dict | None:
     """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
     if b is None or "error" in b:
@@ -362,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_calibrate(args)
     if args.command == "decide":
         return cmd_decide(args)
+    if args.command == "harden":
+        return cmd_harden(args)
     return 0
 
 
