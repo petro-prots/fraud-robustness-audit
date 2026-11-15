@@ -38,6 +38,8 @@ REC_RECALL = ("Власник моделі: на чистих даних мод�
 REC_FEASIBILITY = ("Розробник інструмента аудиту: помилка інструмента – атака виконала операції поза моделлю "
                    "загроз, тож результат аудиту недійсний – повідомте про помилку (issue) з `out/audit.json`; "
                    "модель тут ні до чого.")
+REC_NONFINITE = ("Розробник інструмента аудиту: показник не обчислено (NaN або нескінченність) у прогоні "
+                 "`{run}` – результат аудиту недійсний; повідомте про помилку (issue) з `out/audit.json`.")
 REC_SKEW = ("DevSecOps: продуктивний шлях ознак (serving) розходиться з навчальним – виправте serving path "
             "до злиття; аудит такої моделі не описує її поведінку в продакшені.")
 
@@ -78,9 +80,10 @@ class GateConfig:
         if not isinstance(attacks, list) or not attacks or any(a not in ATTACKS for a in attacks) \
                 or len(set(attacks)) != len(attacks):
             raise ValueError(f"{where}: attacks must be a non-empty list of distinct {list(ATTACKS)}, got {attacks!r}")
-        if not isinstance(seeds, list) or not seeds or any(isinstance(s, bool) or not isinstance(s, int)
+        if not isinstance(seeds, list) or not seeds or any(isinstance(s, bool) or not isinstance(s, int) or s < 0
                                                            for s in seeds) or len(set(seeds)) != len(seeds):
-            raise ValueError(f"{where}: attack_seeds must be a non-empty list of distinct integers, got {seeds!r}")
+            raise ValueError(f"{where}: attack_seeds must be a non-empty list of distinct integers >= 0, "
+                             f"got {seeds!r}")
         c = cls(target_fpr=num("target_fpr"), recall_clean_min=num("recall_clean_min"),
                 delta=None if raw["delta"] is None else num("delta"), attacks=list(attacks),
                 attack_seeds=[int(s) for s in seeds], confidence=num("confidence"))
@@ -159,19 +162,28 @@ def decide(cfg: GateConfig, results: dict, skew=None) -> list:
         if conf is not None and not math.isclose(float(conf), cfg.confidence):
             raise ValueError(f"run {k}: confidence {conf} differs from the gate's {cfg.confidence}")
 
-    worst = max(results, key=lambda k: results[k].uplift[2])
-    w_up = float(results[worst].uplift[2])
     per_run = {k: float(r.uplift[2]) for k, r in results.items()}
-    if cfg.delta is None:
+    bad_up = [k for k, v in per_run.items() if not math.isfinite(v)]  # max() over NaN is order-dependent
+    worst = bad_up[0] if bad_up else max(per_run, key=per_run.get)
+    w_up = per_run[worst]
+    if bad_up:
+        up = Check("ver_uplift", w_up, cfg.delta, False, REC_NONFINITE.format(run=worst), worst,
+                   {"uplift_upper": per_run, "non_finite": bad_up})
+    elif cfg.delta is None:
         up = Check("ver_uplift", w_up, None, False, REC_DELTA_NONE, worst, {"uplift_upper": per_run})
     else:
         ok = w_up <= cfg.delta
         up = Check("ver_uplift", w_up, cfg.delta, ok, "" if ok else REC_VER_UPLIFT, worst, {"uplift_upper": per_run})
 
     recalls = {k: float(r.clean_quality["test"]["recall"]) for k, r in results.items()}
-    r_key = min(recalls, key=recalls.get)
-    r_ok = recalls[r_key] >= cfg.recall_clean_min  # nan → False
-    rec = Check("recall_clean", recalls[r_key], cfg.recall_clean_min, r_ok, "" if r_ok else REC_RECALL, r_key)
+    bad_rec = [k for k, v in recalls.items() if not math.isfinite(v)]
+    if bad_rec:
+        rec = Check("recall_clean", recalls[bad_rec[0]], cfg.recall_clean_min, False,
+                    REC_NONFINITE.format(run=bad_rec[0]), bad_rec[0])
+    else:
+        r_key = min(recalls, key=recalls.get)
+        r_ok = recalls[r_key] >= cfg.recall_clean_min
+        rec = Check("recall_clean", recalls[r_key], cfg.recall_clean_min, r_ok, "" if r_ok else REC_RECALL, r_key)
 
     shares = {k: float(r.feasible_share) for k, r in results.items()}
     f_key = min(shares, key=lambda k: -1.0 if math.isnan(shares[k]) else shares[k])

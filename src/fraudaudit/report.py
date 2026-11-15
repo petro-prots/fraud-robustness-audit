@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 from pathlib import Path
 
 from .audit import _num, _pct, strategy_dict, to_json
@@ -23,11 +24,24 @@ _TITLE = {
 def _value(c: Check) -> str:
     if c.value is None:
         return "–"
+    if c.name == "feasibility" and c.value != 1.0:
+        return _pct_exact(c.value)
     if c.name in ("ver_uplift", "feasibility"):
         return _pct(c.value)
     if c.name == "recall_clean":
         return _num(c.value, 4)
     return str(int(c.value))
+
+
+def _pct_exact(x: float) -> str:
+    """Percent with as many decimals as needed so that a value below 1 never prints as 100 %."""
+    if not math.isfinite(x):
+        return f"{x} %"
+    for d in range(1, 13):
+        s = f"{100 * x:.{d}f}"
+        if float(s) != 100.0:
+            break
+    return f"{s} %".replace(".", ",")
 
 
 def _threshold(c: Check) -> str:
@@ -68,13 +82,17 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               f"приросту VER_adv − VER_clean {_pct(up.value)} при "
               + (f"δ = {_pct(delta)}." if delta is not None else "незаданому δ."),
               ""]
-    if delta is not None:
-        lines.append(f"У доларах (частка × медіанна сума епізоду A = {_num(med, 2)} $): атака додає шахраю до "
-                     f"~{_num(up.value * med, 0)} $ на скомпрометовану картку при допустимих "
+    per_card = int(wm["n_target_cards"]) == int(w.n_targets)
+    unit = ("на одну скомпрометовану картку (один цільовий епізод на картку)" if per_card else "на епізод")
+    head = f"У доларах (орієнтовно: частка × медіанна сума епізоду A = {_num(med, 2)} $): "
+    if up.value is None or not math.isfinite(up.value):
+        lines.append(head + "не обчислено – приріст VER у найгіршому прогоні не скінченний.")
+    elif delta is not None:
+        lines.append(head + f"атака додає шахраю до ~{_num(up.value * med, 0)} $ {unit} при допустимих "
                      f"~{_num(delta * med, 0)} $.")
     else:
-        lines.append(f"У доларах (частка × медіанна сума епізоду A = {_num(med, 2)} $): атака додає шахраю до "
-                     f"~{_num(up.value * med, 0)} $ на скомпрометовану картку; допустиму величину не задано.")
+        lines.append(head + f"атака додає шахраю до ~{_num(up.value * med, 0)} $ {unit}; допустиму величину "
+                     "не задано.")
     lines += ["", "## Перевірки", "", "| перевірка | значення | поріг | результат |", "|---|---:|---|---|"]
     for c in checks:
         title = _TITLE[c.name].format(conf=conf)
@@ -150,10 +168,34 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               f"- модель загроз: `{wm['threat_model']['file']}`, SHA-256 `{wm['threat_model']['sha256']}`"]
     if meta.get("gate_file"):
         lines.append(f"- шлюз: `{meta['gate_file']}`, SHA-256 `{meta.get('gate_sha256')}`")
+    if "model_target_fpr" in meta:
+        mt = meta["model_target_fpr"]
+        lines.append("- target_fpr моделі не вказано — звірку пропущено" if mt is None
+                     else f"- target_fpr моделі (`model.json`): {mt}, збігається з `gate.yaml`")
     if gate:
         lines.append("- параметри шлюзу: " + ", ".join(f"{k} = {v}" for k, v in gate.items()))
     lines += ["- версії: " + ", ".join(f"{k} {v}" for k, v in wm["versions"].items()), ""]
     return "\n".join(lines)
+
+
+def error_summary(message: str) -> str:
+    """Minimal summary when the audit could not run (configuration or artifact error): CI must show why."""
+    return (f"# ❌ {VERDICT_FAIL} — помилка конфігурації/артефактів\n\n"
+            "Аудит не виконано, тож шлюз закритий (exit 2). Причина:\n\n"
+            f"```\n{message}\n```\n\n"
+            "Виправте конфігурацію (`gate.yaml`, модель загроз, звіт skew) або артефакти моделі (`models/`, "
+            "перевірка SHA-256 у `manifest.json`) і повторіть аудит; не обходьте перевірку цілісності.\n")
+
+
+def write_error_outputs(out_dir: Path | str, message: str) -> str:
+    """``out_dir/audit.json`` (verdict, error) and ``out_dir/summary.md`` for a run that could not start."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    md = error_summary(message)
+    (out / "audit.json").write_text(json.dumps({"verdict": VERDICT_FAIL, "passed": False, "error": message},
+                                               indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    (out / "summary.md").write_text(md, encoding="utf-8")
+    return md
 
 
 def write_gate_outputs(out_dir: Path | str, cfg: GateConfig, checks: list[Check], results: dict, meta: dict,

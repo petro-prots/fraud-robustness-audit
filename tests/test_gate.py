@@ -87,6 +87,7 @@ def test_gate_yaml_committed_values():
     {"attack_seeds": []},
     {"attack_seeds": [1, 1]},
     {"attack_seeds": [1.5]},
+    {"attack_seeds": [1, -2]},
     {"delta": -0.1},
     {"recall_clean_min": 1.5},
     {"confidence": 1.0},
@@ -188,7 +189,7 @@ def test_summary_has_dollar_interpretation(base):
     x = f"{0.30 * med:.0f}"
     y = f"{0.05 * med:.0f}"
     assert f"до ~{x} $" in md and f"допустимих ~{y} $" in md
-    assert "скомпрометовану картку" in md
+    assert ("скомпрометовану картку" in md) if base.meta["n_target_cards"] == base.n_targets else ("на епізод" in md)
     assert "| es | 1 |" in md and "| random | 1 |" in md and "найгірш" in md
     assert "Рекомендації" in md and "fraudaudit harden" in md and "не послаблюйте атаку чи δ" in md
     assert "легітимні операції" in md  # replay assumption
@@ -248,12 +249,12 @@ def cli_env(df, model_dir, tmp_path, monkeypatch):
     summary = tmp_path / "step_summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
 
-    def run(gate: dict, *extra):
+    def run(gate, *extra, model=None):
         from fraudaudit.cli import main
         g = tmp_path / "gate.yaml"
-        g.write_text(yaml.safe_dump(gate))
+        g.write_text(gate if isinstance(gate, str) else yaml.safe_dump(gate))
         out = tmp_path / "out"
-        code = main(["audit", "--data", "unused", "--model", str(model_dir), "--threat", str(threat),
+        code = main(["audit", "--data", "unused", "--model", str(model or model_dir), "--threat", str(threat),
                      "--gate", str(g), "--out", str(out), "--seed", "7", "--n-jobs", "1", *extra])
         return code, out, summary
     return run
@@ -303,3 +304,87 @@ def test_skew_json_roundtrip():
     rep = SkewReport(max_abs_diff={"amt": 0.0, "cnt_1d": 1.0}, decision_mismatches=1, n_tx=5, passed=False,
                      n_cards=3, max_abs_p_diff=0.2)
     assert skew_from_json(json.loads(json.dumps(skew_to_json(rep)))) == rep
+
+
+# --- fail-closed edge cases ------------------------------------------------------------------------------
+
+
+def nan_uplift(r):
+    return dataclasses.replace(r, uplift=(float("nan"), float("nan"), float("nan")))
+
+
+def test_nonfinite_uplift_in_a_later_run_fails(base):
+    c3 = cfg(attacks=["random"], attack_seeds=[1, 2, 3])
+    res = {run_key("random", 1): fake(base, 0.01), run_key("random", 2): nan_uplift(fake(base, 0.01)),
+           run_key("random", 3): fake(base, 0.02)}
+    c = by_name(decide(c3, res, None))["ver_uplift"]
+    assert not c.passed and c.worst == "random/2" and c.recommendation
+    res[run_key("random", 2)] = dataclasses.replace(fake(base, 0.01), uplift=(0.0, 0.0, float("inf")))
+    assert not by_name(decide(c3, res, None))["ver_uplift"].passed
+    md = summary_markdown(decide(c3, res, None), res, {})
+    assert "❌ НЕ ПРОЙДЕНО" in md.split("\n## ")[0]
+
+
+def test_nonfinite_recall_in_a_later_run_fails(base):
+    c2 = cfg(attacks=["random"], attack_seeds=[1, 2])
+    res = {run_key("random", 1): fake(base, 0.01), run_key("random", 2): fake(base, 0.01, recall=float("nan"))}
+    c = by_name(decide(c2, res, None))["recall_clean"]
+    assert not c.passed and c.worst == "random/2"
+
+
+def test_summary_dollar_wording_per_card_or_episode(base):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.2)}
+    md = summary_markdown(decide(c, res, None), res, {})
+    assert "орієнтовно: частка × медіанна сума епізоду" in md
+    one_per_card = base.meta["n_target_cards"] == base.n_targets
+    assert ("на одну скомпрометовану картку (один цільовий епізод на картку)" in md) == one_per_card
+    many = dataclasses.replace(res[run_key("random", 1)],
+                               meta=dict(res[run_key("random", 1)].meta, n_target_cards=base.n_targets - 1))
+    md2 = summary_markdown(decide(c, {run_key("random", 1): many}, None), {run_key("random", 1): many}, {})
+    assert "на епізод" in md2 and "на одну скомпрометовану картку" not in md2
+
+
+def test_summary_feasibility_failure_not_rounded_to_100(base):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.01, feasible=0.9999)}
+    md = summary_markdown(decide(c, res, None), res, {})
+    row = next(line for line in md.splitlines() if line.startswith("| `feasibility`"))
+    assert "99,99 %" in row and "| 100,0 % | = 100,0 %" not in row
+
+
+def test_summary_model_target_fpr_missing_noted(base):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.01)}
+    md = summary_markdown(decide(c, res, None), res, {"model_target_fpr": None})
+    assert "target_fpr моделі не вказано — звірку пропущено" in md
+
+
+def test_cli_audit_tampered_model_exit_2_with_summary(cli_env, model_dir, tmp_path):
+    import shutil
+    bad = tmp_path / "bad_model"
+    shutil.copytree(model_dir, bad)
+    with open(bad / "mlp.keras", "ab") as f:
+        f.write(b"\0")
+    code, out, summary = cli_env(GATE_LOOSE, model=bad)
+    assert code == 2
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert md.startswith("# ❌ НЕ ПРОЙДЕНО — помилка конфігурації/артефактів") and "SHA" in md.upper()
+    assert "❌ НЕ ПРОЙДЕНО — помилка конфігурації/артефактів" in summary.read_text(encoding="utf-8")
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["passed"] is False and data["error"]
+
+
+def test_cli_audit_bad_yaml_exit_2_with_summary(cli_env):
+    code, out, summary = cli_env("target_fpr: [0.01\n")
+    assert code == 2
+    assert "помилка конфігурації/артефактів" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "помилка конфігурації/артефактів" in summary.read_text(encoding="utf-8")
+
+
+def test_cli_audit_records_model_target_fpr(cli_env):
+    code, out, _ = cli_env(GATE_LOOSE)
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["meta"]["model_target_fpr"] is None  # the tiny test model has no meta.target_fpr
+    assert "target_fpr моделі не вказано — звірку пропущено" in (out / "summary.md").read_text(encoding="utf-8")

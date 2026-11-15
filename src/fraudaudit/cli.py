@@ -115,11 +115,13 @@ def cmd_skew(args: argparse.Namespace) -> int:
 def cmd_audit(args: argparse.Namespace) -> int:
     import hashlib
 
+    import yaml
+
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig, decide, passed, run_ensemble
-    from fraudaudit.model.artifacts import load_artifacts
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
     from fraudaudit.model.pipeline import FraudModel
-    from fraudaudit.report import write_gate_outputs
+    from fraudaudit.report import write_error_outputs, write_gate_outputs
     from fraudaudit.skew import skew_from_json
     from fraudaudit.threat import MerchantTable, ThreatModel
 
@@ -130,19 +132,27 @@ def cmd_audit(args: argparse.Namespace) -> int:
         skew_json = None if args.skew_report is None else json.loads(args.skew_report.read_text(encoding="utf-8"))
         skew = None if skew_json is None else skew_from_json(skew_json)
         model_meta = json.loads((args.model / "model.json").read_text(encoding="utf-8")).get("meta", {})
-        if "target_fpr" in model_meta and abs(float(model_meta["target_fpr"]) - cfg.target_fpr) > 1e-12:
-            raise ValueError(f"model τ was chosen for target_fpr {model_meta['target_fpr']}, "
+        model_fpr = model_meta.get("target_fpr")
+        if model_fpr is not None and abs(float(model_fpr) - cfg.target_fpr) > 1e-12:
+            raise ValueError(f"model τ was chosen for target_fpr {model_fpr}, "
                              f"{args.gate} asks for {cfg.target_fpr}")
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        print(f"error: audit configuration: {e}", file=sys.stderr)
+        df = load_raw(args.data)
+        model = FraudModel.from_artifacts(load_artifacts(args.model))  # SHA-256 before deserialisation
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        msg = f"{type(e).__name__}: {e}"
+        print(f"error: audit configuration/artifacts: {msg}", file=sys.stderr)
+        md = write_error_outputs(args.out, msg)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write(md)
         return 2
-    df = load_raw(args.data)
-    model = FraudModel.from_artifacts(load_artifacts(args.model))
     t1 = time.perf_counter()
     results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
                            threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
     checks = decide(cfg, results, skew)
     meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
+            "model_target_fpr": None if model_fpr is None else float(model_fpr),
             "gate_sha256": hashlib.sha256(args.gate.read_bytes()).hexdigest(),
             "skew_report": None if args.skew_report is None else str(args.skew_report),
             "wall_seconds": round(time.perf_counter() - t1, 1),
