@@ -10,7 +10,9 @@ as ``np.allclose`` in ``tests/test_serving.py``), because float32 rounding of a 
 differ by one ulp between a summation over a window and a running list.
 
 Decisions: every replayed operation goes through ``Serving.decide`` (single-row compiled call)
-and is compared with the batch decision ``p_batch >= tau``; ``max_abs_p_diff`` is the largest
+and is compared with the batch decision ``p_batch >= tau`` (scores within float32 noise ``1e-6`` of tau are ties and
+not counted: tau is a validation quantile, so some score equals it exactly, and a one-ulp difference of p between the
+batch and the single-row call would flip the decision); ``max_abs_p_diff`` is the largest
 |p_serving - p_batch|.
 """
 from __future__ import annotations
@@ -31,6 +33,7 @@ from .serving.state import CardState, Tx, profile_of
 
 _MEAN_IDX = np.array([FEATURE_COLUMNS.index(c) for c in AGG_COLUMNS if c.startswith("mean_amt_")])
 _RTOL = 1e-6
+_P_TIE = 1e-6  # float32 noise of p (batch vs single-row call, ~1.5e-7): a score this close to tau is a tie, not a mismatch
 _REPLAY_COLS = ["cc_num", "ts", "row", "amt", "merchant", "category", "merch_lat", "merch_long",
                 "gender", "dob", "lat", "long", "city_pop", "state"]
 
@@ -125,7 +128,7 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
     tol[:, _MEAN_IDX] = atol + _RTOL * np.abs(batch[:, _MEAN_IDX].astype(np.float64))
     features_ok = bool((diff <= tol).all())
 
-    mismatches = int((declined != (p_batch >= model.tau)).sum())
+    mismatches = int(((declined != (p_batch >= model.tau)) & (np.abs(p_batch - model.tau) > _P_TIE)).sum())
     p_diff = float(np.abs(p_served - p_batch).max()) if len(sub) else 0.0
     return SkewReport(max_abs_diff=max_diff, decision_mismatches=mismatches, n_tx=int(len(sub)),
                       passed=features_ok and mismatches == 0, n_cards=int(k), max_abs_p_diff=p_diff)
