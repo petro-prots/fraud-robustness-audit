@@ -1,0 +1,305 @@
+import dataclasses
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import yaml
+
+from conftest import make_sparkov_like
+from fraudaudit import audit as audit_mod
+from fraudaudit.attacks.random_search import RandomSearch
+from fraudaudit.audit import run_audit
+from fraudaudit.gate import Check, GateConfig, decide, run_key
+from fraudaudit.model.artifacts import load_artifacts
+from fraudaudit.model.pipeline import FraudModel
+from fraudaudit.report import summary_markdown, write_gate_outputs
+from fraudaudit.skew import SkewReport
+from fraudaudit.threat import ThreatModel
+
+ROOT = Path(__file__).resolve().parents[1]
+TM_PATH = ROOT / "threat-models" / "realistic.yaml"
+GATE_PATH = ROOT / "gate.yaml"
+ALL = ("fit", "val", "test")  # sparkov_like has too few test episodes for a 50/50 card split
+
+
+@pytest.fixture(scope="module")
+def df():
+    return make_sparkov_like()
+
+
+@pytest.fixture(scope="module")
+def tm():
+    return dataclasses.replace(ThreatModel.from_yaml(TM_PATH), recon_budget_ops=300)
+
+
+@pytest.fixture(scope="module")
+def model_dir(df, tmp_path_factory):
+    from fraudaudit.model.pipeline import train_model
+    model, _ = train_model(df, seed=0, epochs=1)
+    d = tmp_path_factory.mktemp("model")
+    model.save(d, meta={"seed": 0})
+    return d
+
+
+@pytest.fixture(scope="module")
+def model(model_dir):
+    return FraudModel.from_artifacts(load_artifacts(model_dir))
+
+
+@pytest.fixture(scope="module")
+def base(df, model, tm, model_dir):
+    return run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                     target_periods=ALL, threat_path=TM_PATH, attack_seed=1)
+
+
+def cfg(**kw):
+    d = dict(target_fpr=0.01, recall_clean_min=0.5, delta=0.05, attacks=["random", "es"],
+             attack_seeds=[1, 2, 3], confidence=0.95)
+    d.update(kw)
+    return GateConfig(**d)
+
+
+def fake(base, uplift_hi, feasible=1.0, recall=0.9, attack_seed=1):
+    """``base`` with a chosen uplift upper bound, feasible share and clean test recall."""
+    q = {p: dict(v) for p, v in base.clean_quality.items()}
+    q["test"]["recall"] = recall
+    return dataclasses.replace(base, uplift=(uplift_hi - 0.02, uplift_hi - 0.04, uplift_hi),
+                               feasible_share=feasible, clean_quality=q,
+                               meta=dict(base.meta, attack_seed=attack_seed))
+
+
+def by_name(checks):
+    return {c.name: c for c in checks}
+
+
+def test_gate_yaml_committed_values():
+    c = GateConfig.from_yaml(GATE_PATH)
+    assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.05, attacks=["random", "es"],
+                           attack_seeds=[1, 2, 3], confidence=0.95)
+
+
+@pytest.mark.parametrize("change", [
+    {"extra": 1},                        # unknown key
+    {"delta": "drop"},                   # missing key
+    {"attacks": ["random", "ga"]},       # unknown attack
+    {"attacks": []},
+    {"attack_seeds": []},
+    {"attack_seeds": [1, 1]},
+    {"attack_seeds": [1.5]},
+    {"delta": -0.1},
+    {"recall_clean_min": 1.5},
+    {"confidence": 1.0},
+    {"target_fpr": 0.0},
+])
+def test_gate_yaml_strict(tmp_path, change):
+    raw = yaml.safe_load(GATE_PATH.read_text())
+    for k, v in change.items():
+        if v == "drop":
+            raw.pop(k)
+        else:
+            raw[k] = v
+    p = tmp_path / "gate.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError):
+        GateConfig.from_yaml(p)
+
+
+def test_gate_yaml_delta_null_allowed(tmp_path):
+    raw = yaml.safe_load(GATE_PATH.read_text())
+    raw["delta"] = None
+    p = tmp_path / "gate.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    assert GateConfig.from_yaml(p).delta is None
+
+
+def test_worst_attack_decides(base):
+    res = {run_key("random", 1): fake(base, 0.02), run_key("es", 1): fake(base, 0.09)}
+    c = by_name(decide(cfg(attack_seeds=[1]), res, None))["ver_uplift"]
+    assert not c.passed and c.value == pytest.approx(0.09) and c.threshold == 0.05
+    assert c.worst == "es/1"
+    assert "harden" in c.recommendation
+    res[run_key("es", 1)] = fake(base, 0.04)
+    c = by_name(decide(cfg(attack_seeds=[1]), res, None))["ver_uplift"]
+    assert c.passed and c.value == pytest.approx(0.04) and c.worst == "es/1"
+    assert c.passed and c.recommendation == ""
+
+
+def test_worst_seed_decides(base):
+    res = {run_key("random", s): fake(base, u, attack_seed=s) for s, u in ((1, 0.01), (2, 0.07), (3, 0.02))}
+    c = by_name(decide(cfg(attacks=["random"]), res, None))["ver_uplift"]
+    assert not c.passed and c.value == pytest.approx(0.07) and c.worst == "random/2"
+
+
+def test_delta_none_fails_closed(base):
+    res = {run_key("random", 1): fake(base, -0.5)}  # even a negative uplift does not pass without δ
+    c = by_name(decide(cfg(delta=None, attacks=["random"], attack_seeds=[1]), res, None))["ver_uplift"]
+    assert not c.passed and c.threshold is None
+    assert "δ не задано" in c.recommendation
+
+
+def test_feasibility_below_one_fails(base):
+    one = cfg(attacks=["random"], attack_seeds=[1, 2])
+    res = {run_key("random", 1): fake(base, 0.0), run_key("random", 2): fake(base, 0.0, feasible=0.999)}
+    c = by_name(decide(one, res, None))["feasibility"]
+    assert not c.passed and c.value == pytest.approx(0.999) and c.threshold == 1.0
+    assert "помилк" in c.recommendation.lower()
+    res[run_key("random", 2)] = fake(base, 0.0, feasible=float("nan"))  # no executed ops: not proven feasible
+    assert not by_name(decide(one, res, None))["feasibility"].passed
+    res[run_key("random", 2)] = fake(base, 0.0)
+    assert by_name(decide(one, res, None))["feasibility"].passed
+
+
+def test_recall_clean(base):
+    one = cfg(attacks=["random"], attack_seeds=[1])
+    c = by_name(decide(one, {run_key("random", 1): fake(base, 0.0, recall=0.49)}, None))["recall_clean"]
+    assert not c.passed and c.value == pytest.approx(0.49) and c.threshold == 0.5
+    assert "власник моделі" in c.recommendation.lower()
+    assert by_name(decide(one, {run_key("random", 1): fake(base, 0.0, recall=0.5)}, None))["recall_clean"].passed
+
+
+def test_skew_check_only_with_report(base):
+    one = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.0)}
+    assert [c.name for c in decide(one, res, None)] == ["ver_uplift", "recall_clean", "feasibility"]
+    ok = SkewReport(max_abs_diff={"amt": 0.0}, decision_mismatches=0, n_tx=10, passed=True, n_cards=2)
+    bad = dataclasses.replace(ok, decision_mismatches=3, passed=False)
+    assert by_name(decide(one, res, ok))["skew"].passed
+    c = by_name(decide(one, res, bad))["skew"]
+    assert not c.passed and c.value == 3 and "DevSecOps" in c.recommendation
+
+
+def test_decide_requires_every_run(base):
+    with pytest.raises(ValueError):  # es/1 missing: the ensemble is incomplete
+        decide(cfg(attack_seeds=[1]), {run_key("random", 1): fake(base, 0.0)}, None)
+    with pytest.raises(ValueError):  # confidence of the runs differs from the gate
+        decide(cfg(attacks=["random"], attack_seeds=[1], confidence=0.9), {run_key("random", 1): fake(base, 0.0)},
+               None)
+
+
+def test_summary_has_dollar_interpretation(base):
+    c = cfg(attacks=["random", "es"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.02), run_key("es", 1): fake(base, 0.30)}
+    checks = decide(c, res, None)
+    meta = {"gate": dataclasses.asdict(c), "seed": 7, "wall_seconds": 12.3}
+    md = summary_markdown(checks, res, meta)
+    assert md.splitlines()[0].startswith("# ") and "❌ НЕ ПРОЙДЕНО" in md.split("\n## ")[0]
+    med = base.meta["median_amount"]
+    x = f"{0.30 * med:.0f}"
+    y = f"{0.05 * med:.0f}"
+    assert f"до ~{x} $" in md and f"допустимих ~{y} $" in md
+    assert "скомпрометовану картку" in md
+    assert "| es | 1 |" in md and "| random | 1 |" in md and "найгірш" in md
+    assert "Рекомендації" in md and "fraudaudit harden" in md and "не послаблюйте атаку чи δ" in md
+    assert "легітимні операції" in md  # replay assumption
+    assert "recall" in md and "VER_clean" in md and base.meta["git_sha"] in md
+    for name in ("ver_uplift", "recall_clean", "feasibility"):
+        assert name in md
+    ok = {run_key("random", 1): fake(base, 0.01), run_key("es", 1): fake(base, 0.02)}
+    md_ok = summary_markdown(decide(c, ok, None), ok, meta)
+    assert "✅ ПРОЙДЕНО" in md_ok.split("\n## ")[0] and "НЕ ПРОЙДЕНО" not in md_ok
+    assert "Рекомендації" not in md_ok
+
+
+def test_write_gate_outputs(base, tmp_path):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.01)}
+    checks = decide(c, res, None)
+    data = write_gate_outputs(tmp_path, c, checks, res, {"seed": 7})
+    saved = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
+    assert saved == json.loads(json.dumps(data))
+    assert saved["passed"] is True and saved["verdict"] == "ПРОЙДЕНО" and saved["worst_run"] == "random/1"
+    assert [ch["name"] for ch in saved["checks"]] == ["ver_uplift", "recall_clean", "feasibility"]
+    assert saved["runs"]["random/1"]["uplift"]["upper"] == pytest.approx(0.01)
+    assert saved["gate"]["delta"] == 0.05
+    assert (tmp_path / "summary.md").read_text(encoding="utf-8").startswith("# ")
+
+
+def test_attack_seed_changes_attack_only(df, model, tm, model_dir, base):
+    r2 = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
+                   target_periods=ALL, threat_path=TM_PATH, attack_seed=2)
+    assert [t["card"] for t in r2.per_target] == [t["card"] for t in base.per_target]  # same split
+    assert r2.spare_cards == base.spare_cards
+    assert [t["ver_clean"] for t in r2.per_target] == [t["ver_clean"] for t in base.per_target]
+    assert not np.array_equal(r2.best.to_vector(), base.best.to_vector())  # another attack stream
+    assert r2.meta["attack_seed"] == 2 and base.meta["attack_seed"] == 1
+    legacy = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir, target_periods=ALL)
+    assert legacy.meta["attack_seed"] is None
+
+
+# --- CLI: exit codes on the synthetic fixture with a tiny model --------------------------------------------
+
+
+@pytest.fixture
+def cli_env(df, model_dir, tmp_path, monkeypatch):
+    import fraudaudit.data as data_mod
+    monkeypatch.setattr(data_mod, "load_raw", lambda _d: df)
+    real = audit_mod.run_audit
+
+    def all_periods(*a, **kw):
+        kw["target_periods"] = ALL
+        return real(*a, **kw)
+
+    monkeypatch.setattr(audit_mod, "run_audit", all_periods)
+    threat = tmp_path / "threat.yaml"
+    raw = yaml.safe_load(TM_PATH.read_text())
+    raw["recon_budget_ops"] = 300
+    threat.write_text(yaml.safe_dump(raw))
+    summary = tmp_path / "step_summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    def run(gate: dict, *extra):
+        from fraudaudit.cli import main
+        g = tmp_path / "gate.yaml"
+        g.write_text(yaml.safe_dump(gate))
+        out = tmp_path / "out"
+        code = main(["audit", "--data", "unused", "--model", str(model_dir), "--threat", str(threat),
+                     "--gate", str(g), "--out", str(out), "--seed", "7", "--n-jobs", "1", *extra])
+        return code, out, summary
+    return run
+
+
+GATE_LOOSE = dict(target_fpr=0.01, recall_clean_min=0.0, delta=10.0, attacks=["random"], attack_seeds=[1],
+                  confidence=0.95)
+
+
+def test_cli_audit_exit_0_when_all_checks_pass(cli_env):
+    code, out, summary = cli_env(GATE_LOOSE)
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["passed"] is True and list(data["runs"]) == ["random/1"]
+    assert "✅ ПРОЙДЕНО" in summary.read_text(encoding="utf-8")
+
+
+def test_cli_audit_exit_1_when_a_check_fails(cli_env):
+    code, out, summary = cli_env(dict(GATE_LOOSE, delta=None))
+    assert code == 1
+    assert json.loads((out / "audit.json").read_text(encoding="utf-8"))["passed"] is False
+    assert "❌ НЕ ПРОЙДЕНО" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "❌ НЕ ПРОЙДЕНО" in summary.read_text(encoding="utf-8")
+
+
+def test_cli_audit_skew_report_fails_gate(cli_env, tmp_path):
+    from fraudaudit.skew import skew_to_json
+    bad = SkewReport(max_abs_diff={"amt": 0.5}, decision_mismatches=2, n_tx=10, passed=False, n_cards=2)
+    p = tmp_path / "skew.json"
+    p.write_text(json.dumps(skew_to_json(bad)))
+    code, out, _ = cli_env(GATE_LOOSE, "--skew-report", str(p))
+    assert code == 1
+    checks = {c["name"]: c for c in json.loads((out / "audit.json").read_text(encoding="utf-8"))["checks"]}
+    assert checks["skew"]["passed"] is False and checks["ver_uplift"]["passed"] is True
+
+
+def test_cli_parsers():
+    from fraudaudit.cli import build_parser
+    a = build_parser().parse_args(["audit", "--gate", "gate.yaml", "--skew-report", "out/skew.json"])
+    assert str(a.gate) == "gate.yaml" and str(a.skew_report) == "out/skew.json" and a.seed == 42
+    assert str(build_parser().parse_args(["audit"]).gate) == "gate.yaml"
+    assert str(build_parser().parse_args(["skew", "--out", "out/skew.json"]).out) == "out/skew.json"
+
+
+def test_skew_json_roundtrip():
+    from fraudaudit.skew import skew_from_json, skew_to_json
+    rep = SkewReport(max_abs_diff={"amt": 0.0, "cnt_1d": 1.0}, decision_mismatches=1, n_tx=5, passed=False,
+                     n_cards=3, max_abs_p_diff=0.2)
+    assert skew_from_json(json.loads(json.dumps(skew_to_json(rep)))) == rep

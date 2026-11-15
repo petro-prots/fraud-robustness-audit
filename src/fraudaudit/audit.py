@@ -15,8 +15,9 @@ Steps of ``run_audit``:
    successful target episodes) with its Clopper-Pearson upper bound, clean recall/FPR/precision.
 
 Determinism (ruling R7): the random streams are derived from ``seed`` only: card split
-``split_cards(…, seed)``, oracle ``default_rng([seed, 1])``, attack ``default_rng([seed, 2])``,
-target ``i`` ``default_rng([seed, 3, i])``, bootstrap ``seed``. Target executions run in a spawn
+``split_cards(…, seed)``, oracle ``default_rng([seed, 1])``, attack ``default_rng([seed, 2])``
+(``default_rng([seed, 2, attack_seed])`` with ``attack_seed``: the gate repeats the attack with several
+seeds on the same split), target ``i`` ``default_rng([seed, 3, i])``, bootstrap ``seed``. Target executions run in a spawn
 process pool (``n_jobs > 1``, each worker loads its own model from ``model_dir``); results are
 identical for any ``n_jobs``. Entry points that use ``n_jobs > 1`` need an
 ``if __name__ == "__main__":`` guard.
@@ -176,14 +177,16 @@ def _attack_params(attack) -> dict:
 
 def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, *,
               n_jobs: int | None = None, model_dir: Path | str | None = None,
-              target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None) -> AuditResult:
+              target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None,
+              attack_seed: int | None = None, confidence: float = CONFIDENCE) -> AuditResult:
     """Episode audit of ``model`` (see the module docstring).
 
     ``model`` is used in-process (``n_jobs=1``) and for the clean quality; ``n_jobs > 1`` needs
     ``model_dir`` (the same model's artifacts), loaded by every worker. ``n_jobs=None`` means
     ``os.cpu_count()`` with ``model_dir`` and 1 without. ``target_periods`` other than ``("test",)``
     only for tests on small synthetic data. ``threat_path`` (the YAML ``tm`` came from) is hashed
-    into ``meta``.
+    into ``meta``. ``attack_seed`` changes only the attack's random stream (the card split, the oracle
+    and the target realisations stay those of ``seed``); ``confidence`` is the level of every interval.
     """
     t0 = time.perf_counter()
     jobs = n_jobs if n_jobs is not None else ((os.cpu_count() or 1) if model_dir is not None else 1)
@@ -202,7 +205,9 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
 
     with ReconOracle(serving, spares, tm, merchants, tm.recon_budget_ops,
                      np.random.default_rng([seed, _STREAM_ORACLE]), n_jobs=jobs, model_dir=model_dir) as oracle:
-        run = attack.run(oracle, tm, np.random.default_rng([seed, _STREAM_ATTACK]))
+        attack_rng = np.random.default_rng([seed, _STREAM_ATTACK] if attack_seed is None
+                                           else [seed, _STREAM_ATTACK, int(attack_seed)])
+        run = attack.run(oracle, tm, attack_rng)
         recon = {"attack": type(attack).__name__, "attack_params": _attack_params(attack),
                  "evals": int(run.evals), "ops_used": int(run.ops_used),
                  "best_fitness": float(run.best_fitness), "cards_blocked": int(oracle.cards_blocked),
@@ -232,6 +237,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     from .cli import git_info
     meta = {
         "seed": int(seed),
+        "attack_seed": None if attack_seed is None else int(attack_seed),
         **git_info(),
         "platform": {"system": platform.system(), "machine": platform.machine(), "platform": platform.platform(),
                      "cpu_count": os.cpu_count()},
@@ -247,7 +253,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         "recon_budget_ops": int(tm.recon_budget_ops),
         "recon": recon,
         "n_jobs": jobs,
-        "confidence": CONFIDENCE,
+        "confidence": float(confidence),
         "n_boot": N_BOOT,
         "n_success": int(k),
         "n_clean_success": int(sum(t["clean_success"] for t in per_target)),
@@ -258,9 +264,9 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         "median_amount": float(np.median([t["amount"] for t in per_target])),
     }
     result = AuditResult(
-        ver_adv=ver_ci(v_adv, CONFIDENCE, N_BOOT, seed), ver_clean=ver_ci(v_clean, CONFIDENCE, N_BOOT, seed),
-        uplift=uplift_ci(v_adv, v_clean, CONFIDENCE, N_BOOT, seed),
-        asr=k / n, asr_upper=clopper_pearson_upper(int(k), n, CONFIDENCE), n_targets=n,
+        ver_adv=ver_ci(v_adv, confidence, N_BOOT, seed), ver_clean=ver_ci(v_clean, confidence, N_BOOT, seed),
+        uplift=uplift_ci(v_adv, v_clean, confidence, N_BOOT, seed),
+        asr=k / n, asr_upper=clopper_pearson_upper(int(k), n, confidence), n_targets=n,
         recon_ops=int(run.ops_used), best=best, clean_quality=quality, meta=meta,
         feasible_share=float(feasible_share), per_target=per_target,
         spare_cards=sorted({c.episode.card for c in spares}))

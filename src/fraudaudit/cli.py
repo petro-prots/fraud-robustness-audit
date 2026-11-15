@@ -33,13 +33,17 @@ def build_parser() -> argparse.ArgumentParser:
     skew.add_argument("--seed", type=int, default=42)
     skew.add_argument("--atol", type=float, default=1e-4, help="tolerance of the mean_amt_* columns only")
     skew.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+    skew.add_argument("--out", type=Path, default=None, help="also write the report as JSON (for audit --skew-report)")
 
-    audit = sub.add_parser("audit", help="episode audit: VER of normal fraud vs VER under attack")
+    audit = sub.add_parser("audit", help="episode audit and quality gate: every attack x seed of gate.yaml; "
+                                         "exit 1 if a check fails")
     audit.add_argument("--data", type=Path, default=Path("data"))
     audit.add_argument("--model", type=Path, default=Path("models"), help="artifact directory")
     audit.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
-    audit.add_argument("--attack", choices=["random", "es"], default="random",
-                       help="random search or the (mu+lambda) evolution strategy (parameters: attack.es)")
+    audit.add_argument("--gate", type=Path, default=Path("gate.yaml"),
+                       help="gate rules: thresholds, attacks and attack seeds (the worst run decides)")
+    audit.add_argument("--skew-report", type=Path, default=None,
+                       help="JSON of `fraudaudit skew --out`; adds the skew check")
     audit.add_argument("--out", type=Path, default=Path("out"), help="writes audit.json and summary.md")
     audit.add_argument("--seed", type=int, default=42)
     audit.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
@@ -90,16 +94,17 @@ def cmd_skew(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.model.artifacts import load_artifacts
     from fraudaudit.model.pipeline import FraudModel
-    from fraudaudit.skew import skew_check, summary_markdown
+    from fraudaudit.skew import skew_check, skew_to_json, summary_markdown
 
     df = load_raw(args.data)
     model = FraudModel.from_artifacts(load_artifacts(args.model))
     rep = skew_check(df, model, n_cards=args.cards, seed=args.seed, atol=args.atol, n_jobs=args.n_jobs,
                      model_dir=args.model)
-    print(json.dumps({"passed": rep.passed, "n_cards": rep.n_cards, "n_tx": rep.n_tx,
-                      "decision_mismatches": rep.decision_mismatches,
-                      "max_abs_p_diff": rep.max_abs_p_diff, "max_abs_diff": rep.max_abs_diff,
-                      "seed": args.seed, "atol": args.atol, **git_info()}, indent=2, sort_keys=True), flush=True)
+    data = skew_to_json(rep, seed=args.seed, atol=args.atol, **git_info())
+    print(json.dumps(data, indent=2, sort_keys=True), flush=True)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
@@ -108,31 +113,52 @@ def cmd_skew(args: argparse.Namespace) -> int:
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
-    from fraudaudit.attacks.evolution import EvolutionStrategy
-    from fraudaudit.attacks.random_search import RandomSearch
-    from fraudaudit.audit import run_audit, write_outputs
+    import hashlib
+
     from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig, decide, passed, run_ensemble
     from fraudaudit.model.artifacts import load_artifacts
     from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.report import write_gate_outputs
+    from fraudaudit.skew import skew_from_json
     from fraudaudit.threat import MerchantTable, ThreatModel
 
     t0 = time.perf_counter()
-    tm = ThreatModel.from_yaml(args.threat)
-    attacks = {"random": RandomSearch, "es": lambda: EvolutionStrategy.from_params(tm.es)}
+    try:
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        skew_json = None if args.skew_report is None else json.loads(args.skew_report.read_text(encoding="utf-8"))
+        skew = None if skew_json is None else skew_from_json(skew_json)
+        model_meta = json.loads((args.model / "model.json").read_text(encoding="utf-8")).get("meta", {})
+        if "target_fpr" in model_meta and abs(float(model_meta["target_fpr"]) - cfg.target_fpr) > 1e-12:
+            raise ValueError(f"model τ was chosen for target_fpr {model_meta['target_fpr']}, "
+                             f"{args.gate} asks for {cfg.target_fpr}")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"error: audit configuration: {e}", file=sys.stderr)
+        return 2
     df = load_raw(args.data)
     model = FraudModel.from_artifacts(load_artifacts(args.model))
-    result = run_audit(df, model, tm, attacks[args.attack](), seed=args.seed, n_jobs=args.n_jobs,
-                       model_dir=args.model, threat_path=args.threat)
-    result.meta["wall_seconds_with_loading"] = round(time.perf_counter() - t0, 1)  # + load_raw, model load
-    data = write_outputs(result, args.out, MerchantTable.from_df(df))
-    print(json.dumps({k: data[k] for k in ("ver_clean", "ver_adv", "asr", "asr_upper", "n_targets",
-                                           "recon_ops", "feasible_share")}
-                     | {"wall_seconds": result.meta["wall_seconds"], "out": str(args.out)}, indent=2), flush=True)
+    t1 = time.perf_counter()
+    results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
+                           threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
+    checks = decide(cfg, results, skew)
+    meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
+            "gate_sha256": hashlib.sha256(args.gate.read_bytes()).hexdigest(),
+            "skew_report": None if args.skew_report is None else str(args.skew_report),
+            "wall_seconds": round(time.perf_counter() - t1, 1),
+            "wall_seconds_with_loading": round(time.perf_counter() - t0, 1)}
+    data = write_gate_outputs(args.out, cfg, checks, results, meta, MerchantTable.from_df(df), skew_json)
+    print(json.dumps({"verdict": data["verdict"], "worst_run": data["worst_run"],
+                      "checks": {c.name: {"value": c.value, "threshold": c.threshold, "passed": c.passed}
+                                 for c in checks},
+                      "uplift_upper": {k: r.uplift[2] for k, r in results.items()},
+                      "wall_seconds": meta["wall_seconds"], "out": str(args.out)}, indent=2, ensure_ascii=False),
+          flush=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write((args.out / "summary.md").read_text(encoding="utf-8"))
-    return 0
+    return 0 if passed(checks) else 1
 
 
 def cmd_decide(args: argparse.Namespace) -> int:

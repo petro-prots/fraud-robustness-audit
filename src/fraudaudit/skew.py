@@ -148,3 +148,18 @@ def summary_markdown(rep: SkewReport, atol: float) -> str:
     ]
     lines += [f"| `{c}` | {v:.3g} |" for c, v in rep.max_abs_diff.items()]
     return "\n".join(lines) + "\n"
+
+
+def skew_to_json(rep: SkewReport, **extra) -> dict:
+    """Every field of ``rep`` (plus ``extra``, e.g. seed, atol, git) as JSON; read back with ``skew_from_json``."""
+    return {"passed": bool(rep.passed), "n_cards": int(rep.n_cards), "n_tx": int(rep.n_tx),
+            "decision_mismatches": int(rep.decision_mismatches), "max_abs_p_diff": float(rep.max_abs_p_diff),
+            "max_abs_diff": {k: float(v) for k, v in rep.max_abs_diff.items()}, **extra}
+
+
+def skew_from_json(d: dict) -> SkewReport:
+    """``SkewReport`` from ``skew_to_json`` output (``fraudaudit skew --out``); extra keys are ignored."""
+    return SkewReport(max_abs_diff={k: float(v) for k, v in d["max_abs_diff"].items()},
+                      decision_mismatches=int(d["decision_mismatches"]), n_tx=int(d["n_tx"]),
+                      passed=bool(d["passed"]), n_cards=int(d["n_cards"]),
+                      max_abs_p_diff=float(d["max_abs_p_diff"]))

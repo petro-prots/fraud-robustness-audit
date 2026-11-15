@@ -66,3 +66,7 @@ Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SH
 The committed baseline was trained from uncommitted code on top of `c1625d0`; that code was committed with the artifacts in `f3adaea` (`meta.provenance_note`; the provenance fields were added afterwards by re-saving the same artifacts, predictions unchanged).
 
 Wall time: 19 min 31 s in total (feature preparation 9 s, `mlp.fit` 19 min 19 s, ~57 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
+
+## Audit gate
+
+`fraudaudit audit --data data --model models --threat threat-models/realistic.yaml --gate gate.yaml --out out/` runs every attack of `gate.yaml` (`attacks: [random, es]`) with every attack seed (`attack_seeds: [1, 2, 3]`) on the same target/spare card split (`--seed`, default 42), one run after another, each with its own process pool. Checks (`fraudaudit.gate.decide`): `ver_uplift` (worst run: upper bound of the paired bootstrap interval of VER_adv − VER_clean ≤ `delta`; `delta: null` fails closed), `recall_clean` (clean test recall at τ ≥ `recall_clean_min`), `feasibility` (every run's `feasible_share` = 1) and, with `--skew-report out/skew.json` (written by `fraudaudit skew --out out/skew.json`), `skew`. Writes `out/audit.json` (every run, checks, verdict) and the Ukrainian `out/summary.md` (appended to `$GITHUB_STEP_SUMMARY` when set); exit code 1 if a check fails, 2 on a configuration error.

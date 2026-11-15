@@ -188,12 +188,11 @@ def test_write_outputs(result, tm, tmp_path):
 def test_cli_audit_parser():
     from fraudaudit.cli import build_parser
     a = build_parser().parse_args(["audit", "--data", "data", "--model", "models", "--threat",
-                                   "threat-models/realistic.yaml", "--attack", "random", "--out", "out/",
+                                   "threat-models/realistic.yaml", "--gate", "gate.yaml", "--out", "out/",
                                    "--n-jobs", "3"])
-    assert (a.command, a.attack, a.seed, a.n_jobs, str(a.out)) == ("audit", "random", 42, 3, "out")
-    assert build_parser().parse_args(["audit", "--attack", "es"]).attack == "es"
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["audit", "--attack", "ga"])
+    assert (a.command, str(a.gate), a.seed, a.n_jobs, str(a.out)) == ("audit", "gate.yaml", 42, 3, "out")
+    with pytest.raises(SystemExit):  # the attacks come from gate.yaml (every attack x seed)
+        build_parser().parse_args(["audit", "--attack", "es"])
 
 
 def test_audit_meta_has_es_params(result, tm):
