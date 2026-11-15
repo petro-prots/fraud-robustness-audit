@@ -1,0 +1,10 @@
+rho: 0.8
+k_max: 20
+amount_min: 1.00
+amount_max: 1376.04
+window_days: 7
+max_declines: 1
+knowledge: decision        # decision | score (strong – поза цим планом)
+recon_budget_ops: 2000     # операцій на запасних картках
+cards_per_eval: 5          # запасних карток на одну оцінку стратегії
+merchant_coord_radius: 1.0 # як у генераторі Sparkov: ±1° від дому
