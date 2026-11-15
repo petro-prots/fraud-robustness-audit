@@ -6,6 +6,7 @@ the remaining operations are not executed. ``ver`` is the share of the target su
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .serving.core import Serving
@@ -28,9 +29,14 @@ def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declin
                 rho: float) -> EpisodeOutcome:
     """Run ``txs`` on a copy of ``ctx.state`` (the context is never changed).
 
-    ``max_declines=None`` means the bank never blocks the card. ``success`` is
-    ``passed_amount >= rho * A`` with A = ``ctx.episode.amount``.
+    ``max_declines=None`` means the bank never blocks the card; otherwise it must be >= 1.
+    ``success`` is ``passed_amount >= rho * A`` with A = ``ctx.episode.amount``, compared in whole
+    cents so that float noise cannot flip it: ``round(passed*100) >= ceil(round(rho*A*100, 6))``.
     """
+    if not ctx.episode.amount > 0:
+        raise ValueError("episode amount must be > 0")
+    if max_declines is not None and max_declines < 1:
+        raise ValueError("max_declines must be None or >= 1")
     state = ctx.state.copy()
     target = float(ctx.episode.amount)
     passed = 0.0
@@ -49,5 +55,5 @@ def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declin
             blocked = True
             break
     return EpisodeOutcome(passed_amount=passed, ver=passed / target, n_ops=len(decisions),
-                          n_declines=n_declines, blocked=blocked, success=passed >= rho * target,
+                          n_declines=n_declines, blocked=blocked, success=round(passed * 100) >= math.ceil(round(rho * target * 100, 6)),
                           decisions=tuple(decisions))

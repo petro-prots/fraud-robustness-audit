@@ -1,11 +1,14 @@
 import dataclasses
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from fraudaudit.episode import EpisodeOutcome, run_episode
-from fraudaudit.serving.core import Decision
+from fraudaudit.data import fraud_episodes
+from fraudaudit.features.base import BaseEncoder
+from fraudaudit.serving.core import Decision, Serving
 from fraudaudit.serving.state import CardProfile, CardState, Tx
 
 T0 = pd.Timestamp("2020-02-01 10:00:00")
@@ -51,6 +54,7 @@ def test_unlimited_declines():
 def test_max_declines_two():
     o = run_episode(StubServing([1, 0, 1, 0]), _ctx(), _txs([1, 2, 3, 4]), 2, 0.8)
     assert (o.passed_amount, o.n_ops, o.n_declines, o.blocked) == (2.0, 3, 2, True)
+    assert o.decisions == (True, False, True) and o.ver == pytest.approx(0.02)
 
 
 def test_declined_tx_updates_state():
@@ -80,3 +84,50 @@ def test_no_decline_no_block_and_frozen():
     assert isinstance(o, EpisodeOutcome)
     with pytest.raises(dataclasses.FrozenInstanceError):
         o.ver = 1.0
+
+
+def test_cent_exact_success():
+    ctx = _ctx(0.30)  # 0.7 * 0.30 is 0.21 only up to float noise
+    assert run_episode(StubServing([0]), ctx, _txs([0.21]), None, 0.7).success
+    assert not run_episode(StubServing([0]), ctx, _txs([0.20]), None, 0.7).success
+
+
+def test_rejects_bad_amount_and_max_declines():
+    for a in (0.0, -5.0):
+        with pytest.raises(ValueError, match="amount"):
+            run_episode(StubServing([0]), _ctx(a), _txs([1]), None, 0.8)
+    with pytest.raises(ValueError, match="max_declines"):
+        run_episode(StubServing([0]), _ctx(), _txs([1]), 0, 0.8)
+
+
+def test_real_serving_and_context(sparkov_like):
+    from fraudaudit.threat import MerchantTable, Strategy, ThreatModel, context_for, realize
+    from pathlib import Path
+
+    class ListModel:
+        def __init__(self, encoder, ps):
+            self.encoder, self.tau, self.ps, self.i = encoder, 0.5, ps, 0
+
+        def predict_proba(self, F):
+            p = self.ps[self.i]
+            self.i += 1
+            return np.full(len(F), p)
+
+    df = sparkov_like
+    tm = ThreatModel.from_yaml(Path(__file__).resolve().parents[1] / "threat-models" / "realistic.yaml")
+    merchants = MerchantTable.from_df(df)
+    ctx = context_for(df, fraud_episodes(df, {"fit", "val", "test"})[0])
+    rng = np.random.default_rng(3)
+    s = dataclasses.replace(Strategy.random(tm, len(merchants), rng), k=4)
+    txs = realize(s, ctx, tm, merchants, rng)
+    assert len(txs) == 4
+    n0 = len(ctx.state)
+    model = ListModel(BaseEncoder().fit(df), [0.1, 0.9, 0.1, 0.1])
+    o = run_episode(Serving(model), ctx, txs, 1, tm.rho)
+    assert (o.n_ops, o.n_declines, o.blocked, o.decisions) == (2, 1, True, (False, True))
+    assert o.passed_amount == txs[0].amt and o.ver == pytest.approx(txs[0].amt / ctx.episode.amount)
+    assert len(ctx.state) == n0
+    model = ListModel(BaseEncoder().fit(df), [0.1, 0.9, 0.1, 0.1])
+    o = run_episode(Serving(model), ctx, txs, None, tm.rho)
+    assert o.n_ops == 4 and o.decisions == (False, True, False, False)
+    assert o.passed_amount == pytest.approx(txs[0].amt + txs[2].amt + txs[3].amt)
