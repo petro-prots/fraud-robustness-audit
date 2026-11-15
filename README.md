@@ -73,4 +73,25 @@ Wall time: 19 min 31 s in total (feature preparation 9 s, `mlp.fit` 19 min 19 s,
 
 ### Conventional-audit baseline (informational)
 
-After the ensemble, `audit` also runs the single-transaction baseline (`fraudaudit.audit.run_single_tx_baseline`, threat model `--single-threat threat-models/single-transaction.yaml`; `--no-baseline` skips it). It never changes the verdict. It uses the same target episodes as the episode audit. Every real fraud operation is attacked on its own: a random search of `single_tx_budget: 50` decision-only queries over the amount (1.00–1376.04 $), a time shift in [0, 7 days) from the original time (whole-day wrapping into the episode window) and the merchant. The card state is the original stream: the history before the episode plus the real preceding fraud operations. Aggregates are not recomputed and there is no bank reaction. The first non-declined candidate is kept; if there is none, the original operation is kept and counts as not evaded. Results: `evaded_tx_share`, `evaded_amount_share` (amounts of the chosen operations / sum of A) and the replay. The replay runs the chosen operations of each episode as one episode through `run_episode` (recomputed aggregates, `min_gap_secs`, `max_declines`, ρ of the episode threat model) and reports VER with its paired uplift over VER_clean. The summary section «Звичайний аудит (атака на одну транзакцію) проти епізодного» compares these numbers with the worst episode run, in `audit.json` under `baseline`.
+After the ensemble, `audit` also runs the single-transaction baseline (`fraudaudit.audit.run_single_tx_baseline`, threat model `--single-threat threat-models/single-transaction.yaml`; `--no-baseline` skips it). It never changes the verdict or the exit code; if it fails, `audit.json` gets `baseline: {"error": …}` and the summary gets a note. It uses the same target episodes as the episode audit.
+
+Every real fraud operation is attacked on its own with a random search of at most `single_tx_budget: 50` decision-only queries over three things:
+- the amount (1.00–1376.04 $);
+- a time shift in [0, 7 days) from the original time, wrapped into the episode window by whole days, so a candidate can land before the original time (counted in `meta`);
+- the merchant.
+
+The card state at the candidate time is the recorded stream (ruling R15): the history before the episode plus every other real operation of the episode before that time. Aggregates are not recomputed with the attacker's other changes, and there is no bank reaction. The conventional audit queries the target card's own state; the episode attacker only probes spare cards.
+
+`amount_rule` (`first` in the YAML) chooses which candidate is kept:
+- `first`: the first non-declined candidate;
+- `max`: all 50 queries are made and the non-declined candidate with the largest amount is kept.
+
+The gate runs both rules, the YAML's rule first (primary). If no candidate evades, the original operation is kept and counts as not evaded.
+
+Results:
+- `evaded_tx_share`;
+- `evaded_amount_share` (ORIGINAL amounts of the evaded operations / sum of A);
+- `chosen_amount_ratio` (amounts of the chosen candidates / sum of A, no cap);
+- the replay: the chosen operations of each episode run as one episode through `run_episode` (recomputed aggregates, `min_gap_secs`, `max_declines`, ρ of the episode threat model), with VER and its paired uplift over VER_clean.
+
+The summary section «Звичайний аудит (атака на одну транзакцію) проти епізодного» compares these with the worst episode run, the mean and range of the uplift over all attack × seed runs, and the paired bootstrap of VER_adv − VER_replay. In `audit.json` they are under `baseline` (`primary`, `rules`, `comparison`).

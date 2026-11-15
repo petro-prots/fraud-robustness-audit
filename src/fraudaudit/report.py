@@ -7,7 +7,10 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
+
 from .audit import BaselineResult, _num, _pct, baseline_to_json, strategy_dict, to_json
+from .metrics import uplift_ci
 from .gate import Check, GateConfig, parse_run_key, passed
 
 VERDICT_OK, VERDICT_FAIL = "ПРОЙДЕНО", "НЕ ПРОЙДЕНО"
@@ -55,70 +58,113 @@ def _ci(t) -> str:
     return f"{_pct(t[0])} [{_pct(t[1])}; {_pct(t[2])}]"
 
 
-def baseline_interpretation(b: BaselineResult, worst) -> str:
-    """One plain Ukrainian sentence: does the conventional audit over- or under-state the risk?
-
-    The conventional audit's estimate is ``b.evaded_amount_share`` (share of the fraud amount whose
-    operations evade); the episode audit's is VER_adv of the worst run ``worst`` (an ``AuditResult``), the
-    same scale (share of A). Above the upper bound of VER_adv's interval: overstates; below the lower
-    bound: understates; inside: a close overall estimate. The replay VER says what the operations the
-    conventional audit found actually withdraw as an episode."""
-    claim, va, wu = b.evaded_amount_share, worst.ver_adv, worst.uplift
-    rep, ru = b.replay_ver[0], b.replay_uplift[0]
-    tail = (f"ті самі операції, виконані як епізод з перерахунком агрегатів і реакцією банку, виводять "
-            f"{_pct(rep)} суми епізоду (приріст до VER_clean {_pct(ru)})")
-    episode = f"епізодна атака виводить {_pct(va[0])} (приріст {_pct(wu[0])})"
-    if claim > va[2]:
-        return (f"Звичайний аудит завищує ризик: за ним ухиляються операції на {_pct(claim)} суми шахрайства, "
-                f"але {tail}, а {episode}.")
-    if claim < va[1]:
-        return (f"Звичайний аудит занижує ризик: за ним ухиляються операції лише на {_pct(claim)} суми "
-                f"шахрайства, тоді як {episode}, а {tail}.")
-    return (f"Звичайний аудит дає близьку оцінку загального ризику ({_pct(claim)} суми проти VER_adv "
-            f"{_pct(va[0])} епізодної атаки), але {tail}, тож приріст від атаки він не вимірює.")
+def baseline_comparison(b: BaselineResult, results: dict, worst_key: str) -> dict:
+    """The episode side of the comparison: the worst run (gate's ``ver_uplift`` worst) and the mean and range of
+    the uplift means over every attack × seed run, plus the paired bootstrap of ``ver_adv_i − ver_replay_i``
+    (worst run vs the conventional audit's replay) on the same target episodes."""
+    w = results[worst_key]
+    if [(t["card"], t["start"]) for t in w.per_target] != [(t["card"], t["start"]) for t in b.per_target]:
+        raise ValueError("the baseline and the episode audit have different target episodes")
+    conf = float(b.meta["confidence"])
+    diff = uplift_ci(np.array([t["ver_adv"] for t in w.per_target]),
+                     np.array([t["ver_replay"] for t in b.per_target]), conf, int(b.meta["n_boot"]),
+                     int(b.meta["seed"]))
+    ups = [float(r.uplift[0]) for r in results.values()]
+    return {"worst_run": worst_key, "worst_ver_adv": tuple(w.ver_adv), "worst_uplift": tuple(w.uplift),
+            "uplift_mean_runs": float(np.mean(ups)), "uplift_min_runs": float(min(ups)),
+            "uplift_max_runs": float(max(ups)), "n_runs": len(ups), "adv_minus_replay": tuple(diff)}
 
 
-def _baseline_section(b: BaselineResult, worst_key: str, worst, conf: int) -> list[str]:
+def baseline_interpretation(b: BaselineResult, cmp: dict) -> str:
+    """One plain Ukrainian sentence in two parts, both decided by intervals.
+
+    (a) The per-operation evaded amount share vs the replay VER interval: above its upper bound, the
+    conventional figure is not a loss estimate. (b) The paired ``ver_adv_i − ver_replay_i`` interval: lower
+    bound > 0 – the attack the conventional audit found is weaker than the episode attack; upper < 0 –
+    stronger; else no significant difference."""
+    claim, rep = b.evaded_amount_share, b.replay_ver
+    d = cmp["adv_minus_replay"]
+    if claim > rep[2]:
+        a = (f"Показник ухилення окремих операцій не є оцінкою втрат: за звичайним аудитом ухиляються операції "
+             f"на {_pct(claim)} суми шахрайства, але ці самі операції, виконані як епізод, виводять лише "
+             f"{_pct(rep[0])}")
+    elif claim < rep[1]:
+        a = (f"Показник ухилення окремих операцій ({_pct(claim)} суми шахрайства) нижчий за те, що ці самі "
+             f"операції виводять як епізод ({_pct(rep[0])})")
+    else:
+        a = (f"Показник ухилення окремих операцій ({_pct(claim)} суми шахрайства) узгоджується з тим, що ці самі "
+             f"операції виводять як епізод ({_pct(rep[0])})")
+    ru, wu = _pct(b.replay_uplift[0]), _pct(cmp["worst_uplift"][0])
+    gap = f"різниця VER {_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}]"
+    if d[1] > 0:
+        part = f"знайдена ним атака слабша за епізодну: приріст {ru} проти {wu} ({gap})"
+    elif d[2] < 0:
+        part = f"знайдена ним атака сильніша за епізодну: приріст {ru} проти {wu} ({gap})"
+    else:
+        part = f"знайдена ним атака статистично не відрізняється від епізодної: приріст {ru} проти {wu} ({gap})"
+    return f"{a}; {part}."
+
+
+_RULE_NAME = {"first": "перший невідхилений кандидат", "max": "найбільша сума серед невідхилених"}
+
+
+def _baseline_section(baselines: dict, results: dict, worst_key: str, conf: int,
+                      error: str | None = None) -> list[str]:
+    lines = ["", "## Звичайний аудит (атака на одну транзакцію) проти епізодного", "",
+             "Інформаційне порівняння: не впливає на вердикт шлюзу."]
+    if error is not None:
+        return lines + ["", f"Базову лінію не обчислено через помилку (вердикт і код виходу не змінено): `{error}`"]
+    b = next(iter(baselines.values()))  # primary: the rule of single-transaction.yaml
+    cmp = baseline_comparison(b, results, worst_key)
     tms = b.meta["single_threat_model"]["params"]
     ep = b.meta["episode_params"]
-    return [
-        "", "## Звичайний аудит (атака на одну транзакцію) проти епізодного", "",
-        "Інформаційне порівняння: не впливає на вердикт шлюзу.", "",
-        f"| показник | значення | {conf} % інтервал |", "|---|---:|---|",
-        f"| Частка ухилених операцій (звичайний аудит) | {_pct(b.evaded_tx_share)} ({b.n_evaded} з {b.n_ops}) | – |",
-        f"| Частка ухиленої суми (суми знайдених операцій / сума A) | {_pct(b.evaded_amount_share)} | – |",
-        f"| Те саме за оригінальними сумами ухилених операцій | {_pct(b.evaded_orig_amount_share)} | – |",
-        f"| VER повтору знайдених операцій як епізоду | {_pct(b.replay_ver[0])} "
-        f"| [{_pct(b.replay_ver[1])}; {_pct(b.replay_ver[2])}] |",
-        f"| Приріст повтору до VER_clean (парний bootstrap) | {_pct(b.replay_uplift[0])} "
-        f"| [{_pct(b.replay_uplift[1])}; {_pct(b.replay_uplift[2])}] |",
-        f"| VER_adv епізодної атаки (найгірший прогін `{worst_key}`) | {_pct(worst.ver_adv[0])} "
-        f"| [{_pct(worst.ver_adv[1])}; {_pct(worst.ver_adv[2])}] |",
-        f"| Приріст епізодної атаки (найгірший прогін `{worst_key}`) | {_pct(worst.uplift[0])} "
-        f"| [{_pct(worst.uplift[1])}; {_pct(worst.uplift[2])}] |",
+    lines += ["", f"| правило вибору суми | ухилених операцій | частка ухиленої суми (оригінальні суми) "
+              f"| сума знайдених операцій / сума A | VER повтору як епізоду [{conf} %] | приріст повтору до "
+              f"VER_clean [{conf} %] | запитів |", "|---|---:|---:|---:|---|---|---:|"]
+    for rule, x in baselines.items():
+        mark = " (основне)" if x is b else ""
+        lines.append(f"| `{rule}` – {_RULE_NAME[rule]}{mark} | {_pct(x.evaded_tx_share)} ({x.n_evaded} з {x.n_ops}) "
+                     f"| {_pct(x.evaded_amount_share)} | {_num(x.chosen_amount_ratio, 3)} "
+                     f"| {_pct(x.replay_ver[0])} [{_pct(x.replay_ver[1])}; {_pct(x.replay_ver[2])}] "
+                     f"| {_pct(x.replay_uplift[0])} [{_pct(x.replay_uplift[1])}; {_pct(x.replay_uplift[2])}] "
+                     f"| {x.meta['queries']} |")
+    va, wu, d = cmp["worst_ver_adv"], cmp["worst_uplift"], cmp["adv_minus_replay"]
+    lines += [
         "",
-        baseline_interpretation(b, worst),
+        f"Епізодний аудит: найгірший прогін `{worst_key}` – VER_adv {_pct(va[0])} [{_pct(va[1])}; {_pct(va[2])}], "
+        f"приріст {_pct(wu[0])} [{_pct(wu[1])}; {_pct(wu[2])}]; середній приріст за {cmp['n_runs']} прогонами "
+        f"атака × seed {_pct(cmp['uplift_mean_runs'])} (від {_pct(cmp['uplift_min_runs'])} до "
+        f"{_pct(cmp['uplift_max_runs'])}). Парна різниця VER_adv (`{worst_key}`) − VER повтору (`{b.amount_rule}`): "
+        f"{_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}].",
+        "",
+        baseline_interpretation(b, cmp),
         "",
         f"- Звичайний аудит: кожна реальна шахрайська операція цільових епізодів атакується окремо випадковим "
-        f"пошуком ({tms['single_tx_budget']} запитів на операцію, лише рішення моделі): сума "
+        f"пошуком (до {tms['single_tx_budget']} запитів на операцію, лише рішення моделі): сума "
         f"{_num(tms['amount_min'], 2)}–{_num(tms['amount_max'], 2)} $, зсув часу до {tms['max_shift_days']} днів "
-        f"(з перенесенням у {ep['window_days']}-денне вікно епізоду цілими добами), мерчант. Стан картки – "
-        "оригінальний потік (історія до епізоду і реальні попередні операції епізоду), агрегати не "
-        "перераховуються, реакції банку немає; береться перший кандидат, якого модель не відхиляє, а якщо "
-        "такого немає – оригінальна операція (не ухилена).",
+        f"(з перенесенням у {ep['window_days']}-денне вікно епізоду цілими добами, тож кандидат може опинитися "
+        f"раніше за оригінальну операцію: {b.meta['n_wrapped_earlier_than_original']} з {b.meta['queries']} "
+        "запитів), мерчант. Стан картки – записаний потік: історія до епізоду і всі інші реальні операції "
+        "епізоду до часу кандидата; агрегати не перераховуються, реакції банку немає. Якщо невідхиленого "
+        "кандидата немає – лишається оригінальна операція (не ухилена).",
+        "- Перевага звичайного аудиту: він запитує модель на стані самої цільової картки, тоді як епізодний "
+        "нападник розвідує лише на запасних картках.",
         f"- Повтор: знайдені операції кожного епізоду впорядковуються за часом (не ближче ніж "
         f"{ep['min_gap_secs']} с одна до одної) і виконуються як епізод з перерахунком агрегатів, "
-        f"`max_declines` = {ep['max_declines']} і ρ = {_num(ep['rho'], 2)}; поріг ρ·A досягли "
-        f"{b.meta['n_replay_success']} з {b.n_targets} епізодів, заблоковано карток: {b.meta['n_replay_blocked']}.",
+        f"`max_declines` = {ep['max_declines']} і ρ = {_num(ep['rho'], 2)}; для правила `{b.amount_rule}` поріг "
+        f"ρ·A досягли {b.meta['n_replay_success']} з {b.n_targets} епізодів, заблоковано карток: "
+        f"{b.meta['n_replay_blocked']}.",
         f"- Ті самі {b.n_targets} цільових епізодів, що й в епізодному аудиті (seed розподілу {b.meta['seed']}); "
-        f"запитів до моделі {b.meta['queries']}; час {b.meta['wall_seconds']} с.",
+        "час: " + ", ".join(f"`{r}` {x.meta['wall_seconds']} с" for r, x in baselines.items()) + ".",
     ]
+    return lines
 
 
 def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=None,
-                     baseline: BaselineResult | None = None) -> str:
+                     baseline: dict | None = None, baseline_error: str | None = None) -> str:
     """Ukrainian Markdown: verdict, checks, recommendations, attacks × seeds, baseline, the conventional
-    (single-transaction) audit comparison when ``baseline`` is given (informational), clean quality,
+    (single-transaction) audit comparison when ``baseline`` (``{amount_rule: BaselineResult}``, the first
+    entry is the primary rule) or ``baseline_error`` is given (informational), clean quality,
     the worst run's strategy, metadata. ``results`` is ``{run_key: AuditResult}``; ``meta`` holds the
     gate-level metadata (``gate``, ``gate_file``, ``wall_seconds``, …); per-run metadata comes from the runs."""
     ok = passed(checks)
@@ -196,8 +242,8 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               f"- Інтервали: percentile bootstrap за епізодами ({wm['n_boot']} повторів, приріст – парний); межа "
               f"ASR – Clopper–Pearson."]
 
-    if baseline is not None:
-        lines += _baseline_section(baseline, worst_key, w, conf)
+    if baseline or baseline_error is not None:
+        lines += _baseline_section(baseline or {}, results, worst_key, conf, baseline_error)
 
     gate = meta.get("gate") or {}
     lines += ["", "## Якість моделі на чистих даних (при τ)", ""]
@@ -263,10 +309,23 @@ def write_error_outputs(out_dir: Path | str, message: str) -> str:
     return md
 
 
+def _baseline_json(baseline: dict | None, results: dict, worst: str, error: str | None):
+    if error is not None:
+        return {"error": error}
+    if not baseline:
+        return None
+    primary = next(iter(baseline))
+    cmp = baseline_comparison(baseline[primary], results, worst)
+    return {"primary": primary, "rules": {k: baseline_to_json(v) for k, v in baseline.items()},
+            "comparison": cmp}
+
+
 def write_gate_outputs(out_dir: Path | str, cfg: GateConfig, checks: list[Check], results: dict, meta: dict,
-                       merchants=None, skew: dict | None = None, baseline: BaselineResult | None = None) -> dict:
+                       merchants=None, skew: dict | None = None, baseline: dict | None = None,
+                       baseline_error: str | None = None) -> dict:
     """``out_dir/audit.json`` (verdict, checks, gate, every run via ``to_json``, skew, the single-transaction
-    ``baseline`` or null) and ``out_dir/summary.md``. The baseline never changes the verdict."""
+    ``baseline`` ``{"primary", "rules": {rule: …}, "comparison"}``, ``{"error": …}`` or null) and
+    ``out_dir/summary.md``. The baseline never changes the verdict."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ok = passed(checks)
@@ -275,7 +334,8 @@ def write_gate_outputs(out_dir: Path | str, cfg: GateConfig, checks: list[Check]
     data = {"verdict": VERDICT_OK if ok else VERDICT_FAIL, "passed": ok,
             "checks": [dataclasses.asdict(c) for c in checks], "gate": dataclasses.asdict(cfg),
             "worst_run": worst, "runs": {k: to_json(r, merchants) for k, r in results.items()},
-            "skew": skew, "baseline": None if baseline is None else baseline_to_json(baseline), "meta": meta}
+            "skew": skew, "baseline": _baseline_json(baseline, results, worst, baseline_error), "meta": meta}
     (out / "audit.json").write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    (out / "summary.md").write_text(summary_markdown(checks, results, meta, merchants, baseline), encoding="utf-8")
+    (out / "summary.md").write_text(summary_markdown(checks, results, meta, merchants, baseline,
+                                                                    baseline_error), encoding="utf-8")
     return data

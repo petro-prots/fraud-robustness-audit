@@ -404,10 +404,13 @@ SINGLE_PATH = ROOT / "threat-models" / "single-transaction.yaml"
 
 @pytest.fixture(scope="module")
 def baseline(df, model, tm, model_dir):
+    """``{amount_rule: BaselineResult}``, the primary rule (``first``) first."""
     from fraudaudit.audit import run_single_tx_baseline
     from fraudaudit.threat import SingleTxThreatModel
-    return run_single_tx_baseline(df, model, SingleTxThreatModel.from_yaml(SINGLE_PATH), tm, seed=7, n_jobs=1,
-                                  model_dir=model_dir, target_periods=ALL, single_path=SINGLE_PATH)
+    tms = SingleTxThreatModel.from_yaml(SINGLE_PATH)
+    return {r: run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=1, model_dir=model_dir,
+                                      target_periods=ALL, single_path=SINGLE_PATH, amount_rule=r)
+            for r in ("first", "max")}
 
 
 SECTION = "## Звичайний аудит (атака на одну транзакцію) проти епізодного"
@@ -415,37 +418,66 @@ SECTION = "## Звичайний аудит (атака на одну транз
 
 def test_baseline_section_in_summary(base, baseline):
     from fraudaudit.audit import _pct
-    c = cfg(attacks=["random"], attack_seeds=[1])
-    res = {run_key("random", 1): fake(base, 0.02)}
+    from fraudaudit.report import baseline_comparison
+    c = cfg(attacks=["random"], attack_seeds=[1, 2])
+    res = {run_key("random", 1): fake(base, 0.02), run_key("random", 2): fake(base, 0.30, attack_seed=2)}
     checks = decide(c, res, None)
     md = summary_markdown(checks, res, {}, baseline=baseline)
     assert SECTION in md
     sec = md.split(SECTION)[1].split("\n## ")[0]
-    assert _pct(baseline.evaded_tx_share) in sec and _pct(baseline.evaded_amount_share) in sec
-    assert f"{baseline.n_evaded} з {baseline.n_ops}" in sec
-    assert _pct(baseline.replay_ver[0]) in sec and _pct(baseline.replay_uplift[2]) in sec
-    w = res[run_key("random", 1)]
-    assert _pct(w.uplift[0]) in sec and _pct(w.ver_adv[0]) in sec and "`random/1`" in sec
-    assert "не впливає на вердикт" in sec
-    assert any(s in sec for s in ("завищує ризик", "занижує ризик", "близьку оцінку"))
+    for rule, b in baseline.items():
+        row = next(line for line in sec.splitlines() if line.startswith(f"| `{rule}`"))
+        assert _pct(b.evaded_tx_share) in row and _pct(b.evaded_amount_share) in row
+        assert f"{b.n_evaded} з {b.n_ops}" in row and _pct(b.replay_ver[0]) in row
+        assert _pct(b.replay_uplift[2]) in row and str(b.meta["queries"]) in row
+    assert "(основне)" in next(line for line in sec.splitlines() if line.startswith("| `first`"))
+    w = res[run_key("random", 2)]
+    assert _pct(w.uplift[0]) in sec and _pct(w.ver_adv[0]) in sec and "`random/2`" in sec
+    cmp = baseline_comparison(baseline["first"], res, "random/2")
+    assert cmp["n_runs"] == 2 and _pct(cmp["uplift_mean_runs"]) in sec
+    assert _pct(cmp["uplift_min_runs"]) in sec and _pct(cmp["uplift_max_runs"]) in sec
+    assert _pct(cmp["adv_minus_replay"][0]) in sec
+    assert "не впливає на вердикт" in sec and "стані самої цільової картки" in sec
+    assert "раніше за оригінальну операцію" in sec
     # informational only: the verdict and the checks do not change
     md0 = summary_markdown(checks, res, {})
     assert SECTION not in md0
     assert md.split("\n## ")[0] == md0.split("\n## ")[0]
 
 
-def test_baseline_interpretation_direction(base, baseline):
+def test_baseline_comparison_paired(base, baseline):
+    from fraudaudit.metrics import uplift_ci
+    from fraudaudit.report import baseline_comparison
+    b = baseline["first"]
+    res = {run_key("random", 1): base}
+    cmp = baseline_comparison(b, res, "random/1")
+    adv = np.array([t["ver_adv"] for t in base.per_target])
+    rep = np.array([t["ver_replay"] for t in b.per_target])
+    assert cmp["adv_minus_replay"] == uplift_ci(adv, rep, 0.95, 2000, 7)
+    assert cmp["worst_uplift"] == tuple(base.uplift)
+    other = dataclasses.replace(b, per_target=b.per_target[::-1])
+    with pytest.raises(ValueError):
+        baseline_comparison(other, res, "random/1")
+
+
+def test_baseline_interpretation_direction(baseline):
     from fraudaudit.report import baseline_interpretation
-    w = dataclasses.replace(base, ver_adv=(0.6, 0.5, 0.7), uplift=(0.4, 0.3, 0.5))
-    over = dataclasses.replace(baseline, evaded_amount_share=0.9)
-    under = dataclasses.replace(baseline, evaded_amount_share=0.2)
-    near = dataclasses.replace(baseline, evaded_amount_share=0.6)
-    assert baseline_interpretation(over, w).startswith("Звичайний аудит завищує ризик")
-    assert baseline_interpretation(under, w).startswith("Звичайний аудит занижує ризик")
-    assert "близьку оцінку" in baseline_interpretation(near, w)
-    for s in (over, under, near):
-        text = baseline_interpretation(s, w)
-        assert text.endswith(".") and text.count(". ") == 0  # one sentence
+    b = dataclasses.replace(baseline["first"], replay_ver=(0.3, 0.25, 0.35), replay_uplift=(0.28, 0.2, 0.33))
+    cmp = {"worst_uplift": (0.6, 0.5, 0.7)}
+    high, inside = (dataclasses.replace(b, evaded_amount_share=x) for x in (1.0, 0.3))
+    weaker = dict(cmp, adv_minus_replay=(0.4, 0.3, 0.5))
+    stronger = dict(cmp, adv_minus_replay=(-0.4, -0.5, -0.3))
+    same = dict(cmp, adv_minus_replay=(0.01, -0.05, 0.07))
+    t = baseline_interpretation(high, weaker)
+    assert t.startswith("Показник ухилення окремих операцій не є оцінкою втрат") and "лише 30,0 %" in t
+    assert "знайдена ним атака слабша за епізодну: приріст 28,0 % проти 60,0 %" in t
+    assert "узгоджується" in baseline_interpretation(inside, weaker)
+    assert "сильніша за епізодну" in baseline_interpretation(high, stronger)
+    assert "статистично не відрізняється" in baseline_interpretation(high, same)
+    for x in (high, inside):
+        for c in (weaker, stronger, same):
+            text = baseline_interpretation(x, c)
+            assert text.endswith(".") and text.count(". ") == 0  # one sentence
 
 
 def test_write_gate_outputs_with_baseline(base, baseline, tmp_path):
@@ -454,19 +486,28 @@ def test_write_gate_outputs_with_baseline(base, baseline, tmp_path):
     checks = decide(c, res, None)
     data = write_gate_outputs(tmp_path, c, checks, res, {"seed": 7}, baseline=baseline)
     saved = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
-    assert saved["baseline"]["evaded_tx_share"] == pytest.approx(baseline.evaded_tx_share)
-    assert saved["baseline"]["replay_ver"]["mean"] == pytest.approx(baseline.replay_ver[0])
+    bl = saved["baseline"]
+    assert bl["primary"] == "first" and list(bl["rules"]) == ["first", "max"]
+    assert bl["rules"]["max"]["chosen_amount_ratio"] == pytest.approx(baseline["max"].chosen_amount_ratio)
+    assert bl["rules"]["first"]["replay_ver"]["mean"] == pytest.approx(baseline["first"].replay_ver[0])
+    assert len(bl["comparison"]["adv_minus_replay"]) == 3
     assert saved["passed"] is True and data["passed"] is True
     assert SECTION in (tmp_path / "summary.md").read_text(encoding="utf-8")
     write_gate_outputs(tmp_path, c, checks, res, {"seed": 7})
     assert json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))["baseline"] is None
+    write_gate_outputs(tmp_path, c, checks, res, {"seed": 7}, baseline_error="RuntimeError: boom")
+    assert json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))["baseline"] == {
+        "error": "RuntimeError: boom"}
+    md = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert SECTION in md and "RuntimeError: boom" in md and "✅ ПРОЙДЕНО" in md.split("\n## ")[0]
 
 
 def test_cli_audit_runs_baseline_informational(cli_env):
     code, out, _ = cli_env(GATE_LOOSE)
     assert code == 0
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
-    assert data["baseline"] is not None and 0 <= data["baseline"]["evaded_tx_share"] <= 1
+    assert list(data["baseline"]["rules"]) == ["first", "max"]
+    assert 0 <= data["baseline"]["rules"]["first"]["evaded_tx_share"] <= 1
     assert SECTION in (out / "summary.md").read_text(encoding="utf-8")
     code, out, _ = cli_env(dict(GATE_LOOSE, delta=None))  # the baseline never changes the verdict
     assert code == 1
@@ -474,6 +515,17 @@ def test_cli_audit_runs_baseline_informational(cli_env):
     assert code == 0
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["baseline"] is None and SECTION not in (out / "summary.md").read_text(encoding="utf-8")
+
+
+def test_cli_audit_baseline_error_keeps_verdict(cli_env, monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("baseline exploded")
+    monkeypatch.setattr(audit_mod, "run_single_tx_baseline", boom)
+    code, out, _ = cli_env(GATE_LOOSE)
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["passed"] is True and data["baseline"] == {"error": "RuntimeError: baseline exploded"}
+    assert "baseline exploded" in (out / "summary.md").read_text(encoding="utf-8")
 
 
 def test_cli_audit_bad_single_threat_exit_2(cli_env, tmp_path):

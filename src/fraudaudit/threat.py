@@ -152,7 +152,8 @@ class ThreatModel:
 
 
 _SINGLE_KEYS = ("amount_min", "amount_max", "max_shift_days", "merchant_coord_radius", "knowledge",
-                "single_tx_budget")
+                "single_tx_budget", "amount_rule")
+_AMOUNT_RULES = ("first", "max")
 
 
 @dataclass(frozen=True)
@@ -161,7 +162,8 @@ class SingleTxThreatModel:
     every real fraud operation is attacked on its own by a random search of ``single_tx_budget``
     queries over the amount ``[amount_min, amount_max]``, a time shift ``[0, max_shift_days)`` from the
     original time and the merchant (coordinates home ± ``merchant_coord_radius``). Knowledge is the
-    decision only. The episode window, ``min_gap_secs``, ``max_declines`` and ``rho`` of the replay come
+    decision only. ``amount_rule``: ``first`` keeps the first non-declined candidate, ``max`` queries the
+    whole budget and keeps the non-declined candidate with the largest amount. The episode window, ``min_gap_secs``, ``max_declines`` and ``rho`` of the replay come
     from the episode ``ThreatModel``."""
     amount_min: float
     amount_max: float
@@ -169,6 +171,7 @@ class SingleTxThreatModel:
     merchant_coord_radius: float
     knowledge: str
     single_tx_budget: int
+    amount_rule: str = "first"
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> "SingleTxThreatModel":
@@ -197,7 +200,10 @@ class SingleTxThreatModel:
 
         tm = cls(amount_min=num("amount_min"), amount_max=num("amount_max"),
                  max_shift_days=integer("max_shift_days"), merchant_coord_radius=num("merchant_coord_radius"),
-                 knowledge=str(raw["knowledge"]), single_tx_budget=integer("single_tx_budget"))
+                 knowledge=str(raw["knowledge"]), single_tx_budget=integer("single_tx_budget"),
+                 amount_rule=raw["amount_rule"])
+        if tm.amount_rule not in _AMOUNT_RULES:
+            raise ValueError(f"{path}: amount_rule must be one of {list(_AMOUNT_RULES)}, got {tm.amount_rule!r}")
         if not (0 < tm.amount_min <= tm.amount_max and tm.max_shift_days >= 1 and tm.merchant_coord_radius >= 0
                 and tm.single_tx_budget >= 1):
             raise ValueError(f"{path}: inconsistent single-transaction threat model {tm}")

@@ -156,15 +156,23 @@ def cmd_audit(args: argparse.Namespace) -> int:
     results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
                            threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
     checks = decide(cfg, results, skew)
-    baseline = None
+    baseline, baseline_error = None, None
     if tms is not None:  # informational: the conventional audit on the same targets, not a gate check
         from fraudaudit import audit as audit_mod
-        baseline = audit_mod.run_single_tx_baseline(df, model, tms, tm, args.seed, n_jobs=args.n_jobs,
-                                                    model_dir=args.model, single_path=args.single_threat,
-                                                    confidence=cfg.confidence)
-        print(f"baseline: evaded ops {baseline.evaded_tx_share:.4f}, amount {baseline.evaded_amount_share:.4f}, "
-              f"replay VER {baseline.replay_ver[0]:.4f}, {baseline.meta['wall_seconds']} s",
-              file=sys.stderr, flush=True)
+        rules = [tms.amount_rule] + [r for r in audit_mod.AMOUNT_RULES if r != tms.amount_rule]  # primary first
+        try:
+            baseline = {}
+            for rule in rules:
+                b = audit_mod.run_single_tx_baseline(df, model, tms, tm, args.seed, n_jobs=args.n_jobs,
+                                                     model_dir=args.model, single_path=args.single_threat,
+                                                     confidence=cfg.confidence, amount_rule=rule)
+                baseline[rule] = b
+                print(f"baseline {rule}: evaded ops {b.evaded_tx_share:.4f}, amount {b.evaded_amount_share:.4f}, "
+                      f"chosen/A {b.chosen_amount_ratio:.4f}, replay VER {b.replay_ver[0]:.4f}, "
+                      f"{b.meta['wall_seconds']} s", file=sys.stderr, flush=True)
+        except Exception as e:  # noqa: BLE001 – informational: never changes the verdict or the exit code
+            baseline, baseline_error = None, f"{type(e).__name__}: {e}"
+            print(f"warning: single-transaction baseline failed: {baseline_error}", file=sys.stderr, flush=True)
     meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
             "model_target_fpr": None if model_fpr is None else float(model_fpr),
             "gate_sha256": hashlib.sha256(args.gate.read_bytes()).hexdigest(),
@@ -172,15 +180,12 @@ def cmd_audit(args: argparse.Namespace) -> int:
             "wall_seconds": round(time.perf_counter() - t1, 1),
             "wall_seconds_with_loading": round(time.perf_counter() - t0, 1)}
     data = write_gate_outputs(args.out, cfg, checks, results, meta, MerchantTable.from_df(df), skew_json,
-                              baseline)
+                              baseline, baseline_error)
     print(json.dumps({"verdict": data["verdict"], "worst_run": data["worst_run"],
                       "checks": {c.name: {"value": c.value, "threshold": c.threshold, "passed": c.passed}
                                  for c in checks},
                       "uplift_upper": {k: r.uplift[2] for k, r in results.items()},
-                      "baseline": None if baseline is None else {
-                          "evaded_tx_share": baseline.evaded_tx_share,
-                          "evaded_amount_share": baseline.evaded_amount_share,
-                          "replay_ver": baseline.replay_ver, "replay_uplift": baseline.replay_uplift},
+                      "baseline": _baseline_brief(data["baseline"]),
                       "wall_seconds": meta["wall_seconds"], "out": str(args.out)}, indent=2, ensure_ascii=False),
           flush=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -188,6 +193,15 @@ def cmd_audit(args: argparse.Namespace) -> int:
         with open(summary, "a", encoding="utf-8") as f:
             f.write((args.out / "summary.md").read_text(encoding="utf-8"))
     return 0 if passed(checks) else 1
+
+
+def _baseline_brief(b: dict | None) -> dict | None:
+    """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
+    if b is None or "error" in b:
+        return b
+    keys = ("evaded_tx_share", "evaded_amount_share", "chosen_amount_ratio", "replay_ver", "replay_uplift")
+    return {"rules": {r: {k: v[k] for k in keys} for r, v in b["rules"].items()},
+            "adv_minus_replay": b["comparison"]["adv_minus_replay"]}
 
 
 def cmd_decide(args: argparse.Namespace) -> int:

@@ -207,7 +207,8 @@ def test_audit_meta_has_es_params(result, tm):
 
 import pandas as pd  # noqa: E402
 
-from fraudaudit.audit import BaselineResult, run_single_tx_baseline, single_tx_target  # noqa: E402
+from fraudaudit.audit import (BaselineResult, _wrap_offset, original_stream_state,  # noqa: E402
+                              run_single_tx_baseline, single_tx_target)
 from fraudaudit.data import Episode  # noqa: E402
 from fraudaudit.serving.state import CardState, Tx, profile_of  # noqa: E402
 from fraudaudit.threat import EpisodeContext, MerchantTable, SingleTxThreatModel  # noqa: E402
@@ -234,20 +235,24 @@ def tms():
 def test_single_transaction_yaml_values_and_strict(tms, tmp_path):
     import yaml
     assert (tms.amount_min, tms.amount_max, tms.max_shift_days, tms.single_tx_budget, tms.knowledge,
-            tms.merchant_coord_radius) == (1.0, 1376.04, 7, 50, "decision", 1.0)
+            tms.merchant_coord_radius, tms.amount_rule) == (1.0, 1376.04, 7, 50, "decision", 1.0, "first")
     raw = yaml.safe_load(SINGLE_PATH.read_text())
     for change in ({"extra": 1}, {"knowledge": "score"}, {"single_tx_budget": 0}, {"single_tx_budget": 2.5},
-                   {"max_shift_days": 0}, {"amount_min": 0}, {"single_tx_budget": True}):
+                   {"max_shift_days": 0}, {"amount_min": 0}, {"single_tx_budget": True},
+                   {"amount_rule": "mean"}, {"amount_rule": None}):
         bad = dict(raw, **change)
         p = tmp_path / "bad.yaml"
         p.write_text(yaml.safe_dump(bad))
         with pytest.raises(ValueError):
             SingleTxThreatModel.from_yaml(p)
-    missing = {k: v for k, v in raw.items() if k != "single_tx_budget"}
-    p = tmp_path / "missing.yaml"
-    p.write_text(yaml.safe_dump(missing))
-    with pytest.raises(ValueError):
-        SingleTxThreatModel.from_yaml(p)
+    for key in ("single_tx_budget", "amount_rule"):
+        missing = {k: v for k, v in raw.items() if k != key}
+        p = tmp_path / "missing.yaml"
+        p.write_text(yaml.safe_dump(missing))
+        with pytest.raises(ValueError):
+            SingleTxThreatModel.from_yaml(p)
+    p.write_text(yaml.safe_dump(dict(raw, amount_rule="max")))
+    assert SingleTxThreatModel.from_yaml(p).amount_rule == "max"
 
 
 def _spread_episode(df, n=13, spacing_h=12.5):
@@ -277,7 +282,7 @@ def test_single_tx_uses_original_state(df, tm, tms):
         assert t["ver_clean"] == pytest.approx(1.0)  # the real spread episode passes untouched
         # the same chosen operations as one episode (aggregates recomputed): they bunch up, the bank declines
         assert t["replay_declines"] >= 1 and t["replay_blocked"]
-        assert t["ver_replay"] < t["evaded_amount"] / ctx.episode.amount
+        assert t["ver_replay"] < t["chosen_amount"] / ctx.episode.amount
 
 
 def test_single_tx_candidates_respect_threat_model(df, tm, tms):
@@ -296,7 +301,7 @@ def test_single_tx_candidates_respect_threat_model(df, tm, tms):
     t0 = single_tx_target(strict, ctx, real, tms, tm, merchants, 3, 1)
     assert t0["n_evaded"] == 0 and t0["queries"] == 5 * tms.single_tx_budget
     assert [pd.Timestamp(o["ts"]) for o in t0["chosen"]] == [r.ts for r in real]  # originals kept
-    assert t0["evaded_amount"] == 0.0
+    assert t0["chosen_amount"] == 0.0 and t0["evaded_orig_amount"] == 0.0
 
 
 @pytest.fixture(scope="module")
@@ -316,7 +321,10 @@ def test_baseline_result(baseline, result):
     assert b.n_ops == n_ops and b.n_evaded == sum(t["n_evaded"] for t in b.per_target)
     assert b.evaded_tx_share == pytest.approx(b.n_evaded / n_ops)
     total = sum(t["amount"] for t in b.per_target)
-    assert b.evaded_amount_share == pytest.approx(sum(t["evaded_amount"] for t in b.per_target) / total)
+    assert b.evaded_amount_share == pytest.approx(sum(t["evaded_orig_amount"] for t in b.per_target) / total)
+    assert b.chosen_amount_ratio == pytest.approx(sum(t["chosen_amount"] for t in b.per_target) / total)
+    assert 0.0 <= b.evaded_amount_share <= 1.0 + 1e-12 and b.amount_rule == "first"
+    assert b.meta["n_wrapped_earlier_than_original"] <= b.meta["n_wrapped_candidates"] <= b.meta["queries"]
     v = np.array([t["ver_replay"] for t in b.per_target])
     c = np.array([t["ver_clean"] for t in b.per_target])
     assert b.replay_ver == ver_ci(v, 0.95, 2000, 7) and b.replay_uplift == uplift_ci(v, c, 0.95, 2000, 7)
@@ -332,3 +340,55 @@ def test_baseline_identical_for_n_jobs(df, model, tm, tms, model_dir, baseline):
     assert b2.per_target == baseline.per_target
     assert (b2.evaded_tx_share, b2.evaded_amount_share, b2.replay_ver, b2.replay_uplift) == \
            (baseline.evaded_tx_share, baseline.evaded_amount_share, baseline.replay_ver, baseline.replay_uplift)
+
+
+def test_wrap_offset_edges():
+    day, win = 86_400, 7 * 86_400
+    assert _wrap_offset(0, win) == 0 and _wrap_offset(win - 1, win) == win - 1
+    assert _wrap_offset(win, win) == win - day  # exactly at the window end: one day back
+    for n in range(7):
+        for r in (0, 1, 3600, day - 1):
+            off = win + n * day + r
+            got = _wrap_offset(off, win)
+            assert win - day <= got < win and (off - got) % day == 0 and got == win - day + r
+
+
+def test_original_stream_includes_later_real_ops(df):
+    """R15: the state at a shifted candidate time holds every other real op of the episode before that time,
+    also the ones that come after the attacked op in the original order."""
+    ctx, _, merchants = _spread_episode(df, n=1)
+    s = ctx.episode.start
+    real = [dataclasses.replace(_spread_episode(df, n=1)[1][0], ts=s + pd.Timedelta(seconds=x))
+            for x in (0, 10, 20, 30, 40)]  # op 0, then a burst of 4 later ops
+    at = s + pd.Timedelta(hours=5)
+    st = original_stream_state(ctx, real, 0, at)
+    assert st.aggregates(at)[0] == 4  # cnt_1d: the 4 later ops, not op 0 itself
+    st2 = original_stream_state(ctx, real, 2, at)
+    assert st2.aggregates(at)[0] == 4  # ops 0, 1, 3, 4
+    early = s + pd.Timedelta(seconds=25)
+    assert original_stream_state(ctx, real, 0, early).aggregates(early)[0] == 2  # only ops 1, 2 are before
+
+
+def test_single_tx_shifted_past_burst_sees_it(df, tm, tms):
+    serving = Serving(Cnt1dModel(BaseEncoder().fit(df)))
+    ctx, one, merchants = _spread_episode(df, n=1)
+    s = ctx.episode.start
+    real = [dataclasses.replace(one[0], ts=s + pd.Timedelta(seconds=x)) for x in (0, 10, 20, 30, 40)]
+    one_day = dataclasses.replace(tms, max_shift_days=1)  # every candidate of op 0 lands in [start, start + 1 d)
+    t = single_tx_target(serving, ctx, real, one_day, tm, merchants, 0, 0)
+    assert t["chosen"][0]["evaded"] is False  # shifted past the burst, op 0 sees its 4 later ops and is declined
+    assert t["queries"] >= one_day.single_tx_budget
+
+
+def test_amount_rule_max(df, tm, tms):
+    serving = Serving(LimitModel(BaseEncoder().fit(df), limit=600.0))
+    ctx, real, merchants = _spread_episode(df, n=5)
+    first = single_tx_target(serving, ctx, real, tms, tm, merchants, 3, 1, "first")
+    mx = single_tx_target(serving, ctx, real, tms, tm, merchants, 3, 1, "max")
+    assert mx["queries"] == 5 * tms.single_tx_budget and first["queries"] < mx["queries"]
+    assert first["n_evaded"] == mx["n_evaded"] == 5
+    for a, b in zip(first["chosen"], mx["chosen"]):
+        assert a["amt"] <= b["amt"] <= 600.0
+    assert mx["chosen_amount"] >= first["chosen_amount"]
+    with pytest.raises(ValueError):
+        single_tx_target(serving, ctx, real, tms, tm, merchants, 3, 1, "median")
