@@ -24,6 +24,10 @@ def make_sparkov_like(n_cards: int = 40, days: int = 120, seed: int = 0) -> pd.D
     home_zip = rng.integers(10000, 99999, n_cards)
     home_state = rng.choice(states, n_cards)
     dob = pd.Timestamp("1950-01-01") + pd.to_timedelta(rng.integers(0, 365 * 50, n_cards), unit="D")
+    # owner fields are constant per card, as in real Sparkov
+    owner_rng = np.random.default_rng(seed + 1)
+    home_gender = owner_rng.choice(["F", "M"], n_cards)
+    home_pop = owner_rng.integers(100, 100000, n_cards)
     for c in range(n_cards):
         card = 4_000_000_000_000_000 + c
         n = int(rng.integers(30, 60))
@@ -49,9 +53,9 @@ def make_sparkov_like(n_cards: int = 40, days: int = 120, seed: int = 0) -> pd.D
         "category": rng.choice(CATEGORIES, n),
         "amt": np.round(rng.lognormal(3.5, 1.0, n).clip(1.0, 1376.04), 2),
         "first": "Ann", "last": "Doe",
-        "gender": rng.choice(["F", "M"], n),
+        "gender": home_gender[ci],
         "street": "1 Main St", "city": "Town", "state": home_state[ci], "zip": home_zip[ci],
-        "lat": home_lat[ci], "long": home_long[ci], "city_pop": rng.integers(100, 100000, n),
+        "lat": home_lat[ci], "long": home_long[ci], "city_pop": home_pop[ci],
         "job": "Engineer", "dob": dob[ci].strftime("%Y-%m-%d"),
         "trans_num": [f"{i:032x}" for i in range(n)],
         "unix_time": (pd.Series(ts) - pd.Timestamp("1970-01-01")).dt.total_seconds().astype("int64").to_numpy(),

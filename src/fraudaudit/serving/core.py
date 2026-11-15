@@ -15,7 +15,6 @@ from ..features.columns import BASE_COLUMNS, FEATURE_COLUMNS
 from .state import CardState, Tx
 
 _N_BASE = len(BASE_COLUMNS)
-_DAY_NS = 86_400 * 1_000_000_000
 _COL = {c: i for i, c in enumerate(BASE_COLUMNS)}
 
 

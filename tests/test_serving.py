@@ -48,16 +48,13 @@ def _profile(cc=1) -> CardProfile:
 
 
 def _replay(df: pd.DataFrame, serving: Serving) -> np.ndarray:
-    """Serving-path features of every row: each card replayed through CardState.push in (ts, row) order."""
+    """Serving-path features of every row: each card's state from ``profile_of``, replayed through
+    ``CardState.push`` in (ts, row) order; the profile is never overridden."""
     out = np.empty((len(df), len(FEATURE_COLUMNS)), dtype=np.float32)
     df = df.sort_values(["ts", "row"], kind="stable")
-    for _, g in df.groupby("cc_num", sort=False):
-        state = None
+    for card, g in df.groupby("cc_num", sort=False):
+        state = CardState.from_history(profile_of(df, card), g.iloc[:0], at=g["ts"].iloc[0])
         for idx, r in zip(g.index, g.itertuples(index=False)):
-            prof = _row_profile(r)  # fixture owner fields vary per row; the base part must follow the row
-            if state is None:
-                state = CardState.from_history(prof, g.iloc[:0], at=pd.Timestamp(r.ts))
-            state.profile = prof
             tx = _row_tx(r)
             out[idx] = serving.features(state, tx)
             state.push(tx)
@@ -118,6 +115,31 @@ def test_state_truncates_30d():
         s.push(Tx(T0 + 29 * DAY, 1.0, "fraud_A", "home", 40.0, -80.0))
 
 
+def test_profile_of_rejects_inconsistent_card(sparkov_like):
+    df = sparkov_like.copy()
+    card = df["cc_num"].iloc[0]
+    assert profile_of(df, card).cc_num == card
+    for col, value in (("gender", "X"), ("city_pop", 1), ("lat", 0.0), ("dob", "1900-01-01")):
+        bad = df.copy()
+        bad.loc[bad.index[bad["cc_num"] == card][-1], col] = value
+        with pytest.raises(ValueError, match=col):
+            profile_of(bad, card)
+    with pytest.raises(ValueError):
+        profile_of(df, -1)
+
+
+@pytest.mark.parametrize("days, k", [(1, 0), (7, 1)])
+def test_window_lower_bound_inclusive(days, k):
+    t = T0 + 40 * DAY
+    s = CardState(_profile())
+    s.push(Tx(t - days * DAY - SEC, 100.0, "fraud_A", "home", 40.0, -80.0))  # just outside
+    s.push(Tx(t - days * DAY, 10.0, "fraud_A", "home", 40.0, -80.0))  # exactly w earlier: inside
+    agg = s.aggregates(t)
+    assert agg[k] == 1 and agg[3 + k] == pytest.approx(10.0)
+    assert agg[2] == 2  # both within 30 days
+    assert agg[6] == days * 86_400
+
+
 def test_same_second_ops_not_counted():
     s = CardState(_profile())
     s.push(Tx(T0 - 3600 * SEC, 10.0, "fraud_A", "home", 40.0, -80.0))
@@ -172,3 +194,28 @@ def test_unknown_merchant_rejected(sparkov_like):
     serving, _ = _serving_for(sparkov_like, 0.5, 0.1)
     with pytest.raises(ValueError):
         serving.features(CardState(_row_profile(r)), dataclasses.replace(_row_tx(r), merchant="fraud_Nope"))
+
+
+def test_decide_with_real_model(sparkov_like):
+    import time
+
+    from fraudaudit.model.pipeline import train_model
+
+    df = sparkov_like
+    model, _ = train_model(df, seed=0, epochs=1)
+    serving = Serving(model)
+    card = df["cc_num"].iloc[0]
+    g = df[df["cc_num"] == card]
+    state = CardState.from_history(profile_of(df, card), df, at=g["ts"].iloc[-1])
+    tx = _row_tx(next(g.iloc[-1:].itertuples(index=False)))
+    d = serving.decide(state, tx)
+    p_ref = model.predict_proba(serving.features(state, tx)[np.newaxis, :])[0]
+    assert isinstance(d.p, float) and 0.0 <= d.p <= 1.0
+    assert d.p == p_ref
+    assert d.declined == (d.p >= model.tau)
+    times = []
+    for _ in range(50):
+        a = time.perf_counter()
+        serving.decide(state, tx)
+        times.append(time.perf_counter() - a)
+    assert np.median(times) < 0.020  # loose smoke bound; ~1 ms expected on CPU

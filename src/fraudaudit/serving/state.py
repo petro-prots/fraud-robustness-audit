@@ -12,7 +12,6 @@ the 30-day window and its gap to any later query is > 30 days, i.e. capped anywa
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -51,23 +50,34 @@ class Tx:
     merch_long: float
 
 
+OWNER_FIELDS = ("gender", "dob", "lat", "long", "city_pop", "state")
+
+
 def profile_of(df: pd.DataFrame, cc_num: int) -> CardProfile:
-    """Profile from the card's first operation in (ts, row) order."""
+    """Owner profile of a card; ``ValueError`` if an owner field is not constant over its operations.
+
+    The batch path computes base features per row, the serving path from one profile per card, so a
+    card with varying owner fields would make the two paths diverge silently.
+    """
     g = df[df["cc_num"] == cc_num]
     if g.empty:
         raise ValueError(f"no operations of card {cc_num}")
-    r = g.sort_values(["ts", "row"] if "row" in g else ["ts"], kind="stable").iloc[0]
+    varying = [c for c in OWNER_FIELDS if g[c].nunique(dropna=False) > 1]
+    if varying:
+        raise ValueError(f"owner fields of card {cc_num} are not constant: {varying}")
+    r = g.iloc[0]
     return CardProfile(cc_num=int(cc_num), gender=str(r["gender"]), dob=pd.Timestamp(r["dob"]),
                        lat=float(r["lat"]), long=float(r["long"]), city_pop=int(r["city_pop"]),
                        state=str(r["state"]))
 
 
 class CardState:
-    """Owner profile + operations of the last 30 days as a time-ordered deque of ``(ts_ns, amt)``."""
+    """Owner profile + operations of the last 30 days as time-ordered parallel lists ``ts_ns``, ``amt``."""
 
     def __init__(self, profile: CardProfile) -> None:
         self.profile = profile
-        self._ops: deque[tuple[int, float]] = deque()
+        self._t: list[int] = []  # ns, non-decreasing
+        self._a: list[float] = []
         self._now: int | None = None  # ns; None = no time seen yet
 
     @classmethod
@@ -82,12 +92,13 @@ class CardState:
         m = (t < at_ns) & (t >= at_ns - _KEEP_NS)
         t, amt = t[m], h["amt"].to_numpy(dtype=np.float64)[m]
         order = np.argsort(t, kind="stable")
-        s._ops.extend(zip(t[order].tolist(), amt[order].tolist()))
+        s._t = t[order].tolist()
+        s._a = amt[order].tolist()
         s._now = at_ns
         return s
 
     def __len__(self) -> int:
-        return len(self._ops)
+        return len(self._t)
 
     def _check_time(self, ts_ns: int, what: str) -> None:
         if self._now is not None and ts_ns < self._now:
@@ -98,12 +109,11 @@ class CardState:
         """AGG_COLUMNS for an operation at ``ts`` (float64, length 7); the state is not changed."""
         t = pd.Timestamp(ts).value
         self._check_time(t, "query")
-        times = [o[0] for o in self._ops]
-        amts = [o[1] for o in self._ops]
+        times, amts = self._t, self._a
         hi = bisect_left(times, t)  # ops strictly before t: [0, hi)
         out = np.zeros(len(AGG_COLUMNS), dtype=np.float64)
         for k, w in enumerate(_WINDOWS_NS):
-            lo = bisect_left(times, t - w)  # first t_j >= t - w
+            lo = bisect_left(times, t - w, 0, hi)  # first t_j >= t - w
             n = hi - lo
             if n > 0:
                 out[k] = n
@@ -116,16 +126,15 @@ class CardState:
         """Record ``tx`` as history for later operations; drop operations older than 30 days."""
         t = pd.Timestamp(tx.ts).value
         self._check_time(t, "push")
-        if self._ops and t < self._ops[-1][0]:  # cannot happen when _now is set, kept as a guard
-            raise ValueError("operations must be pushed in time order")
-        self._ops.append((t, float(tx.amt)))
+        self._t.append(t)
+        self._a.append(float(tx.amt))
         self._now = t
-        floor = t - _KEEP_NS
-        while self._ops[0][0] < floor:
-            self._ops.popleft()
+        drop = bisect_left(self._t, t - _KEEP_NS)  # keep t_j >= now - 30d
+        if drop:
+            del self._t[:drop], self._a[:drop]
 
     def copy(self) -> "CardState":
         c = CardState(self.profile)
-        c._ops = deque(self._ops)
+        c._t, c._a = list(self._t), list(self._a)
         c._now = self._now
         return c
