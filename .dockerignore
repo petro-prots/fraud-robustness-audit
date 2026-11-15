@@ -1,0 +1,6 @@
+data/
+out/
+.git/
+.superpowers/
+**/__pycache__/
+.ipynb_checkpoints/
