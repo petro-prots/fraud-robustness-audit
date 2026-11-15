@@ -38,7 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--data", type=Path, default=Path("data"))
     audit.add_argument("--model", type=Path, default=Path("models"), help="artifact directory")
     audit.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
-    audit.add_argument("--attack", choices=["random"], default="random")
+    audit.add_argument("--attack", choices=["random", "es"], default="random",
+                       help="random search or the (mu+lambda) evolution strategy (parameters: attack.es)")
     audit.add_argument("--out", type=Path, default=Path("out"), help="writes audit.json and summary.md")
     audit.add_argument("--seed", type=int, default=42)
     audit.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
@@ -107,6 +108,7 @@ def cmd_skew(args: argparse.Namespace) -> int:
 
 
 def cmd_audit(args: argparse.Namespace) -> int:
+    from fraudaudit.attacks.evolution import EvolutionStrategy
     from fraudaudit.attacks.random_search import RandomSearch
     from fraudaudit.audit import run_audit, write_outputs
     from fraudaudit.data import load_raw
@@ -114,9 +116,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
     from fraudaudit.model.pipeline import FraudModel
     from fraudaudit.threat import MerchantTable, ThreatModel
 
-    attacks = {"random": RandomSearch}
     t0 = time.perf_counter()
     tm = ThreatModel.from_yaml(args.threat)
+    attacks = {"random": RandomSearch, "es": lambda: EvolutionStrategy.from_params(tm.es)}
     df = load_raw(args.data)
     model = FraudModel.from_artifacts(load_artifacts(args.model))
     result = run_audit(df, model, tm, attacks[args.attack](), seed=args.seed, n_jobs=args.n_jobs,

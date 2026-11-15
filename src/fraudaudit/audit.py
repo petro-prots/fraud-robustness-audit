@@ -23,6 +23,7 @@ identical for any ``n_jobs``. Entry points that use ``n_jobs > 1`` need an
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import multiprocessing as mp
@@ -167,6 +168,12 @@ def clean_quality(df: pd.DataFrame, model) -> dict:
     return out
 
 
+def _attack_params(attack) -> dict:
+    """Public scalar attributes of ``attack`` (its hyper-parameters), for the report."""
+    return {k: v for k, v in sorted(vars(attack).items())
+            if not k.startswith("_") and isinstance(v, (int, float, str, bool, type(None)))}
+
+
 def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, *,
               n_jobs: int | None = None, model_dir: Path | str | None = None,
               target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None) -> AuditResult:
@@ -196,7 +203,8 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     with ReconOracle(serving, spares, tm, merchants, tm.recon_budget_ops,
                      np.random.default_rng([seed, _STREAM_ORACLE]), n_jobs=jobs, model_dir=model_dir) as oracle:
         run = attack.run(oracle, tm, np.random.default_rng([seed, _STREAM_ATTACK]))
-        recon = {"attack": type(attack).__name__, "evals": int(run.evals), "ops_used": int(run.ops_used),
+        recon = {"attack": type(attack).__name__, "attack_params": _attack_params(attack),
+                 "evals": int(run.evals), "ops_used": int(run.ops_used),
                  "best_fitness": float(run.best_fitness), "cards_blocked": int(oracle.cards_blocked),
                  "n_spare_episodes": len(spares)}
     if run.best is None:
@@ -230,7 +238,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         "versions": _versions(),
         "threat_model": {"file": None if threat_path is None else str(threat_path),
                          "sha256": None if threat_path is None else _sha256(Path(threat_path)),
-                         "params": {f: getattr(tm, f) for f in tm.__dataclass_fields__}},
+                         "params": dataclasses.asdict(tm)},
         "model": {"dir": None if model_dir is None else str(model_dir),
                   "model_json_sha256": None if model_dir is None else _sha256(Path(model_dir) / "model.json"),
                   "tau": float(model.tau)},

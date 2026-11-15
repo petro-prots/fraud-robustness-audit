@@ -49,6 +49,50 @@ _COORD_TOL = 1e-9  # home + U(-r, r) minus home may exceed r by float rounding
 
 
 @dataclass(frozen=True)
+class ESParams:
+    """(μ+λ) evolution strategy parameters (YAML ``attack.es``): population ``mu``, children per
+    generation ``lam``, mutation std ``sigma`` as a share of each field's range, probability
+    ``p_merchant`` of replacing a merchant by a uniform one, probability ``p_k`` of ``k ± 1``."""
+    mu: int = 5
+    lam: int = 10
+    sigma: float = 0.15
+    p_merchant: float = 0.1
+    p_k: float = 0.2
+
+    def __post_init__(self) -> None:
+        if not (isinstance(self.mu, int) and self.mu >= 1):
+            raise ValueError(f"es.mu must be an integer >= 1, got {self.mu!r}")
+        if not (isinstance(self.lam, int) and self.lam >= 1):
+            raise ValueError(f"es.lam must be an integer >= 1, got {self.lam!r}")
+        if not (np.isfinite(self.sigma) and self.sigma >= 0):
+            raise ValueError(f"es.sigma must be >= 0, got {self.sigma!r}")
+        for name in ("p_merchant", "p_k"):
+            v = getattr(self, name)
+            if not 0 <= v <= 1:
+                raise ValueError(f"es.{name} must be in [0, 1], got {v!r}")
+
+    @classmethod
+    def from_mapping(cls, raw, where: str) -> "ESParams":
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where}: attack.es must be a mapping")
+        names = [f.name for f in dataclasses.fields(cls)]
+        extra = sorted(set(raw) - set(names))
+        missing = [n for n in names if n not in raw]
+        if extra:
+            raise ValueError(f"{where}: unknown keys in attack.es {extra}")
+        if missing:
+            raise ValueError(f"{where}: missing keys in attack.es {missing}")
+        try:
+            return cls(mu=int(raw["mu"]), lam=int(raw["lam"]), sigma=float(raw["sigma"]),
+                       p_merchant=float(raw["p_merchant"]), p_k=float(raw["p_k"]))
+        except ValueError as e:
+            raise ValueError(f"{where}: {e}") from None
+
+
+_ATTACK_KEYS = ("es",)
+
+
+@dataclass(frozen=True)
 class ThreatModel:
     rho: float
     k_max: int
@@ -61,13 +105,24 @@ class ThreatModel:
     cards_per_eval: int
     merchant_coord_radius: float
     min_gap_secs: int
+    es: ESParams = ESParams()  # attacker search parameters (YAML ``attack.es``), not threat limits
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ThreatModel":
+        """Strict loader: every scalar field is required, unknown keys are rejected. The optional
+        nested ``attack`` mapping holds attack parameters (``attack.es`` – all five ``ESParams``
+        keys); without it the defaults apply."""
         raw = yaml.safe_load(Path(path).read_text())
         if not isinstance(raw, dict):
             raise ValueError(f"{path}: expected a mapping")
-        names = [f.name for f in dataclasses.fields(cls)]
+        attack = raw.pop("attack", {})
+        if not isinstance(attack, dict):
+            raise ValueError(f"{path}: attack must be a mapping")
+        extra_attack = sorted(set(attack) - set(_ATTACK_KEYS))
+        if extra_attack:
+            raise ValueError(f"{path}: unknown keys in attack {extra_attack}")
+        es = ESParams.from_mapping(attack["es"], str(path)) if "es" in attack else ESParams()
+        names = [f.name for f in dataclasses.fields(cls) if f.name != "es"]
         extra = sorted(set(raw) - set(names))
         missing = [n for n in names if n not in raw]
         if extra:
@@ -79,7 +134,7 @@ class ThreatModel:
                  max_declines=int(raw["max_declines"]), knowledge=str(raw["knowledge"]),
                  recon_budget_ops=int(raw["recon_budget_ops"]), cards_per_eval=int(raw["cards_per_eval"]),
                  merchant_coord_radius=float(raw["merchant_coord_radius"]),
-                 min_gap_secs=int(raw["min_gap_secs"]))
+                 min_gap_secs=int(raw["min_gap_secs"]), es=es)
         if not (0 < tm.rho <= 1 and tm.k_max >= 1 and 0 < tm.amount_min <= tm.amount_max
                 and tm.window_days >= 1 and tm.merchant_coord_radius >= 0 and tm.min_gap_secs >= 0):
             raise ValueError(f"{path}: inconsistent threat model {tm}")

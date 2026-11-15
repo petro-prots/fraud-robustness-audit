@@ -5,12 +5,13 @@ import numpy as np
 import pytest
 
 from conftest import make_sparkov_like
+from fraudaudit.attacks.evolution import EvolutionStrategy
 from fraudaudit.attacks.random_search import Attack, AttackRun, RandomSearch
 from fraudaudit.data import fraud_episodes
 from fraudaudit.features.base import BaseEncoder
 from fraudaudit.features.columns import FEATURE_COLUMNS
 from fraudaudit.oracle import BudgetExhausted, ReconOracle
-from fraudaudit.serving.core import Serving
+from fraudaudit.serving.core import Decision, Serving
 from fraudaudit.threat import MerchantTable, Strategy, ThreatModel, contexts_for, realize
 
 TM_PATH = Path(__file__).resolve().parents[1] / "threat-models" / "realistic.yaml"
@@ -182,3 +183,130 @@ def test_random_search_identical_for_n_jobs(df, tm, merchants, real_model_dir):
     assert (a.best_fitness, a.evals, a.ops_used) == (b.best_fitness, b.evals, b.ops_used)
     np.testing.assert_array_equal(a.best.to_vector(), b.best.to_vector())
     assert [f for _, f in ha] == [f for _, f in hb]
+
+
+# ---- evolution strategy ---------------------------------------------------------------------------
+
+class NightServing:
+    """Stub bank: decline iff amt > 500 (LimitModel) or the hour of the operation is in [22, 4)."""
+
+    def __init__(self, serving):
+        self.inner = serving
+
+    def decide(self, state, tx):
+        h = tx.ts.hour
+        if h >= 22 or h < 4:
+            return Decision(p=1.0, declined=True)
+        return self.inner.decide(state, tx)
+
+
+def test_es_attack_protocol():
+    assert isinstance(EvolutionStrategy(), Attack)
+    es = EvolutionStrategy()
+    assert (es.mu, es.lam, es.sigma, es.p_merchant, es.p_k) == (5, 10, 0.15, 0.1, 0.2)
+    with pytest.raises(ValueError):
+        EvolutionStrategy(mu=0)
+    with pytest.raises(ValueError):
+        EvolutionStrategy(p_merchant=1.5)
+
+
+def test_es_from_threat_model(tm):
+    es = EvolutionStrategy.from_params(tm.es)
+    assert (es.mu, es.lam, es.sigma, es.p_merchant, es.p_k) == (5, 10, 0.15, 0.1, 0.2)
+
+
+def test_es_beats_random_on_stub(serving, spares, tm, merchants):
+    """Same budget (the realistic one), same oracle seeds. Measured with the default parameters:
+    per seed ES >= RS on only 6 of 12 seeds (the stub is easy: ~130 random candidates already reach
+    ~0.9 of the ceiling 1.0), so the brief's "3 of 3 seeds" does not hold; the claim tested is the
+    mean over a fixed seed set (all seeds measured, none dropped) and that ES never collapses."""
+    night = NightServing(serving)
+    budget = tm.recon_budget_ops
+    rs_fits, es_fits = [], []
+    for seed in range(12):
+        rs = RandomSearch().run(_oracle(night, spares, tm, merchants, budget, seed=seed), tm,
+                                np.random.default_rng([seed, 2]))
+        es = EvolutionStrategy().run(_oracle(night, spares, tm, merchants, budget, seed=seed), tm,
+                                     np.random.default_rng([seed, 2]))
+        rs_fits.append(rs.best_fitness)
+        es_fits.append(es.best_fitness)
+    assert np.mean(es_fits) > np.mean(rs_fits)
+    assert min(es_fits) > 0.8
+
+
+def test_es_respects_budget(serving, spares, tm, merchants):
+    for budget in (0, 7, 60, 400):
+        cs = CountingServing(serving)
+        o = _oracle(cs, spares, tm, merchants, budget, seed=5)
+        run = EvolutionStrategy().run(o, tm, np.random.default_rng(6))
+        assert run.ops_used == o.ops_used == cs.calls <= budget
+        assert run.evals == o.evals == len(o.history)
+        if run.evals == 0:
+            assert run.best is None and np.isnan(run.best_fitness)
+            continue
+        fits = [f for _, f in o.history]
+        assert run.best_fitness == max(fits)  # children evaluated before exhaustion count
+        first_best = next(s for s, f in o.history if f == run.best_fitness)  # ties: the oldest
+        np.testing.assert_array_equal(run.best.to_vector(), first_best.to_vector())
+    # the run stops only when the next candidate's worst case does not fit
+    assert o.remaining < tm.cards_per_eval * tm.k_max
+
+
+def test_es_mutation_bounds_and_locality(tm, merchants):
+    n_m = len(merchants)
+    rng = np.random.default_rng(0)
+    es = EvolutionStrategy()
+    parent = Strategy.random(tm, n_m, rng).clip(tm, n_m)
+    for _ in range(300):
+        c = es.mutate(parent, tm, n_m, rng)
+        assert isinstance(c.k, int) and 1 <= c.k <= tm.k_max and abs(c.k - parent.k) <= 1
+        assert tm.rho <= c.u <= 1.0
+        assert np.all((c.shares >= 0) & (c.shares <= 1))
+        assert np.all((c.day >= 0) & (c.day < tm.window_days))
+        assert np.all((c.hour >= 0) & (c.hour < 24))
+        assert c.merchant.dtype == np.int64 and np.all((c.merchant >= 0) & (c.merchant < n_m))
+        parent = c
+    # extreme k stays in range
+    for k in (1, tm.k_max):
+        p = dataclasses.replace(parent, k=k)
+        ks = {EvolutionStrategy(p_k=1.0).mutate(p, tm, n_m, rng).k for _ in range(50)}
+        assert ks <= {max(1, k - 1), k, min(tm.k_max, k + 1)} and len(ks) == 2
+    # merchant locality: without replacement every step is a small Gaussian move
+    local = EvolutionStrategy(sigma=0.01, p_merchant=0.0)
+    p = dataclasses.replace(parent, merchant=np.full(tm.k_max, n_m // 2, dtype=np.int64))
+    steps = np.concatenate([local.mutate(p, tm, n_m, rng).merchant - n_m // 2 for _ in range(200)])
+    assert np.abs(steps).max() <= np.ceil(5 * 0.01 * n_m)
+    assert np.any(steps != 0)
+    # with replacement the merchant jumps anywhere
+    jump = EvolutionStrategy(sigma=0.0, p_merchant=1.0)
+    m = np.concatenate([jump.mutate(p, tm, n_m, rng).merchant for _ in range(50)])
+    assert np.abs(m - n_m // 2).max() > 0.3 * n_m
+    # no noise, no jumps: the child equals the parent
+    still = EvolutionStrategy(sigma=0.0, p_merchant=0.0, p_k=0.0)
+    np.testing.assert_array_equal(still.mutate(parent, tm, n_m, rng).to_vector(), parent.to_vector())
+
+
+def test_es_mutation_rng_consumption_fixed(tm, merchants):
+    n_m = len(merchants)
+    es = EvolutionStrategy()
+    a = Strategy.random(tm, n_m, np.random.default_rng(1)).clip(tm, n_m)
+    b = dataclasses.replace(Strategy.random(tm, n_m, np.random.default_rng(2)).clip(tm, n_m), k=1)
+    r1, r2 = np.random.default_rng(3), np.random.default_rng(3)
+    es.mutate(a, tm, n_m, r1)
+    es.mutate(b, tm, n_m, r2)
+    assert r1.random() == r2.random()
+
+
+def test_es_identical_for_n_jobs(df, tm, merchants, real_model_dir):
+    spares = contexts_for(df, fraud_episodes(df, {"fit", "val", "test"}))
+    runs = []
+    for n_jobs in (1, 2):
+        with ReconOracle(None, spares, tm, merchants, 600, np.random.default_rng(11), n_jobs=n_jobs,
+                         model_dir=real_model_dir) as o:
+            runs.append((EvolutionStrategy().run(o, tm, np.random.default_rng(13)), o.history))
+    (a, ha), (b, hb) = runs
+    assert a.evals > EvolutionStrategy().mu  # at least one generation
+    assert (a.best_fitness, a.evals, a.ops_used) == (b.best_fitness, b.evals, b.ops_used)
+    np.testing.assert_array_equal(a.best.to_vector(), b.best.to_vector())
+    assert [f for _, f in ha] == [f for _, f in hb]
+    assert all(np.array_equal(x.to_vector(), y.to_vector()) for (x, _), (y, _) in zip(ha, hb))

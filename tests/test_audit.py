@@ -191,3 +191,14 @@ def test_cli_audit_parser():
                                    "threat-models/realistic.yaml", "--attack", "random", "--out", "out/",
                                    "--n-jobs", "3"])
     assert (a.command, a.attack, a.seed, a.n_jobs, str(a.out)) == ("audit", "random", 42, 3, "out")
+    assert build_parser().parse_args(["audit", "--attack", "es"]).attack == "es"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["audit", "--attack", "ga"])
+
+
+def test_audit_meta_has_es_params(result, tm):
+    import json
+    params = result.meta["threat_model"]["params"]
+    assert params["es"] == {"mu": 5, "lam": 10, "sigma": 0.15, "p_merchant": 0.1, "p_k": 0.2}
+    json.dumps(result.meta)  # serialisable
+    assert result.meta["recon"]["attack_params"] == {"batch_size": None}  # RandomSearch

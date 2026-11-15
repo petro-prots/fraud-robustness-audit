@@ -44,6 +44,28 @@ def test_threat_model_from_yaml(tm):
         tm.rho = 0.5
 
 
+def test_threat_model_es_params(tm, tmp_path):
+    from fraudaudit.threat import ESParams
+    assert tm.es == ESParams(mu=5, lam=10, sigma=0.15, p_merchant=0.1, p_k=0.2)
+    base = "".join(line + "\n" for line in TM_PATH.read_text().splitlines()
+                   if line and not line.startswith(" ") and not line.startswith("attack"))
+    p = tmp_path / "tm.yaml"
+    p.write_text(base)  # no attack section: defaults
+    assert ThreatModel.from_yaml(p).es == ESParams()
+    p.write_text(base + "attack:\n  es: {mu: 3, lam: 7, sigma: 0.2, p_merchant: 0.0, p_k: 0.5}\n")
+    assert ThreatModel.from_yaml(p).es == ESParams(mu=3, lam=7, sigma=0.2, p_merchant=0.0, p_k=0.5)
+    for bad, match in [("attack:\n  es: {mu: 3}\n", "missing"),
+                       ("attack:\n  es: {mu: 5, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2, x: 1}\n", "unknown"),
+                       ("attack:\n  ga: {}\n", "unknown"),
+                       ("attack:\n  es: {mu: 0, lam: 10, sigma: 0.15, p_merchant: 0.1, p_k: 0.2}\n", "mu"),
+                       ("attack:\n  es: {mu: 5, lam: 10, sigma: -1, p_merchant: 0.1, p_k: 0.2}\n", "sigma"),
+                       ("attack:\n  es: {mu: 5, lam: 10, sigma: 0.15, p_merchant: 2, p_k: 0.2}\n", "p_merchant"),
+                       ("attack: 3\n", "attack")]:
+        p.write_text(base + bad)
+        with pytest.raises(ValueError, match=match):
+            ThreatModel.from_yaml(p)
+
+
 def test_threat_model_rejects_unknown_or_missing_keys(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text(TM_PATH.read_text() + "extra: 1\n")
