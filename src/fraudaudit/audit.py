@@ -4,7 +4,8 @@ Steps of ``run_audit``:
 
 1. target and spare episodes (``select_episodes``, ruling R14): with ``spares_period="fit"`` (the gate) the
    targets are ALL fraud episodes of the target periods (``test``: 218) and the spares are the fraud
-   episodes of the ``fit`` period – a card may appear in both, but at another time and with another
+   episodes of the S half of the ``fit`` period (card split ``fit_split``, ruling R20: the H half is
+   reserved for ``harden``) – a card may appear in both, but at another time and with another
    state («other compromised data» for the same model); with ``spares_period="test"`` (legacy, kept for
    comparison) the target-period episodes are split by card 50/50 into target and spare cards
    (``split_cards(episodes, seed)``). The attacker never sees a target episode;
@@ -50,7 +51,7 @@ import numpy as np
 import pandas as pd
 
 from .attacks.random_search import Attack
-from .data import SPARES_PERIODS, fraud_episodes, period, split_cards
+from .data import FIT_SPLIT_SEED, SPARES_PERIODS, fit_split, fit_split_meta, fraud_episodes, period, split_cards
 from .episode import run_episode
 from .metrics import clopper_pearson_upper, uplift_ci, uplift_se, ver_ci
 from .oracle import ReconOracle
@@ -171,14 +172,14 @@ def _versions() -> dict:
             "tensorflow": tf.__version__, "keras": keras.__version__}
 
 
-def clean_quality(df: pd.DataFrame, model) -> dict:
-    """Recall/FPR/precision of ``model`` at its tau on clean ``val`` and ``test`` operations."""
+def clean_quality(df: pd.DataFrame, model, periods: tuple[str, ...] = ("val", "test")) -> dict:
+    """Recall/FPR/precision of ``model`` at its tau on clean operations of ``periods`` (``val`` and ``test``)."""
     from .model.pipeline import features, quality
     per = period(df).to_numpy()
     F = features(df, model.encoder)
     y = df["is_fraud"].to_numpy(dtype=np.int64)
     out = {}
-    for name in ("val", "test"):
+    for name in periods:
         m = per == name
         p = np.asarray(model.predict_proba(F[m]), dtype=np.float64) if m.any() else np.empty(0)
         out[name] = quality(y[m], p, model.tau)
@@ -192,11 +193,12 @@ def _attack_params(attack) -> dict:
 
 
 def select_episodes(df: pd.DataFrame, target_periods: tuple[str, ...], spares_period: str, seed: int):
-    """(target episodes, spare episodes) of the audit (ruling R14).
+    """(target episodes, spare episodes) of the audit (rulings R14, R20).
 
-    ``spares_period="fit"``: every fraud episode of ``target_periods`` is a target, the spares are every fraud
-    episode of the ``fit`` period (``fit`` must not be a target period). ``spares_period="test"`` (legacy): the
-    episodes of ``target_periods`` are split by card 50/50, ``split_cards(episodes, seed)``."""
+    ``spares_period="fit"``: every fraud episode of ``target_periods`` is a target, the spares are the fraud
+    episodes of the S half of the ``fit`` period (``fit_split(…, FIT_SPLIT_SEED)``; the H half is reserved for
+    ``harden``; ``fit`` must not be a target period). ``spares_period="test"`` (legacy): the episodes of
+    ``target_periods`` are split by card 50/50, ``split_cards(episodes, seed)``."""
     if spares_period not in SPARES_PERIODS:
         raise ValueError(f"spares_period must be one of {list(SPARES_PERIODS)}, got {spares_period!r}")
     episodes = fraud_episodes(df, set(target_periods))
@@ -205,14 +207,14 @@ def select_episodes(df: pd.DataFrame, target_periods: tuple[str, ...], spares_pe
     if "fit" in target_periods:
         raise ValueError("spares_period 'fit' needs target periods without 'fit' "
                          f"(the spares come from fit), got {list(target_periods)}")
-    return episodes, fraud_episodes(df, {"fit"})
+    return episodes, fit_split(fraud_episodes(df, {"fit"}), FIT_SPLIT_SEED)[1]
 
 
 def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, *,
+              spares_period: str, one_sided: bool,
               n_jobs: int | None = None, model_dir: Path | str | None = None,
               target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None,
-              attack_seed: int | None = None, confidence: float = CONFIDENCE, spares_period: str = "test",
-              one_sided: bool = False) -> AuditResult:
+              attack_seed: int | None = None, confidence: float = CONFIDENCE) -> AuditResult:
     """Episode audit of ``model`` (see the module docstring).
 
     ``model`` is used in-process (``n_jobs=1``) and for the clean quality; ``n_jobs > 1`` needs
@@ -221,10 +223,33 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     only for tests on small synthetic data. ``threat_path`` (the YAML ``tm`` came from) is hashed
     into ``meta``. ``attack_seed`` changes only the attack's random stream (the card split, the oracle
     and the target realisations stay those of ``seed``); ``confidence`` is the level of every interval.
-    ``spares_period`` chooses the target/spare episodes (``select_episodes``; the gate uses ``"fit"``, the
-    default ``"test"`` is the legacy 50/50 split); ``one_sided`` makes the uplift upper bound one-sided
+    ``spares_period`` (required) chooses the target/spare episodes (``select_episodes``; the gate uses ``"fit"``,
+    ``"test"`` is the legacy 50/50 split); ``one_sided`` (required) makes the uplift upper bound one-sided
     (the gate); VER intervals stay two-sided.
     """
+    if not isinstance(one_sided, bool):
+        raise ValueError(f"one_sided must be a bool, got {one_sided!r}")
+    target_eps, spare_eps = select_episodes(df, tuple(target_periods), spares_period, seed)
+    extra = {}
+    if spares_period == "fit":
+        h, s = fit_split(fraud_episodes(df, {"fit"}), FIT_SPLIT_SEED)
+        extra["fit_split"] = fit_split_meta(h, s, FIT_SPLIT_SEED)
+    return audit_episodes(df, model, tm, attack, seed, target_eps, spare_eps, spares_period=spares_period,
+                          one_sided=one_sided, n_jobs=n_jobs, model_dir=model_dir, target_periods=target_periods,
+                          threat_path=threat_path, attack_seed=attack_seed, confidence=confidence,
+                          extra_meta=extra)
+
+
+def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, target_eps: list,
+                   spare_eps: list, *, spares_period: str, one_sided: bool, n_jobs: int | None = None,
+                   model_dir: Path | str | None = None, target_periods: tuple[str, ...] = ("test",),
+                   threat_path: Path | str | None = None, attack_seed: int | None = None,
+                   confidence: float = CONFIDENCE, quality_periods: tuple[str, ...] = ("val", "test"),
+                   extra_meta: dict | None = None) -> AuditResult:
+    """``run_audit`` on explicit target and spare episodes (``run_audit`` selects them; ``harden``'s
+    mini-audit passes the val episodes as targets and H episodes as spares). ``spares_period`` and
+    ``target_periods`` are only recorded in ``meta``; ``quality_periods`` are the periods of the clean
+    quality (``harden`` never looks at ``test``)."""
     t0 = time.perf_counter()
     jobs = n_jobs if n_jobs is not None else ((os.cpu_count() or 1) if model_dir is not None else 1)
     jobs = max(1, int(jobs))
@@ -233,7 +258,6 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
 
     if not isinstance(one_sided, bool):
         raise ValueError(f"one_sided must be a bool, got {one_sided!r}")
-    target_eps, spare_eps = select_episodes(df, tuple(target_periods), spares_period, seed)
     if not target_eps:
         raise ValueError("no target episodes")
     if not spare_eps:
@@ -272,7 +296,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     k = sum(t["success"] for t in per_target)
     n_exec = sum(t["n_ops"] for t in per_target)
     feasible_share = sum(t["n_feasible_ops"] for t in per_target) / n_exec if n_exec else float("nan")
-    quality = clean_quality(df, model)
+    quality = clean_quality(df, model, quality_periods)
 
     from .cli import git_info
     meta = {
@@ -305,6 +329,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         "n_ver_adv_gt_1": int((v_adv > 1).sum()), "max_ver_adv": float(v_adv.max()),
         "n_ver_clean_gt_1": int((v_clean > 1).sum()), "max_ver_clean": float(v_clean.max()),
         "median_amount": float(np.median([t["amount"] for t in per_target])),
+        **(extra_meta or {}),
     }
     result = AuditResult(
         ver_adv=ver_ci(v_adv, confidence, N_BOOT, seed), ver_clean=ver_ci(v_clean, confidence, N_BOOT, seed),
@@ -459,9 +484,9 @@ def _baseline_job(i: int) -> dict:
 
 def run_single_tx_baseline(df: pd.DataFrame, model, tm_single: SingleTxThreatModel, tm_episode: ThreatModel,
                            seed: int, *, n_jobs: int | None = None, model_dir: Path | str | None = None,
-                           target_periods: tuple[str, ...] = ("test",), single_path: Path | str | None = None,
-                           confidence: float = CONFIDENCE, amount_rule: str | None = None,
-                           spares_period: str = "test") -> BaselineResult:
+                           spares_period: str, target_periods: tuple[str, ...] = ("test",),
+                           single_path: Path | str | None = None, confidence: float = CONFIDENCE,
+                           amount_rule: str | None = None) -> BaselineResult:
     """The «conventional audit» on the target episodes of ``run_audit`` (same ``select_episodes`` with the same
     ``spares_period`` and ``seed``; the spares are not used).
 
@@ -584,9 +609,13 @@ def spares_text(m: dict, spare_cards: list) -> str:
     """One sentence: where the targets and the reconnaissance spares come from (``meta`` of a run)."""
     periods = ", ".join(m.get("target_periods", ["test"]))
     if m.get("spares_period", "test") == "fit":
+        fs = m.get("fit_split")
+        half = ("" if fs is None else
+                f" – the S half of a card split of the fit-period episodes (split seed {fs['seed']}; the other "
+                f"{fs['n_h_cards']} cards are reserved for hardening and never used for reconnaissance)")
         return (f"targets are every fraud episode of the {periods} period(s); reconnaissance spares are the "
-                f"{m['recon']['n_spare_episodes']} fraud episodes of the fit period ({len(spare_cards)} cards; a "
-                "card can also be a target, at another time and with another state).")
+                f"{m['recon']['n_spare_episodes']} fraud episodes of the fit period{half} ({len(spare_cards)} "
+                "cards; a card can also be a target, at another time and with another state).")
     return (f"targets and spares are a 50/50 card split of the {periods} episodes (seed {m['seed']}); spare cards "
             f"for reconnaissance: {len(spare_cards)}.")
 

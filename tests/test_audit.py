@@ -35,7 +35,7 @@ class LimitModel:
 
 @pytest.fixture(scope="module")
 def df():
-    return make_sparkov_like()
+    return make_sparkov_like(n_cards=80)  # R20: the S half of the fit episodes needs >= cards_per_eval spares
 
 
 @pytest.fixture(scope="module")
@@ -60,7 +60,7 @@ def model(model_dir):
 @pytest.fixture(scope="module")
 def result(df, model, tm, model_dir):
     return run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                     target_periods=ALL, threat_path=TM_PATH)
+                     target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
 
 
 def test_ver_ci_bounds():
@@ -151,7 +151,8 @@ def test_targets_and_spares_disjoint_in_audit(df, model, tm, model_dir, monkeypa
         return real(serving, spares, *a, **kw)
 
     monkeypatch.setattr(audit_mod, "ReconOracle", spy)
-    r = run_audit(df, model, tm, RandomSearch(), seed=3, n_jobs=1, model_dir=model_dir, target_periods=ALL)
+    r = run_audit(df, model, tm, RandomSearch(), seed=3, n_jobs=1, model_dir=model_dir, target_periods=ALL,
+                  spares_period="test", one_sided=False)
     spare_cards = {c.episode.card for c in seen["spares"]}
     target_cards = {t["card"] for t in r.per_target}
     assert spare_cards and target_cards
@@ -162,7 +163,7 @@ def test_targets_and_spares_disjoint_in_audit(df, model, tm, model_dir, monkeypa
 
 def test_audit_identical_for_n_jobs(df, model, tm, model_dir, result):
     r2 = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=2, model_dir=model_dir,
-                   target_periods=ALL, threat_path=TM_PATH)
+                   target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
     assert r2.per_target == result.per_target
     assert (r2.ver_adv, r2.ver_clean, r2.asr, r2.asr_upper, r2.recon_ops, r2.feasible_share) == \
            (result.ver_adv, result.ver_clean, result.asr, result.asr_upper, result.recon_ops,
@@ -307,7 +308,7 @@ def test_single_tx_candidates_respect_threat_model(df, tm, tms):
 @pytest.fixture(scope="module")
 def baseline(df, model, tm, tms, model_dir):
     return run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=1, model_dir=model_dir,
-                                  target_periods=ALL, single_path=SINGLE_PATH)
+                                  target_periods=ALL, single_path=SINGLE_PATH, spares_period="test")
 
 
 def test_baseline_result(baseline, result):
@@ -336,7 +337,7 @@ def test_baseline_result(baseline, result):
 
 def test_baseline_identical_for_n_jobs(df, model, tm, tms, model_dir, baseline):
     b2 = run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=2, model_dir=model_dir,
-                                target_periods=ALL, single_path=SINGLE_PATH)
+                                target_periods=ALL, single_path=SINGLE_PATH, spares_period="test")
     assert b2.per_target == baseline.per_target
     assert (b2.evaded_tx_share, b2.evaded_amount_share, b2.replay_ver, b2.replay_uplift) == \
            (baseline.evaded_tx_share, baseline.evaded_amount_share, baseline.replay_ver, baseline.replay_uplift)
@@ -413,7 +414,7 @@ def test_tau_after_decline_reaches_every_run_episode_call(df, model, tm, model_d
     tm2 = dataclasses.replace(tm, tau_after_decline=1e-9)
     seen_a, seen_o = _spy_run_episode(monkeypatch, audit_mod), _spy_run_episode(monkeypatch, oracle_mod)
     r = run_audit(df, model, tm2, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                  target_periods=ALL, threat_path=TM_PATH)
+                  target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
     assert seen_a and seen_o and set(seen_a) == {1e-9} and set(seen_o) == {1e-9}
     assert r.meta["threat_model"]["params"]["tau_after_decline"] == 1e-9
     assert "tau_after_decline" in audit_mod.summary_markdown(audit_mod.to_json(r))
@@ -422,14 +423,15 @@ def test_tau_after_decline_reaches_every_run_episode_call(df, model, tm, model_d
 def test_tau_after_decline_reaches_baseline_replay(df, model, tm, tms, model_dir, monkeypatch):
     seen = _spy_run_episode(monkeypatch, audit_mod)
     run_single_tx_baseline(df, model, tms, dataclasses.replace(tm, tau_after_decline=1e-9), seed=7, n_jobs=1,
-                           model_dir=model_dir, target_periods=ALL, single_path=SINGLE_PATH)
+                           model_dir=model_dir, target_periods=ALL, single_path=SINGLE_PATH, spares_period="test")
     assert seen and set(seen) == {1e-9}
 
 
 def test_audit_with_escalation_identical_for_n_jobs(df, model, tm, model_dir):
     tm2 = dataclasses.replace(tm, tau_after_decline=1e-9)
     r1, r2 = (run_audit(df, model, tm2, RandomSearch(), seed=7, n_jobs=j, model_dir=model_dir,
-                        target_periods=ALL, threat_path=TM_PATH) for j in (1, 2))
+                        target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
+                        for j in (1, 2))
     assert r1.per_target == r2.per_target
     np.testing.assert_array_equal(r1.best.to_vector(), r2.best.to_vector())
 
@@ -460,12 +462,17 @@ def _spy_spares(monkeypatch):
 def test_fit_spares_targets_are_all_test_episodes(df, model, tm, model_dir, monkeypatch):
     seen = _spy_spares(monkeypatch)
     r = run_audit(df, model, tm, RandomSearch(), seed=3, n_jobs=1, model_dir=model_dir,
-                  target_periods=("test",), spares_period="fit")
+                  target_periods=("test",), spares_period="fit", one_sided=False)
     want = fraud_episodes(df, {"test"})
     assert [(t["card"], t["start"]) for t in r.per_target] == [(e.card, e.start.isoformat()) for e in want]
     assert r.n_targets == len(want)
-    fit = fraud_episodes(df, {"fit"})
+    from fraudaudit.data import FIT_SPLIT_SEED, fit_split
+    h, fit = fit_split(fraud_episodes(df, {"fit"}), FIT_SPLIT_SEED)  # R20: only the S half is a spare
     assert [(c.episode.card, c.episode.start) for c in seen["spares"]] == [(e.card, e.start) for e in fit]
+    assert not {c.episode.card for c in seen["spares"]} & {e.card for e in h}  # gate spares ⊆ S, never H
+    assert r.meta["fit_split"] == {"seed": FIT_SPLIT_SEED, "n_h_cards": len({e.card for e in h}),
+                                   "n_s_cards": len({e.card for e in fit}), "n_h_episodes": len(h),
+                                   "n_s_episodes": len(fit)}
     per = audit_mod.period(df)
     spare_rows = [row for c in seen["spares"] for row in c.episode.rows]
     assert set(per[df["row"].isin(spare_rows)]) == {"fit"}
@@ -484,7 +491,7 @@ def test_fit_spares_targets_are_all_test_episodes(df, model, tm, model_dir, monk
 def test_spares_period_test_reproduces_the_old_split(df, model, tm, model_dir, result):
     from fraudaudit.data import split_cards
     r = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                  target_periods=ALL, threat_path=TM_PATH, spares_period="test")
+                  target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
     assert r.per_target == result.per_target and r.spare_cards == result.spare_cards
     assert r.uplift == result.uplift and r.meta["spares_period"] == "test"
     tgt, spare = split_cards(fraud_episodes(df, set(ALL)), 7)
@@ -496,13 +503,13 @@ def test_spares_period_test_reproduces_the_old_split(df, model, tm, model_dir, r
 def test_spares_period_strict(df, model, tm, model_dir, bad):
     with pytest.raises(ValueError):
         run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                  target_periods=("test",), spares_period=bad)
+                  target_periods=("test",), spares_period=bad, one_sided=False)
 
 
 def test_fit_spares_need_targets_outside_fit(df, model, tm, model_dir):
     with pytest.raises(ValueError, match="fit"):
         run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                  target_periods=ALL, spares_period="fit")
+                  target_periods=ALL, spares_period="fit", one_sided=False)
 
 
 @pytest.fixture(scope="module")
@@ -540,3 +547,16 @@ def test_baseline_uses_the_audit_targets_with_fit_spares(df, model, tm, model_di
     assert [(t["card"], t["start"]) for t in b.per_target] == \
            [(t["card"], t["start"]) for t in fit_result.per_target]
     assert b.meta["spares_period"] == "fit"
+
+
+def test_spares_period_and_one_sided_are_required(df, model, tm, model_dir):
+    """Parked minor of Task 16b: no silent legacy defaults for the method of an audit."""
+    from fraudaudit.audit import run_single_tx_baseline
+    from fraudaudit.threat import SingleTxThreatModel
+    with pytest.raises(TypeError):
+        run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, target_periods=ALL, one_sided=False)
+    with pytest.raises(TypeError):
+        run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, target_periods=ALL, spares_period="test")
+    with pytest.raises(TypeError):
+        run_single_tx_baseline(df, model, SingleTxThreatModel.from_yaml(SINGLE_PATH), tm, seed=7, n_jobs=1,
+                               target_periods=ALL)

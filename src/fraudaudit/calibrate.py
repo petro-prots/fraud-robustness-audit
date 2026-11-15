@@ -80,7 +80,8 @@ def calibration_markdown(data: dict) -> str:
     def usd(x):
         return f"~{_num(x * med, 0)} $" if med else "–"
 
-    spares = ("the fraud episodes of the fit period" if m.get("spares_period") == "fit"
+    spares = ("the fraud episodes of the S half of the fit period (card split, ruling R20)"
+              if m.get("spares_period") == "fit"
               else "a 50/50 card split of the target episodes")
     lines = [
         "# Gate resolution calibration (baseline model)",

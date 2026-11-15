@@ -60,3 +60,19 @@ def test_sorted_by_ts_then_row(sparkov_like):
 def test_sparkov_like_deterministic():
     a, b = make_sparkov_like(), make_sparkov_like()
     pd.testing.assert_frame_equal(a, b)
+
+
+# --- R20: disjoint card split of the fit-period episodes (H: hardening, S: gate spares) ---------------------
+
+
+def test_fit_split_is_disjoint_by_card_and_deterministic():
+    from fraudaudit.data import FIT_SPLIT_SEED, fit_split
+    df = make_sparkov_like(n_cards=80)
+    eps = fraud_episodes(df, {"fit"})
+    h, s = fit_split(eps, FIT_SPLIT_SEED)
+    hc, sc = {e.card for e in h}, {e.card for e in s}
+    assert hc and sc and not hc & sc
+    assert sorted(h + s, key=lambda e: (e.card, e.start)) == sorted(eps, key=lambda e: (e.card, e.start))
+    assert abs(len(hc) - len(sc)) <= 1  # ~50/50 by card
+    assert fit_split(eps, FIT_SPLIT_SEED) == (h, s)
+    assert {e.card for e in fit_split(list(reversed(eps)), FIT_SPLIT_SEED)[1]} == sc  # input order irrelevant

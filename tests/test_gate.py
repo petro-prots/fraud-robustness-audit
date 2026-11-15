@@ -25,7 +25,7 @@ ALL = ("fit", "val", "test")  # sparkov_like has too few test episodes for a 50/
 
 @pytest.fixture(scope="module")
 def df():
-    return make_sparkov_like()
+    return make_sparkov_like(n_cards=80)  # R20: the S half of the fit episodes needs >= cards_per_eval spares
 
 
 @pytest.fixture(scope="module")
@@ -50,7 +50,8 @@ def model(model_dir):
 @pytest.fixture(scope="module")
 def base(df, model, tm, model_dir):
     return run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                     target_periods=ALL, threat_path=TM_PATH, attack_seed=1, one_sided=True)
+                     target_periods=ALL, threat_path=TM_PATH, attack_seed=1, one_sided=True,
+                     spares_period="test")
 
 
 def cfg(**kw):
@@ -75,7 +76,7 @@ def by_name(checks):
 
 def test_gate_yaml_committed_values():
     c = GateConfig.from_yaml(GATE_PATH)
-    assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.05, attacks=["random", "es"],
+    assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.10, attacks=["random", "es"],
                            attack_seeds=[1, 2, 3], confidence=0.95, one_sided=True, spares_period="fit")
 
 
@@ -226,13 +227,15 @@ def test_write_gate_outputs(base, tmp_path):
 
 def test_attack_seed_changes_attack_only(df, model, tm, model_dir, base):
     r2 = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
-                   target_periods=ALL, threat_path=TM_PATH, attack_seed=2)
+                   target_periods=ALL, threat_path=TM_PATH, attack_seed=2, spares_period="test",
+                   one_sided=True)
     assert [t["card"] for t in r2.per_target] == [t["card"] for t in base.per_target]  # same split
     assert r2.spare_cards == base.spare_cards
     assert [t["ver_clean"] for t in r2.per_target] == [t["ver_clean"] for t in base.per_target]
     assert not np.array_equal(r2.best.to_vector(), base.best.to_vector())  # another attack stream
     assert r2.meta["attack_seed"] == 2 and base.meta["attack_seed"] == 1
-    legacy = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir, target_periods=ALL)
+    legacy = run_audit(df, model, tm, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir, target_periods=ALL,
+                       spares_period="test", one_sided=True)
     assert legacy.meta["attack_seed"] is None
 
 
@@ -437,7 +440,8 @@ def baseline(df, model, tm, model_dir):
     from fraudaudit.threat import SingleTxThreatModel
     tms = SingleTxThreatModel.from_yaml(SINGLE_PATH)
     return {r: run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=1, model_dir=model_dir,
-                                      target_periods=ALL, single_path=SINGLE_PATH, amount_rule=r)
+                                      target_periods=ALL, single_path=SINGLE_PATH, amount_rule=r,
+                                      spares_period="test")
             for r in ("first", "max")}
 
 

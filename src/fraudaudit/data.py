@@ -10,6 +10,11 @@ import pandas as pd
 VAL_START = pd.Timestamp("2020-03-21")
 EPISODE_GAP = pd.Timedelta(days=7)
 SPARES_PERIODS = ("fit", "test")  # where the reconnaissance spares come from (ruling R14), see audit.select_episodes
+# Ruling R20: the fit-period fraud episodes are split by card into H (hardening generation, ``harden``) and S
+# (reconnaissance spares of the gate). The split seed is a constant, NOT the audit ``--seed``: an audit with another
+# seed must never reconnoitre on cards whose adversarial episodes were used to train the hardened model.
+FIT_SPLIT_SEED = 42
+_FIT_SPLIT_STREAM = 20
 
 
 def finalize(train: pd.DataFrame, test: pd.DataFrame) -> pd.DataFrame:
@@ -69,3 +74,22 @@ def split_cards(episodes: list[Episode], seed: int) -> tuple[list[Episode], list
     target = {cards[i] for i in perm[:n_target]}
     return ([e for e in episodes if e.card in target],
             [e for e in episodes if e.card not in target])
+
+
+def fit_split(episodes: list[Episode], seed: int = FIT_SPLIT_SEED) -> tuple[list[Episode], list[Episode]]:
+    """Split the fit-period episodes by card ~50/50 into (H, S) (ruling R20); episodes of one card stay together.
+
+    H (``(n_cards + 1) // 2`` cards) feeds the adversarial generation of ``harden``, S is the gate's pool of
+    reconnaissance spares (``spares_period: fit``). Deterministic: the cards are sorted and permuted with
+    ``default_rng([seed, 20])`` (its own stream, unlike ``split_cards``), so the input order does not matter.
+    Each list keeps the input order."""
+    cards = sorted({e.card for e in episodes})
+    perm = np.random.default_rng([int(seed), _FIT_SPLIT_STREAM]).permutation(len(cards))
+    h = {cards[i] for i in perm[:(len(cards) + 1) // 2]}
+    return [e for e in episodes if e.card in h], [e for e in episodes if e.card not in h]
+
+
+def fit_split_meta(h: list[Episode], s: list[Episode], seed: int = FIT_SPLIT_SEED) -> dict:
+    """Seed and sizes of a ``fit_split`` for reports."""
+    return {"seed": int(seed), "n_h_cards": len({e.card for e in h}), "n_s_cards": len({e.card for e in s}),
+            "n_h_episodes": len(h), "n_s_episodes": len(s)}
