@@ -32,3 +32,7 @@ All versions in `requirements.txt` are exact (`==`) and were resolved as specifi
 ## Data periods and fraud episodes
 
 `fraudaudit.data`: `fit` = train before 2020-03-21, `val` = train from 2020-03-21, `test` = Sparkov test file. Fraud episodes are per-card fraud operations split at a gap > 7 days. Measured on the real data (1 852 394 rows, 9 651 fraud): `fit` 631 episodes, `val` 135, `test` 218 (one episode per card in every period; test median 10 ops, max 19).
+
+## Windowed aggregates
+
+`fraudaudit.features.aggregates.batch_aggregates`: 7 per-card features (`cnt_1d/7d/30d`, `mean_amt_1d/7d/30d`, `secs_since_prev`). Operation j counts for i iff same card, `t_j < t_i` (same-second operations do not see each other) and `t_j >= t_i − w` (an operation exactly w earlier is in the window). Empty window → 0 / 0.0; no earlier operation or a gap strictly greater than 30 days → `secs_since_prev = 2 592 000`. Measured on the real data (1 852 394 rows, 999 cards, Docker `fraudaudit:dev` on an Apple-silicon Mac): `batch_aggregates` 0.5 s (`load_raw` 8.4 s).
