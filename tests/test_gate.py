@@ -242,6 +242,13 @@ def cli_env(df, model_dir, tmp_path, monkeypatch):
         return real(*a, **kw)
 
     monkeypatch.setattr(audit_mod, "run_audit", all_periods)
+    real_baseline = audit_mod.run_single_tx_baseline
+
+    def baseline_all_periods(*a, **kw):
+        kw["target_periods"] = ALL
+        return real_baseline(*a, **kw)
+
+    monkeypatch.setattr(audit_mod, "run_single_tx_baseline", baseline_all_periods)
     threat = tmp_path / "threat.yaml"
     raw = yaml.safe_load(TM_PATH.read_text())
     raw["recon_budget_ops"] = 300
@@ -388,3 +395,90 @@ def test_cli_audit_records_model_target_fpr(cli_env):
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["meta"]["model_target_fpr"] is None  # the tiny test model has no meta.target_fpr
     assert "target_fpr моделі не вказано — звірку пропущено" in (out / "summary.md").read_text(encoding="utf-8")
+
+
+# --- single-transaction baseline in the gate report (informational) ----------------------------------------
+
+SINGLE_PATH = ROOT / "threat-models" / "single-transaction.yaml"
+
+
+@pytest.fixture(scope="module")
+def baseline(df, model, tm, model_dir):
+    from fraudaudit.audit import run_single_tx_baseline
+    from fraudaudit.threat import SingleTxThreatModel
+    return run_single_tx_baseline(df, model, SingleTxThreatModel.from_yaml(SINGLE_PATH), tm, seed=7, n_jobs=1,
+                                  model_dir=model_dir, target_periods=ALL, single_path=SINGLE_PATH)
+
+
+SECTION = "## Звичайний аудит (атака на одну транзакцію) проти епізодного"
+
+
+def test_baseline_section_in_summary(base, baseline):
+    from fraudaudit.audit import _pct
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.02)}
+    checks = decide(c, res, None)
+    md = summary_markdown(checks, res, {}, baseline=baseline)
+    assert SECTION in md
+    sec = md.split(SECTION)[1].split("\n## ")[0]
+    assert _pct(baseline.evaded_tx_share) in sec and _pct(baseline.evaded_amount_share) in sec
+    assert f"{baseline.n_evaded} з {baseline.n_ops}" in sec
+    assert _pct(baseline.replay_ver[0]) in sec and _pct(baseline.replay_uplift[2]) in sec
+    w = res[run_key("random", 1)]
+    assert _pct(w.uplift[0]) in sec and _pct(w.ver_adv[0]) in sec and "`random/1`" in sec
+    assert "не впливає на вердикт" in sec
+    assert any(s in sec for s in ("завищує ризик", "занижує ризик", "близьку оцінку"))
+    # informational only: the verdict and the checks do not change
+    md0 = summary_markdown(checks, res, {})
+    assert SECTION not in md0
+    assert md.split("\n## ")[0] == md0.split("\n## ")[0]
+
+
+def test_baseline_interpretation_direction(base, baseline):
+    from fraudaudit.report import baseline_interpretation
+    w = dataclasses.replace(base, ver_adv=(0.6, 0.5, 0.7), uplift=(0.4, 0.3, 0.5))
+    over = dataclasses.replace(baseline, evaded_amount_share=0.9)
+    under = dataclasses.replace(baseline, evaded_amount_share=0.2)
+    near = dataclasses.replace(baseline, evaded_amount_share=0.6)
+    assert baseline_interpretation(over, w).startswith("Звичайний аудит завищує ризик")
+    assert baseline_interpretation(under, w).startswith("Звичайний аудит занижує ризик")
+    assert "близьку оцінку" in baseline_interpretation(near, w)
+    for s in (over, under, near):
+        text = baseline_interpretation(s, w)
+        assert text.endswith(".") and text.count(". ") == 0  # one sentence
+
+
+def test_write_gate_outputs_with_baseline(base, baseline, tmp_path):
+    c = cfg(attacks=["random"], attack_seeds=[1])
+    res = {run_key("random", 1): fake(base, 0.01)}
+    checks = decide(c, res, None)
+    data = write_gate_outputs(tmp_path, c, checks, res, {"seed": 7}, baseline=baseline)
+    saved = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
+    assert saved["baseline"]["evaded_tx_share"] == pytest.approx(baseline.evaded_tx_share)
+    assert saved["baseline"]["replay_ver"]["mean"] == pytest.approx(baseline.replay_ver[0])
+    assert saved["passed"] is True and data["passed"] is True
+    assert SECTION in (tmp_path / "summary.md").read_text(encoding="utf-8")
+    write_gate_outputs(tmp_path, c, checks, res, {"seed": 7})
+    assert json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))["baseline"] is None
+
+
+def test_cli_audit_runs_baseline_informational(cli_env):
+    code, out, _ = cli_env(GATE_LOOSE)
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["baseline"] is not None and 0 <= data["baseline"]["evaded_tx_share"] <= 1
+    assert SECTION in (out / "summary.md").read_text(encoding="utf-8")
+    code, out, _ = cli_env(dict(GATE_LOOSE, delta=None))  # the baseline never changes the verdict
+    assert code == 1
+    code, out, _ = cli_env(GATE_LOOSE, "--no-baseline")
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["baseline"] is None and SECTION not in (out / "summary.md").read_text(encoding="utf-8")
+
+
+def test_cli_audit_bad_single_threat_exit_2(cli_env, tmp_path):
+    bad = tmp_path / "single.yaml"
+    bad.write_text("knowledge: score\n")
+    code, out, _ = cli_env(GATE_LOOSE, "--single-threat", str(bad))
+    assert code == 2
+    assert "помилка конфігурації/артефактів" in (out / "summary.md").read_text(encoding="utf-8")

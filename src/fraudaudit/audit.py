@@ -14,10 +14,15 @@ Steps of ``run_audit``:
 5. metrics: mean VER with a percentile bootstrap interval over episodes (``ver_ci``), ASR (share of
    successful target episodes) with its Clopper-Pearson upper bound, clean recall/FPR/precision.
 
+``run_single_tx_baseline`` is the «conventional audit» for comparison (informational, not a gate check):
+on the same target episodes every real fraud operation is attacked on its own against the original
+stream state, then the operations it found are replayed as one episode (see its docstring).
+
 Determinism (ruling R7): the random streams are derived from ``seed`` only: card split
 ``split_cards(…, seed)``, oracle ``default_rng([seed, 1])``, attack ``default_rng([seed, 2])``
 (``default_rng([seed, 2, attack_seed])`` with ``attack_seed``: the gate repeats the attack with several
-seeds on the same split), target ``i`` ``default_rng([seed, 3, i])``, bootstrap ``seed``. Target executions run in a spawn
+seeds on the same split), target ``i`` ``default_rng([seed, 3, i])``, single-transaction baseline
+operation ``j`` of target ``i`` ``default_rng([seed, 4, i, j])``, bootstrap ``seed``. Target executions run in a spawn
 process pool (``n_jobs > 1``, each worker loads its own model from ``model_dir``); results are
 identical for any ``n_jobs``. Entry points that use ``n_jobs > 1`` need an
 ``if __name__ == "__main__":`` guard.
@@ -45,11 +50,13 @@ from .metrics import clopper_pearson_upper, uplift_ci, ver_ci
 from .oracle import ReconOracle
 from .serving.core import Serving
 from .serving.state import Tx
-from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel, contexts_for, feasible_ops, realize
+from .threat import (EpisodeContext, MerchantTable, SingleTxThreatModel, Strategy, ThreatModel, _spread,
+                     contexts_for, feasible_ops, realize)
 
 CONFIDENCE = 0.95
 N_BOOT = 2000
-_STREAM_ORACLE, _STREAM_ATTACK, _STREAM_TARGET = 1, 2, 3
+_STREAM_ORACLE, _STREAM_ATTACK, _STREAM_TARGET, _STREAM_SINGLE = 1, 2, 3, 4
+_DAY_S = 86_400
 
 
 @dataclass(frozen=True)
@@ -272,6 +279,197 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
         spare_cards=sorted({c.episode.card for c in spares}))
     meta["wall_seconds"] = round(time.perf_counter() - t0, 1)
     return result
+
+
+# --- «conventional audit»: single-transaction evasion baseline ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class BaselineResult:
+    evaded_tx_share: float                    # evaded real fraud operations / all real fraud operations
+    evaded_amount_share: float                # sum of the chosen evading operations' amounts / sum of A
+    evaded_orig_amount_share: float           # sum of the ORIGINAL amounts of evaded operations / sum of A
+    replay_ver: tuple[float, float, float]    # the chosen operations as one episode: VER (mean, lower, upper)
+    replay_uplift: tuple[float, float, float] # paired bootstrap of ver_replay_i − ver_clean_i
+    ver_clean: tuple[float, float, float]     # the same clean leg as run_audit
+    n_ops: int
+    n_evaded: int
+    n_targets: int
+    per_target: list[dict]
+    meta: dict
+
+
+BASELINE_DEFINITIONS = {
+    "state": "per operation: card history before the episode start (episode rows excluded) plus the real "
+             "preceding fraud operations of the episode with ts < candidate ts; aggregates not recomputed "
+             "with the attacker's earlier modified operations; no bank reaction",
+    "search": "random search, single_tx_budget queries per operation over amount U[amount_min, amount_max] "
+              "(cents), time shift U{0..max_shift_days·86400−1} s from the original ts with whole-day "
+              "wrapping into [start, start + window_days), merchant uniform from MerchantTable, merchant "
+              "coordinates home ± merchant_coord_radius; the first non-declined candidate is chosen",
+    "fallback": "no evading candidate within the budget: the original operation is kept, not evaded",
+    "evaded_amount_share": "sum of the chosen evading operations' amounts / sum of the target episodes' A",
+    "evaded_orig_amount_share": "sum of the original amounts of the evaded operations / sum of A",
+    "replay": "the chosen operations of an episode (evaded or kept) sorted by time, min_gap_secs enforced "
+              "inside the episode window (as in realize), run through run_episode with recomputed aggregates, "
+              "max_declines and rho of the episode threat model; k_max is not applied (the real number of "
+              "operations is kept)",
+}
+
+
+def _wrap_offset(off: int, win: int) -> int:
+    """Whole-day wrapping of a time offset (seconds from the episode start) into ``[0, win)``: an offset at or
+    after the window end moves back by whole days to the window's last day; the time of day is kept."""
+    if off >= win:
+        off -= ((off - win) // _DAY_S + 1) * _DAY_S
+    return off
+
+
+def _offset(ts: pd.Timestamp, start: pd.Timestamp) -> int:
+    return int((pd.Timestamp(ts) - pd.Timestamp(start)) // pd.Timedelta(seconds=1))
+
+
+def single_tx_target(serving, ctx: EpisodeContext, real_txs: list[Tx], tms: SingleTxThreatModel, tm: ThreatModel,
+                     merchants: MerchantTable, seed: int, i: int) -> dict:
+    """The single-transaction attack on every real operation of target ``i`` and the replay of the chosen
+    operations as one episode; plain types only (crosses process boundaries). See ``BASELINE_DEFINITIONS``.
+
+    Operation ``j`` draws its whole candidate block from ``default_rng([seed, 4, i, j])`` up front
+    (amounts, shifts, merchants, coordinates), so the stream does not depend on when the search stops."""
+    start = pd.Timestamp(ctx.episode.start)
+    win = tm.window_days * _DAY_S
+    budget, r = tms.single_tx_budget, tms.merchant_coord_radius
+    chosen: list[dict] = []
+    queries = 0
+    for j, tx in enumerate(real_txs):
+        rng = np.random.default_rng([seed, _STREAM_SINGLE, i, j])
+        amts = np.round(rng.uniform(tms.amount_min, tms.amount_max, budget), 2)
+        shifts = rng.integers(0, tms.max_shift_days * _DAY_S, budget)
+        merch = rng.integers(0, len(merchants), budget)
+        coords = rng.uniform(-r, r, size=(budget, 2))
+        off0 = _offset(tx.ts, start)
+        pick = {"off": off0, "tx": tx, "evaded": False}
+        for q in range(budget):
+            off = _wrap_offset(off0 + int(shifts[q]), win)
+            ts = start + pd.Timedelta(seconds=off)
+            m = int(merch[q])
+            cand = Tx(ts=ts, amt=float(amts[q]), merchant=merchants.names[m], category=merchants.category[m],
+                      merch_lat=ctx.profile.lat + float(coords[q, 0]),
+                      merch_long=ctx.profile.long + float(coords[q, 1]))
+            state = ctx.state.copy()  # the original stream: history + the real preceding operations
+            for p in real_txs[:j]:
+                if p.ts < ts:
+                    state.push(p)
+            queries += 1
+            if not serving.decide(state, cand).declined:
+                pick = {"off": off, "tx": cand, "evaded": True}
+                break
+        chosen.append(pick)
+
+    offs = np.array([c["off"] for c in chosen], dtype=np.int64)
+    order = np.argsort(offs, kind="stable")
+    times = [start + pd.Timedelta(seconds=int(o)) for o in _spread(offs, tm)]
+    replay = [dataclasses.replace(chosen[k]["tx"], ts=t) for t, k in zip(times, order)]
+    rep = run_episode(serving, ctx, replay, tm.max_declines, tm.rho)
+    clean = _clean_outcome(serving, ctx, real_txs, tm.max_declines, tm.rho)
+    evaded = [c for c in chosen if c["evaded"]]
+    return {"card": int(ctx.episode.card), "start": start.isoformat(), "amount": float(ctx.episode.amount),
+            "n_ops": len(real_txs), "n_evaded": len(evaded), "queries": int(queries),
+            "evaded_amount": float(sum(c["tx"].amt for c in evaded)),
+            "evaded_orig_amount": float(sum(real_txs[j].amt for j, c in enumerate(chosen) if c["evaded"])),
+            "n_real_outside_window": int(sum(_offset(t.ts, start) >= win for t in real_txs)),
+            "ver_replay": float(rep.ver), "replay_success": bool(rep.success), "replay_n_ops": int(rep.n_ops),
+            "replay_declines": int(rep.n_declines), "replay_blocked": bool(rep.blocked),
+            "ver_clean": float(clean.ver),
+            "chosen": [{"ts": pd.Timestamp(c["tx"].ts).isoformat(), "amt": float(c["tx"].amt),
+                        "merchant": c["tx"].merchant, "category": c["tx"].category,
+                        "merch_lat": float(c["tx"].merch_lat), "merch_long": float(c["tx"].merch_long),
+                        "evaded": bool(c["evaded"])} for c in chosen]}
+
+
+def _init_baseline_worker(model_dir, targets, clean, tms, tm, merchants, seed) -> None:
+    _WORKER.update(serving=_load_serving(model_dir), targets=targets, clean=clean, tms=tms, tm=tm,
+                   merchants=merchants, seed=seed)
+
+
+def _baseline_job(i: int) -> dict:
+    w = _WORKER
+    return single_tx_target(w["serving"], w["targets"][i], w["clean"][i], w["tms"], w["tm"], w["merchants"],
+                            w["seed"], i)
+
+
+def run_single_tx_baseline(df: pd.DataFrame, model, tm_single: SingleTxThreatModel, tm_episode: ThreatModel,
+                           seed: int, *, n_jobs: int | None = None, model_dir: Path | str | None = None,
+                           target_periods: tuple[str, ...] = ("test",), single_path: Path | str | None = None,
+                           confidence: float = CONFIDENCE) -> BaselineResult:
+    """The «conventional audit» on the target episodes of ``run_audit`` (same ``split_cards(…, seed)``).
+
+    Result 1 – the classic numbers: ``evaded_tx_share`` and ``evaded_amount_share`` over all real fraud
+    operations of the targets (each operation attacked alone against the original stream state, no bank
+    reaction). Result 2 – ``replay_ver``: the chosen operations of each episode run as one episode through
+    ``run_episode`` with recomputed aggregates and the bank's reaction of ``tm_episode``, and its paired
+    uplift over the clean leg (``replay_uplift``), comparable with ``AuditResult.uplift``. Definitions:
+    ``BASELINE_DEFINITIONS``. Parallel per target like ``run_audit``; identical for any ``n_jobs``."""
+    t0 = time.perf_counter()
+    jobs = n_jobs if n_jobs is not None else ((os.cpu_count() or 1) if model_dir is not None else 1)
+    jobs = max(1, int(jobs))
+    if jobs > 1 and model_dir is None:
+        raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+    target_eps, _ = split_cards(fraud_episodes(df, set(target_periods)), seed)
+    if not target_eps:
+        raise ValueError("no target episodes")
+    targets = contexts_for(df, target_eps)
+    merchants = MerchantTable.from_df(df)
+    clean = [episode_txs(df, ctx.episode) for ctx in targets]
+    idx = list(range(len(targets)))
+    if jobs > 1 and len(targets) > 1:
+        with ProcessPoolExecutor(max_workers=min(jobs, len(targets)), mp_context=mp.get_context("spawn"),
+                                 initializer=_init_baseline_worker,
+                                 initargs=(str(model_dir), targets, clean, tm_single, tm_episode, merchants,
+                                           seed)) as ex:
+            per_target = list(ex.map(_baseline_job, idx, chunksize=max(1, len(idx) // (4 * jobs))))
+    else:
+        serving = Serving(model)
+        per_target = [single_tx_target(serving, targets[i], clean[i], tm_single, tm_episode, merchants, seed, i)
+                      for i in idx]
+
+    n_ops = sum(t["n_ops"] for t in per_target)
+    n_ev = sum(t["n_evaded"] for t in per_target)
+    total = sum(t["amount"] for t in per_target)
+    v_rep = np.array([t["ver_replay"] for t in per_target])
+    v_clean = np.array([t["ver_clean"] for t in per_target])
+    from .cli import git_info
+    meta = {"seed": int(seed), **git_info(), "n_jobs": jobs, "confidence": float(confidence), "n_boot": N_BOOT,
+            "target_periods": list(target_periods),
+            "single_threat_model": {"file": None if single_path is None else str(single_path),
+                                    "sha256": None if single_path is None else _sha256(Path(single_path)),
+                                    "params": dataclasses.asdict(tm_single)},
+            "episode_params": {k: getattr(tm_episode, k) for k in
+                               ("window_days", "min_gap_secs", "max_declines", "rho", "k_max")},
+            "queries": int(sum(t["queries"] for t in per_target)),
+            "n_replay_success": int(sum(t["replay_success"] for t in per_target)),
+            "n_replay_blocked": int(sum(t["replay_blocked"] for t in per_target)),
+            "n_real_outside_window": int(sum(t["n_real_outside_window"] for t in per_target)),
+            "n_episodes_over_k_max": int(sum(t["n_ops"] > tm_episode.k_max for t in per_target)),
+            "definitions": dict(BASELINE_DEFINITIONS)}
+    result = BaselineResult(
+        evaded_tx_share=n_ev / n_ops, evaded_amount_share=sum(t["evaded_amount"] for t in per_target) / total,
+        evaded_orig_amount_share=sum(t["evaded_orig_amount"] for t in per_target) / total,
+        replay_ver=ver_ci(v_rep, confidence, N_BOOT, seed), replay_uplift=uplift_ci(v_rep, v_clean, confidence,
+                                                                                     N_BOOT, seed),
+        ver_clean=ver_ci(v_clean, confidence, N_BOOT, seed), n_ops=int(n_ops), n_evaded=int(n_ev),
+        n_targets=len(per_target), per_target=per_target, meta=meta)
+    meta["wall_seconds"] = round(time.perf_counter() - t0, 1)
+    return result
+
+
+def baseline_to_json(b: BaselineResult) -> dict:
+    def ci(t):
+        return {"mean": t[0], "lower": t[1], "upper": t[2]}
+    return {"evaded_tx_share": b.evaded_tx_share, "evaded_amount_share": b.evaded_amount_share,
+            "evaded_orig_amount_share": b.evaded_orig_amount_share, "replay_ver": ci(b.replay_ver),
+            "replay_uplift": ci(b.replay_uplift), "ver_clean": ci(b.ver_clean), "n_ops": b.n_ops,
+            "n_evaded": b.n_evaded, "n_targets": b.n_targets, "meta": b.meta, "per_target": b.per_target}
 
 
 def strategy_dict(s: Strategy, merchants: MerchantTable | None = None) -> dict:

@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="gate rules: thresholds, attacks and attack seeds (the worst run decides)")
     audit.add_argument("--skew-report", type=Path, default=None,
                        help="JSON of `fraudaudit skew --out`; adds the skew check")
+    audit.add_argument("--single-threat", type=Path, default=Path("threat-models/single-transaction.yaml"),
+                       help="threat model of the informational single-transaction baseline (conventional audit)")
+    audit.add_argument("--no-baseline", action="store_true",
+                       help="skip the single-transaction baseline comparison (it never changes the verdict)")
     audit.add_argument("--out", type=Path, default=Path("out"), help="writes audit.json and summary.md")
     audit.add_argument("--seed", type=int, default=42)
     audit.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
@@ -123,12 +127,13 @@ def cmd_audit(args: argparse.Namespace) -> int:
     from fraudaudit.model.pipeline import FraudModel
     from fraudaudit.report import write_error_outputs, write_gate_outputs
     from fraudaudit.skew import skew_from_json
-    from fraudaudit.threat import MerchantTable, ThreatModel
+    from fraudaudit.threat import MerchantTable, SingleTxThreatModel, ThreatModel
 
     t0 = time.perf_counter()
     try:
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
+        tms = None if args.no_baseline else SingleTxThreatModel.from_yaml(args.single_threat)
         skew_json = None if args.skew_report is None else json.loads(args.skew_report.read_text(encoding="utf-8"))
         skew = None if skew_json is None else skew_from_json(skew_json)
         model_meta = json.loads((args.model / "model.json").read_text(encoding="utf-8")).get("meta", {})
@@ -151,17 +156,31 @@ def cmd_audit(args: argparse.Namespace) -> int:
     results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
                            threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
     checks = decide(cfg, results, skew)
+    baseline = None
+    if tms is not None:  # informational: the conventional audit on the same targets, not a gate check
+        from fraudaudit import audit as audit_mod
+        baseline = audit_mod.run_single_tx_baseline(df, model, tms, tm, args.seed, n_jobs=args.n_jobs,
+                                                    model_dir=args.model, single_path=args.single_threat,
+                                                    confidence=cfg.confidence)
+        print(f"baseline: evaded ops {baseline.evaded_tx_share:.4f}, amount {baseline.evaded_amount_share:.4f}, "
+              f"replay VER {baseline.replay_ver[0]:.4f}, {baseline.meta['wall_seconds']} s",
+              file=sys.stderr, flush=True)
     meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
             "model_target_fpr": None if model_fpr is None else float(model_fpr),
             "gate_sha256": hashlib.sha256(args.gate.read_bytes()).hexdigest(),
             "skew_report": None if args.skew_report is None else str(args.skew_report),
             "wall_seconds": round(time.perf_counter() - t1, 1),
             "wall_seconds_with_loading": round(time.perf_counter() - t0, 1)}
-    data = write_gate_outputs(args.out, cfg, checks, results, meta, MerchantTable.from_df(df), skew_json)
+    data = write_gate_outputs(args.out, cfg, checks, results, meta, MerchantTable.from_df(df), skew_json,
+                              baseline)
     print(json.dumps({"verdict": data["verdict"], "worst_run": data["worst_run"],
                       "checks": {c.name: {"value": c.value, "threshold": c.threshold, "passed": c.passed}
                                  for c in checks},
                       "uplift_upper": {k: r.uplift[2] for k, r in results.items()},
+                      "baseline": None if baseline is None else {
+                          "evaded_tx_share": baseline.evaded_tx_share,
+                          "evaded_amount_share": baseline.evaded_amount_share,
+                          "replay_ver": baseline.replay_ver, "replay_uplift": baseline.replay_uplift},
                       "wall_seconds": meta["wall_seconds"], "out": str(args.out)}, indent=2, ensure_ascii=False),
           flush=True)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

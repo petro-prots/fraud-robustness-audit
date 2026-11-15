@@ -201,3 +201,134 @@ def test_audit_meta_has_es_params(result, tm):
     assert params["es"] == {"mu": 5, "lam": 10, "sigma": 0.15, "p_merchant": 0.1, "p_k": 0.2}
     json.dumps(result.meta)  # serialisable
     assert result.meta["recon"]["attack_params"] == {"batch_size": None}  # RandomSearch
+
+
+# --- single-transaction baseline («звичайний аудит») -------------------------------------------------------
+
+import pandas as pd  # noqa: E402
+
+from fraudaudit.audit import BaselineResult, run_single_tx_baseline, single_tx_target  # noqa: E402
+from fraudaudit.data import Episode  # noqa: E402
+from fraudaudit.serving.state import CardState, Tx, profile_of  # noqa: E402
+from fraudaudit.threat import EpisodeContext, MerchantTable, SingleTxThreatModel  # noqa: E402
+
+SINGLE_PATH = Path(__file__).resolve().parents[1] / "threat-models" / "single-transaction.yaml"
+CNT_1D = FEATURE_COLUMNS.index("cnt_1d")
+
+
+class Cnt1dModel:
+    """Duck-typed model: decline iff the card had >= 3 operations in the last day (``cnt_1d >= 3``)."""
+
+    def __init__(self, encoder):
+        self.encoder, self.tau = encoder, 0.5
+
+    def predict_proba(self, F):
+        return (np.asarray(F)[:, CNT_1D] >= 3).astype(np.float64)
+
+
+@pytest.fixture(scope="module")
+def tms():
+    return SingleTxThreatModel.from_yaml(SINGLE_PATH)
+
+
+def test_single_transaction_yaml_values_and_strict(tms, tmp_path):
+    import yaml
+    assert (tms.amount_min, tms.amount_max, tms.max_shift_days, tms.single_tx_budget, tms.knowledge,
+            tms.merchant_coord_radius) == (1.0, 1376.04, 7, 50, "decision", 1.0)
+    raw = yaml.safe_load(SINGLE_PATH.read_text())
+    for change in ({"extra": 1}, {"knowledge": "score"}, {"single_tx_budget": 0}, {"single_tx_budget": 2.5},
+                   {"max_shift_days": 0}, {"amount_min": 0}, {"single_tx_budget": True}):
+        bad = dict(raw, **change)
+        p = tmp_path / "bad.yaml"
+        p.write_text(yaml.safe_dump(bad))
+        with pytest.raises(ValueError):
+            SingleTxThreatModel.from_yaml(p)
+    missing = {k: v for k, v in raw.items() if k != "single_tx_budget"}
+    p = tmp_path / "missing.yaml"
+    p.write_text(yaml.safe_dump(missing))
+    with pytest.raises(ValueError):
+        SingleTxThreatModel.from_yaml(p)
+
+
+def _spread_episode(df, n=13, spacing_h=12.5):
+    """A hand-made episode on a real card after all its history: n operations ``spacing_h`` hours apart,
+    so any 24-hour window holds at most 2 of them (``cnt_1d <= 2`` in the original stream)."""
+    card = int(df["cc_num"].iloc[0])
+    g = df[df["cc_num"] == card]
+    prof = profile_of(g, card)
+    start = pd.Timestamp("2021-06-01 00:00:00")  # > 30 days after the last row: empty history
+    merchants = MerchantTable.from_df(df)
+    real = [Tx(ts=start + pd.Timedelta(hours=spacing_h * j), amt=100.0, merchant=merchants.names[0],
+               category=merchants.category[0], merch_lat=prof.lat, merch_long=prof.long) for j in range(n)]
+    ep = Episode(card=card, start=start, amount=100.0 * n, rows=())
+    ctx = EpisodeContext(episode=ep, profile=prof, state=CardState.from_history(prof, g, at=start))
+    return ctx, real, merchants
+
+
+def test_single_tx_uses_original_state(df, tm, tms):
+    serving = Serving(Cnt1dModel(BaseEncoder().fit(df)))
+    ctx, real, merchants = _spread_episode(df)
+    for seed in range(5):
+        t = single_tx_target(serving, ctx, real, tms, tm, merchants, seed, 0)
+        # every operation alone, against the original stream (history + the real preceding operations),
+        # sees at most 2 operations in the last day: each one evades at its first query
+        assert t["n_ops"] == t["n_evaded"] == len(real)
+        assert t["queries"] == len(real)
+        assert t["ver_clean"] == pytest.approx(1.0)  # the real spread episode passes untouched
+        # the same chosen operations as one episode (aggregates recomputed): they bunch up, the bank declines
+        assert t["replay_declines"] >= 1 and t["replay_blocked"]
+        assert t["ver_replay"] < t["evaded_amount"] / ctx.episode.amount
+
+
+def test_single_tx_candidates_respect_threat_model(df, tm, tms):
+    serving = Serving(LimitModel(BaseEncoder().fit(df), limit=60.0))  # declines amt > 60
+    ctx, real, merchants = _spread_episode(df, n=5)
+    t = single_tx_target(serving, ctx, real, tms, tm, merchants, 3, 1)
+    assert t["n_evaded"] == 5 and t["queries"] >= 5
+    win_end = ctx.episode.start + pd.Timedelta(days=tm.window_days)
+    for op in t["chosen"]:
+        assert op["evaded"] and op["amt"] <= 60.0 and tms.amount_min <= op["amt"]
+        ts = pd.Timestamp(op["ts"])
+        assert ctx.episode.start <= ts < win_end
+        assert abs(op["merch_lat"] - ctx.profile.lat) <= tms.merchant_coord_radius
+        assert merchants.index(op["merchant"]) is not None
+    strict = Serving(LimitModel(BaseEncoder().fit(df), limit=0.5))  # declines everything
+    t0 = single_tx_target(strict, ctx, real, tms, tm, merchants, 3, 1)
+    assert t0["n_evaded"] == 0 and t0["queries"] == 5 * tms.single_tx_budget
+    assert [pd.Timestamp(o["ts"]) for o in t0["chosen"]] == [r.ts for r in real]  # originals kept
+    assert t0["evaded_amount"] == 0.0
+
+
+@pytest.fixture(scope="module")
+def baseline(df, model, tm, tms, model_dir):
+    return run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=1, model_dir=model_dir,
+                                  target_periods=ALL, single_path=SINGLE_PATH)
+
+
+def test_baseline_result(baseline, result):
+    b = baseline
+    assert isinstance(b, BaselineResult)
+    # the same target episodes as the episode audit, with the same clean leg
+    assert [(t["card"], t["start"]) for t in b.per_target] == [(t["card"], t["start"]) for t in result.per_target]
+    assert [t["ver_clean"] for t in b.per_target] == [t["ver_clean"] for t in result.per_target]
+    assert b.ver_clean == result.ver_clean
+    n_ops = sum(t["n_ops"] for t in b.per_target)
+    assert b.n_ops == n_ops and b.n_evaded == sum(t["n_evaded"] for t in b.per_target)
+    assert b.evaded_tx_share == pytest.approx(b.n_evaded / n_ops)
+    total = sum(t["amount"] for t in b.per_target)
+    assert b.evaded_amount_share == pytest.approx(sum(t["evaded_amount"] for t in b.per_target) / total)
+    v = np.array([t["ver_replay"] for t in b.per_target])
+    c = np.array([t["ver_clean"] for t in b.per_target])
+    assert b.replay_ver == ver_ci(v, 0.95, 2000, 7) and b.replay_uplift == uplift_ci(v, c, 0.95, 2000, 7)
+    for key in ("seed", "n_jobs", "single_threat_model", "wall_seconds", "definitions"):
+        assert key in b.meta, key
+    assert len(b.meta["single_threat_model"]["sha256"]) == 64
+    json.dumps(audit_mod.baseline_to_json(b))
+
+
+def test_baseline_identical_for_n_jobs(df, model, tm, tms, model_dir, baseline):
+    b2 = run_single_tx_baseline(df, model, tms, tm, seed=7, n_jobs=2, model_dir=model_dir,
+                                target_periods=ALL, single_path=SINGLE_PATH)
+    assert b2.per_target == baseline.per_target
+    assert (b2.evaded_tx_share, b2.evaded_amount_share, b2.replay_ver, b2.replay_uplift) == \
+           (baseline.evaded_tx_share, baseline.evaded_amount_share, baseline.replay_ver, baseline.replay_uplift)

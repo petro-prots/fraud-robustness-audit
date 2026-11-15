@@ -151,6 +151,65 @@ class ThreatModel:
         return tm
 
 
+_SINGLE_KEYS = ("amount_min", "amount_max", "max_shift_days", "merchant_coord_radius", "knowledge",
+                "single_tx_budget")
+
+
+@dataclass(frozen=True)
+class SingleTxThreatModel:
+    """Threat model of the «conventional audit» baseline (``threat-models/single-transaction.yaml``):
+    every real fraud operation is attacked on its own by a random search of ``single_tx_budget``
+    queries over the amount ``[amount_min, amount_max]``, a time shift ``[0, max_shift_days)`` from the
+    original time and the merchant (coordinates home ± ``merchant_coord_radius``). Knowledge is the
+    decision only. The episode window, ``min_gap_secs``, ``max_declines`` and ``rho`` of the replay come
+    from the episode ``ThreatModel``."""
+    amount_min: float
+    amount_max: float
+    max_shift_days: int
+    merchant_coord_radius: float
+    knowledge: str
+    single_tx_budget: int
+
+    @classmethod
+    def from_yaml(cls, path: Path | str) -> "SingleTxThreatModel":
+        """Strict loader: every key required, unknown keys rejected, integers must be integers."""
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"{path}: expected a mapping")
+        extra = sorted(set(raw) - set(_SINGLE_KEYS))
+        missing = [k for k in _SINGLE_KEYS if k not in raw]
+        if extra:
+            raise ValueError(f"{path}: unknown keys {extra}")
+        if missing:
+            raise ValueError(f"{path}: missing keys {missing}")
+
+        def num(k):
+            v = raw[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v):
+                raise ValueError(f"{path}: {k} must be a finite number, got {v!r}")
+            return float(v)
+
+        def integer(k):
+            v = num(k)
+            if not v.is_integer():
+                raise ValueError(f"{path}: {k} must be an integer, got {raw[k]!r}")
+            return int(v)
+
+        tm = cls(amount_min=num("amount_min"), amount_max=num("amount_max"),
+                 max_shift_days=integer("max_shift_days"), merchant_coord_radius=num("merchant_coord_radius"),
+                 knowledge=str(raw["knowledge"]), single_tx_budget=integer("single_tx_budget"))
+        if not (0 < tm.amount_min <= tm.amount_max and tm.max_shift_days >= 1 and tm.merchant_coord_radius >= 0
+                and tm.single_tx_budget >= 1):
+            raise ValueError(f"{path}: inconsistent single-transaction threat model {tm}")
+        for k in ("amount_min", "amount_max"):  # whole cents, so rounding keeps an amount in bounds
+            if abs(getattr(tm, k) * 100 - round(getattr(tm, k) * 100)) > 1e-6:
+                raise ValueError(f"{path}: {k} must be a whole number of cents")
+        if tm.knowledge != "decision":
+            raise ValueError(f"{path}: knowledge must be 'decision' (the conventional audit sees no p), "
+                             f"got {tm.knowledge!r}")
+        return tm
+
+
 @dataclass(frozen=True, eq=False)
 class MerchantTable:
     """Merchants ordered by (category, raw name) (``fraud_`` prefix kept); a merchant's category is
