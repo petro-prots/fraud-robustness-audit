@@ -140,19 +140,19 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
 
 
 def summary_markdown(rep: SkewReport, atol: float) -> str:
-    """Short Ukrainian Markdown section for ``$GITHUB_STEP_SUMMARY``."""
+    """Short English Markdown section for ``$GITHUB_STEP_SUMMARY``."""
     worst = max(rep.max_abs_diff.items(), key=lambda kv: kv[1])
     lines = [
-        "## Звірка навчального і продуктивного шляхів ознак",
+        "## Training vs serving feature path comparison",
         "",
-        f"- Карток: {rep.n_cards}, операцій: {rep.n_tx}",
-        f"- Найбільша розбіжність серед усіх {len(rep.max_abs_diff)} ознак: `{worst[0]}` = {worst[1]:.3g} "
-        f"(допуск лише для середніх: {atol:g}, решта точно)",
-        f"- Розбіжностей рішень: {rep.decision_mismatches}; найбільша |Δp|: {rep.max_abs_p_diff:.3g}",
+        f"- Cards: {rep.n_cards}, operations: {rep.n_tx}",
+        f"- Largest discrepancy among all {len(rep.max_abs_diff)} features: `{worst[0]}` = {worst[1]:.3g} "
+        f"(tolerance for means only: {atol:g}, the rest exact)",
+        f"- Decision mismatches: {rep.decision_mismatches}; largest |Δp|: {rep.max_abs_p_diff:.3g}",
         f"- Ties ignored (decision flips within float32 noise of tau, |dp| <= {_P_TIE:g}): {rep.n_ties}",
-        f"- Результат: **{'PASS' if rep.passed else 'FAIL'}**",
+        f"- Result: **{'PASS' if rep.passed else 'FAIL'}**",
         "",
-        "| ознака | макс. розбіжність |",
+        "| feature | max discrepancy |",
         "|---|---|",
     ]
     lines += [f"| `{c}` | {v:.3g} |" for c, v in rep.max_abs_diff.items()]

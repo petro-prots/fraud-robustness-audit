@@ -29,19 +29,19 @@ import yaml
 ATTACKS = ("random", "es")
 GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence")
 
-REC_VER_UPLIFT = ("Власник моделі: модель вразлива до епізодної атаки – донавчіть її змагальними прикладами "
-                  "(`fraudaudit harden`) і повторіть аудит; не послаблюйте атаку чи δ.")
-REC_DELTA_NONE = ("Власник шлюзу: δ не задано – автор шлюзу має затвердити `delta` у `gate.yaml` після "
-                  "вимірювання VER_clean; до того шлюз закритий.")
-REC_RECALL = ("Власник моделі: на чистих даних модель пропускає забагато шахрайства – перевірте дані, "
-              "навчання і τ, перенавчіть модель; не знижуйте `recall_clean_min`.")
-REC_FEASIBILITY = ("Розробник інструмента аудиту: помилка інструмента – атака виконала операції поза моделлю "
-                   "загроз, тож результат аудиту недійсний – повідомте про помилку (issue) з `out/audit.json`; "
-                   "модель тут ні до чого.")
-REC_NONFINITE = ("Розробник інструмента аудиту: показник не обчислено (NaN або нескінченність) у прогоні "
-                 "`{run}` – результат аудиту недійсний; повідомте про помилку (issue) з `out/audit.json`.")
-REC_SKEW = ("DevSecOps: продуктивний шлях ознак (serving) розходиться з навчальним – виправте serving path "
-            "до злиття; аудит такої моделі не описує її поведінку в продакшені.")
+REC_VER_UPLIFT = ("Model owner: the model is vulnerable to the episode attack – retrain it with adversarial examples "
+                  "(`fraudaudit harden`) and rerun the audit; do not weaken the attack or δ.")
+REC_DELTA_NONE = ("Gate owner: δ is not set – the gate author must approve `delta` in `gate.yaml` after "
+                  "VER_clean has been measured; until then the gate stays closed.")
+REC_RECALL = ("Model owner: on clean data the model misses too much fraud – check the data, "
+              "the training and τ, and retrain the model; do not lower `recall_clean_min`.")
+REC_FEASIBILITY = ("Audit tool developer: tool error – the attack executed operations outside the threat model, "
+                   "so the audit result is invalid – report the bug (issue) with `out/audit.json`; "
+                   "the model is not at fault.")
+REC_NONFINITE = ("Audit tool developer: a metric was not computed (NaN or infinity) in run "
+                 "`{run}` – the audit result is invalid; report the bug (issue) with `out/audit.json`.")
+REC_SKEW = ("DevSecOps: the serving feature path diverges from the training one – fix the serving path "
+            "before merging; an audit of such a model does not describe its behaviour in production.")
 
 
 @dataclass(frozen=True)

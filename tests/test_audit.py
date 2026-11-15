@@ -180,8 +180,8 @@ def test_write_outputs(result, tm, tmp_path):
     assert data["best"]["k"] == result.best.k and len(data["best"]["shares"]) == tm.k_max
     assert data["n_targets"] == result.n_targets and len(data["per_target"]) == result.n_targets
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
-    for s in ("VER_clean", "VER_adv", "ASR", "95 %", "Найкраща стратегія", result.meta["git_sha"],
-              "Приріст", "легітимн", "до перенесення"):
+    for s in ("VER_clean", "VER_adv", "ASR", "95 %", "Best strategy", result.meta["git_sha"],
+              "uplift", "legitimate", "before wrapping"):
         assert s in md, s
 
 
@@ -203,7 +203,7 @@ def test_audit_meta_has_es_params(result, tm):
     assert result.meta["recon"]["attack_params"] == {"batch_size": None}  # RandomSearch
 
 
-# --- single-transaction baseline («звичайний аудит») -------------------------------------------------------
+# --- single-transaction baseline ("conventional audit") -------------------------------------------------------
 
 import pandas as pd  # noqa: E402
 

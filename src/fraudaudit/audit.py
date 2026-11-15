@@ -535,62 +535,63 @@ def to_json(r: AuditResult, merchants: MerchantTable | None = None) -> dict:
 
 
 def _pct(x: float) -> str:
-    return f"{100 * x:.1f} %".replace(".", ",")
+    return f"{100 * x:.1f} %"
 
 
 def _num(x: float, d: int = 3) -> str:
-    return f"{x:.{d}f}".replace(".", ",")
+    return f"{x:.{d}f}"
 
 
 def summary_markdown(data: dict) -> str:
-    """Ukrainian Markdown summary of ``to_json`` output (no verdict: the gate is a later step)."""
+    """English Markdown summary of ``to_json`` output (no verdict: the gate is a later step)."""
     m, b = data["meta"], data["best"]
     va, vc, up = data["ver_adv"], data["ver_clean"], data["uplift"]
     med = m["median_amount"]
     conf = int(round(100 * m["confidence"]))
     lines = [
-        "# Аудит стійкості до епізодних атак (мінімальний)",
+        "# Episode-attack robustness audit (minimal)",
         "",
-        f"Атака: `{m['recon']['attack']}`, модель загроз: `{m['threat_model']['file']}`. "
-        "Вердикту немає: правила шлюзу ще не застосовуються.",
+        f"Attack: `{m['recon']['attack']}`, threat model: `{m['threat_model']['file']}`. "
+        "No verdict: the gate rules are not applied yet.",
         "",
-        "| показник | значення | 95 % інтервал |",
+        "| metric | value | 95 % interval |",
         "|---|---:|---|",
-        f"| VER_clean – повтор реальних шахрайських операцій без легітимних операцій вікна | {_pct(vc['mean'])} | [{_pct(vc['lower'])}; {_pct(vc['upper'])}] |",
-        f"| VER_adv (найкраща стратегія атаки) | {_pct(va['mean'])} | [{_pct(va['lower'])}; {_pct(va['upper'])}] |",
-        f"| Приріст VER_adv − VER_clean (парний bootstrap) | {_pct(up['mean'])} "
+        f"| VER_clean – replay of the real fraud operations without the legitimate operations of the window | {_pct(vc['mean'])} | [{_pct(vc['lower'])}; {_pct(vc['upper'])}] |",
+        f"| VER_adv (best attack strategy) | {_pct(va['mean'])} | [{_pct(va['lower'])}; {_pct(va['upper'])}] |",
+        f"| VER_adv − VER_clean uplift (paired bootstrap) | {_pct(up['mean'])} "
         f"| [{_pct(up['lower'])}; {_pct(up['upper'])}] |",
-        f"| ASR (частка успішних епізодів, ≥ ρ·A) | {_pct(data['asr'])} ({m['n_success']} з {data['n_targets']}) "
-        f"| верхня межа {conf} %: {_pct(data['asr_upper'])} |",
+        f"| ASR (share of successful episodes, ≥ ρ·A) | {_pct(data['asr'])} ({m['n_success']} of {data['n_targets']}) "
+        f"| upper bound {conf} %: {_pct(data['asr_upper'])} |",
         "",
-        "Обидва прогони (VER_clean і VER_adv) стартують зі стану картки до початку епізоду, а легітимні "
-        "операції картки всередині вікна епізоду не відтворюються, тож VER_clean – це повтор лише "
-        "шахрайських операцій, а не історичний результат банку.",
+        "VER_clean replays the real fraud operations of each target episode without the card's legitimate "
+        "operations inside the episode window (same for the attack): both runs (VER_clean and VER_adv) start "
+        "from the card state before the episode begins, so VER_clean is a replay of the fraud operations "
+        "only, not the bank's historical outcome.",
         "",
-        f"- Приріст у доларах при медіанній сумі епізоду A = {_num(med, 2)} $: "
+        f"- Uplift in dollars (approximately: share × median episode amount A = {_num(med, 2)} $): "
         f"≈ {_num(up['mean'] * med, 0)} $ [{_num(up['lower'] * med, 0)}; {_num(up['upper'] * med, 0)}] "
-        "на епізод (частка × медіана A).",
-        f"- VER > 1 (через нижню межу суми операції): змагальних епізодів {m['n_ver_adv_gt_1']} "
-        f"(макс. VER_adv {_num(m['max_ver_adv'])}), реальних {m['n_ver_clean_gt_1']} "
-        f"(макс. VER_clean {_num(m['max_ver_clean'])}); значення не обрізаються.",
-        f"- Цільових епізодів: {data['n_targets']} (карток: {m['n_target_cards']}); запасних карток для "
-        f"розвідки: {len(data['spare_cards'])}.",
-        f"- Інтервали VER: percentile bootstrap за епізодами, {m['n_boot']} повторів, seed {m['seed']}; "
-        f"межа ASR: Clopper–Pearson, однобічна.",
-        f"- Розвідка: використано {data['recon_ops']} з {m['recon_budget_ops']} операцій, "
-        f"{m['recon']['evals']} оцінок стратегій, найкращий середній VER на запасних картках "
+        "per episode.",
+        f"- VER > 1 (because of the lower bound of the operation amount): adversarial episodes {m['n_ver_adv_gt_1']} "
+        f"(max VER_adv {_num(m['max_ver_adv'])}), real {m['n_ver_clean_gt_1']} "
+        f"(max VER_clean {_num(m['max_ver_clean'])}); values are not clipped.",
+        f"- Target episodes: {data['n_targets']} (cards: {m['n_target_cards']}); spare cards for "
+        f"reconnaissance: {len(data['spare_cards'])}.",
+        f"- VER intervals: percentile bootstrap over episodes, {m['n_boot']} resamples, seed {m['seed']}; "
+        f"ASR bound: Clopper–Pearson, one-sided.",
+        f"- Reconnaissance: used {data['recon_ops']} of {m['recon_budget_ops']} operations, "
+        f"{m['recon']['evals']} strategy evaluations, best mean VER on spare cards "
         f"{_pct(m['recon']['best_fitness'])}.",
-        f"- Частка виконаних змагальних операцій, що відповідають моделі загроз: {_pct(data['feasible_share'])} "
-        f"({m['n_executed_adv_ops']} операцій).",
-        f"- Без атаки поріг ρ·A досягли {m['n_clean_success']} з {data['n_targets']} епізодів.",
+        f"- Share of executed adversarial operations that conform to the threat model: {_pct(data['feasible_share'])} "
+        f"({m['n_executed_adv_ops']} operations).",
+        f"- Without an attack the ρ·A threshold was reached in {m['n_clean_success']} of {data['n_targets']} episodes.",
         "",
-        "## Найкраща стратегія",
+        "## Best strategy",
         "",
-        f"Операцій k = {b['k']}, сумарно ≈ {_pct(b['u'])} від A. Таблиця – план стратегії в порядку "
-        "запланованого часу, до перенесення у вікно і розсування операцій (min_gap_secs), а не порядок "
-        "фактично виконаних операцій:",
+        f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A. The table is the strategy plan in order of "
+        "planned time, before wrapping into the window and spacing the operations (min_gap_secs), not the order "
+        "of the operations actually executed:",
         "",
-        "| № | частка A | день | година | категорія |",
+        "| # | share of A | day | hour | category |",
         "|---:|---:|---:|---:|---|",
     ]
     for i, op in enumerate(b["ops"], 1):
@@ -598,15 +599,15 @@ def summary_markdown(data: dict) -> str:
                      f"| {op.get('category', '–')} |")
     lines += [
         "",
-        "День рахується від опівночі дня початку епізоду (0 – день початку). Операцію, заплановану раніше "
-        f"за початок епізоду, переносять на добу пізніше, а ту, що виходить за "
-        f"{m['threat_model']['params']['window_days']}-денне вікно, – на добу "
-        "раніше; година доби зберігається. Суми обрізаються до меж однієї операції й округлюються до "
-        "центів, тож фактична сума може трохи відрізнятися від частки A.",
+        "The day is counted from midnight of the episode start day (0 – the start day). An operation planned "
+        f"before the episode start is moved one day later, and one that falls beyond the "
+        f"{m['threat_model']['params']['window_days']}-day window is moved one day "
+        "earlier; the time of day is kept. Amounts are clipped to the single-operation limits and rounded to "
+        "cents, so the actual amount may differ slightly from the share of A.",
         "",
-        "## Якість моделі на чистих даних (при τ)",
+        "## Model quality on clean data (at τ)",
         "",
-        "| період | recall | FPR | precision | операцій | шахрайських |",
+        "| period | recall | FPR | precision | operations | fraud |",
         "|---|---:|---:|---:|---:|---:|",
     ]
     for p in ("val", "test"):
@@ -616,16 +617,16 @@ def summary_markdown(data: dict) -> str:
     v = m["versions"]
     lines += [
         "",
-        "## Метадані",
+        "## Metadata",
         "",
-        f"- seed {m['seed']}; git `{m['git_sha']}` (незакомічені зміни: {m['git_dirty']})",
-        f"- платформа: {m['platform']['platform']}; процесів: {m['n_jobs']}; час аудиту {m['wall_seconds']} с"
-        + (f" (з завантаженням даних і моделі {m['wall_seconds_with_loading']} с)"
+        f"- seed {m['seed']}; git `{m['git_sha']}` (uncommitted changes: {m['git_dirty']})",
+        f"- platform: {m['platform']['platform']}; processes: {m['n_jobs']}; audit time {m['wall_seconds']} s"
+        + (f" (including data and model loading {m['wall_seconds_with_loading']} s)"
            if "wall_seconds_with_loading" in m else ""),
-        f"- модель: `{m['model']['dir']}`, τ = {m['model']['tau']}, SHA-256 `model.json`: "
+        f"- model: `{m['model']['dir']}`, τ = {m['model']['tau']}, SHA-256 `model.json`: "
         f"`{m['model']['model_json_sha256']}`",
-        f"- модель загроз: SHA-256 `{m['threat_model']['sha256']}`",
-        "- версії: " + ", ".join(f"{k} {val}" for k, val in v.items()),
+        f"- threat model: SHA-256 `{m['threat_model']['sha256']}`",
+        "- versions: " + ", ".join(f"{k} {val}" for k, val in v.items()),
         "",
     ]
     return "\n".join(lines)

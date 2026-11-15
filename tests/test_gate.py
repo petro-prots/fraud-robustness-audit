@@ -136,7 +136,7 @@ def test_delta_none_fails_closed(base):
     res = {run_key("random", 1): fake(base, -0.5)}  # even a negative uplift does not pass without δ
     c = by_name(decide(cfg(delta=None, attacks=["random"], attack_seeds=[1]), res, None))["ver_uplift"]
     assert not c.passed and c.threshold is None
-    assert "δ не задано" in c.recommendation
+    assert "δ is not set" in c.recommendation
 
 
 def test_feasibility_below_one_fails(base):
@@ -144,7 +144,7 @@ def test_feasibility_below_one_fails(base):
     res = {run_key("random", 1): fake(base, 0.0), run_key("random", 2): fake(base, 0.0, feasible=0.999)}
     c = by_name(decide(one, res, None))["feasibility"]
     assert not c.passed and c.value == pytest.approx(0.999) and c.threshold == 1.0
-    assert "помилк" in c.recommendation.lower()
+    assert "tool error" in c.recommendation.lower()
     res[run_key("random", 2)] = fake(base, 0.0, feasible=float("nan"))  # no executed ops: not proven feasible
     assert not by_name(decide(one, res, None))["feasibility"].passed
     res[run_key("random", 2)] = fake(base, 0.0)
@@ -155,7 +155,7 @@ def test_recall_clean(base):
     one = cfg(attacks=["random"], attack_seeds=[1])
     c = by_name(decide(one, {run_key("random", 1): fake(base, 0.0, recall=0.49)}, None))["recall_clean"]
     assert not c.passed and c.value == pytest.approx(0.49) and c.threshold == 0.5
-    assert "власник моделі" in c.recommendation.lower()
+    assert "model owner" in c.recommendation.lower()
     assert by_name(decide(one, {run_key("random", 1): fake(base, 0.0, recall=0.5)}, None))["recall_clean"].passed
 
 
@@ -184,22 +184,22 @@ def test_summary_has_dollar_interpretation(base):
     checks = decide(c, res, None)
     meta = {"gate": dataclasses.asdict(c), "seed": 7, "wall_seconds": 12.3}
     md = summary_markdown(checks, res, meta)
-    assert md.splitlines()[0].startswith("# ") and "❌ НЕ ПРОЙДЕНО" in md.split("\n## ")[0]
+    assert md.splitlines()[0].startswith("# ") and "❌ FAILED" in md.split("\n## ")[0]
     med = base.meta["median_amount"]
     x = f"{0.30 * med:.0f}"
     y = f"{0.05 * med:.0f}"
-    assert f"до ~{x} $" in md and f"допустимих ~{y} $" in md
-    assert ("скомпрометовану картку" in md) if base.meta["n_target_cards"] == base.n_targets else ("на епізод" in md)
-    assert "| es | 1 |" in md and "| random | 1 |" in md and "найгірш" in md
-    assert "Рекомендації" in md and "fraudaudit harden" in md and "не послаблюйте атаку чи δ" in md
-    assert "легітимні операції" in md  # replay assumption
+    assert f"up to ~{x} $" in md and f"an allowed ~{y} $" in md
+    assert ("per compromised card" in md) if base.meta["n_target_cards"] == base.n_targets else ("per episode" in md)
+    assert "| es | 1 |" in md and "| random | 1 |" in md and "worst" in md
+    assert "Recommendations" in md and "fraudaudit harden" in md and "do not weaken the attack or δ" in md
+    assert "without the card's legitimate operations inside the episode window (same for the attack)" in md  # replay assumption
     assert "recall" in md and "VER_clean" in md and base.meta["git_sha"] in md
     for name in ("ver_uplift", "recall_clean", "feasibility"):
         assert name in md
     ok = {run_key("random", 1): fake(base, 0.01), run_key("es", 1): fake(base, 0.02)}
     md_ok = summary_markdown(decide(c, ok, None), ok, meta)
-    assert "✅ ПРОЙДЕНО" in md_ok.split("\n## ")[0] and "НЕ ПРОЙДЕНО" not in md_ok
-    assert "Рекомендації" not in md_ok
+    assert "✅ PASSED" in md_ok.split("\n## ")[0] and "FAILED" not in md_ok
+    assert "Recommendations" not in md_ok
 
 
 def test_write_gate_outputs(base, tmp_path):
@@ -209,7 +209,7 @@ def test_write_gate_outputs(base, tmp_path):
     data = write_gate_outputs(tmp_path, c, checks, res, {"seed": 7})
     saved = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
     assert saved == json.loads(json.dumps(data))
-    assert saved["passed"] is True and saved["verdict"] == "ПРОЙДЕНО" and saved["worst_run"] == "random/1"
+    assert saved["passed"] is True and saved["verdict"] == "PASSED" and saved["worst_run"] == "random/1"
     assert [ch["name"] for ch in saved["checks"]] == ["ver_uplift", "recall_clean", "feasibility"]
     assert saved["runs"]["random/1"]["uplift"]["upper"] == pytest.approx(0.01)
     assert saved["gate"]["delta"] == 0.05
@@ -276,15 +276,15 @@ def test_cli_audit_exit_0_when_all_checks_pass(cli_env):
     assert code == 0
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["passed"] is True and list(data["runs"]) == ["random/1"]
-    assert "✅ ПРОЙДЕНО" in summary.read_text(encoding="utf-8")
+    assert "✅ PASSED" in summary.read_text(encoding="utf-8")
 
 
 def test_cli_audit_exit_1_when_a_check_fails(cli_env):
     code, out, summary = cli_env(dict(GATE_LOOSE, delta=None))
     assert code == 1
     assert json.loads((out / "audit.json").read_text(encoding="utf-8"))["passed"] is False
-    assert "❌ НЕ ПРОЙДЕНО" in (out / "summary.md").read_text(encoding="utf-8")
-    assert "❌ НЕ ПРОЙДЕНО" in summary.read_text(encoding="utf-8")
+    assert "❌ FAILED" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "❌ FAILED" in summary.read_text(encoding="utf-8")
 
 
 def test_cli_audit_skew_report_fails_gate(cli_env, tmp_path, model_dir):
@@ -330,7 +330,7 @@ def test_nonfinite_uplift_in_a_later_run_fails(base):
     res[run_key("random", 2)] = dataclasses.replace(fake(base, 0.01), uplift=(0.0, 0.0, float("inf")))
     assert not by_name(decide(c3, res, None))["ver_uplift"].passed
     md = summary_markdown(decide(c3, res, None), res, {})
-    assert "❌ НЕ ПРОЙДЕНО" in md.split("\n## ")[0]
+    assert "❌ FAILED" in md.split("\n## ")[0]
 
 
 def test_nonfinite_recall_in_a_later_run_fails(base):
@@ -344,13 +344,13 @@ def test_summary_dollar_wording_per_card_or_episode(base):
     c = cfg(attacks=["random"], attack_seeds=[1])
     res = {run_key("random", 1): fake(base, 0.2)}
     md = summary_markdown(decide(c, res, None), res, {})
-    assert "орієнтовно: частка × медіанна сума епізоду" in md
+    assert "approximately: share × median episode amount" in md
     one_per_card = base.meta["n_target_cards"] == base.n_targets
-    assert ("на одну скомпрометовану картку (один цільовий епізод на картку)" in md) == one_per_card
+    assert ("per compromised card (one target episode per card)" in md) == one_per_card
     many = dataclasses.replace(res[run_key("random", 1)],
                                meta=dict(res[run_key("random", 1)].meta, n_target_cards=base.n_targets - 1))
     md2 = summary_markdown(decide(c, {run_key("random", 1): many}, None), {run_key("random", 1): many}, {})
-    assert "на епізод" in md2 and "на одну скомпрометовану картку" not in md2
+    assert "per episode" in md2 and "per compromised card" not in md2
 
 
 def test_summary_feasibility_failure_not_rounded_to_100(base):
@@ -358,14 +358,14 @@ def test_summary_feasibility_failure_not_rounded_to_100(base):
     res = {run_key("random", 1): fake(base, 0.01, feasible=0.9999)}
     md = summary_markdown(decide(c, res, None), res, {})
     row = next(line for line in md.splitlines() if line.startswith("| `feasibility`"))
-    assert "99,99 %" in row and "| 100,0 % | = 100,0 %" not in row
+    assert "99.99 %" in row and "| 100.0 % | = 100.0 %" not in row
 
 
 def test_summary_model_target_fpr_missing_noted(base):
     c = cfg(attacks=["random"], attack_seeds=[1])
     res = {run_key("random", 1): fake(base, 0.01)}
     md = summary_markdown(decide(c, res, None), res, {"model_target_fpr": None})
-    assert "target_fpr моделі не вказано — звірку пропущено" in md
+    assert "the model's target_fpr is not given – the check was skipped" in md
 
 
 def test_cli_audit_tampered_model_exit_2_with_summary(cli_env, model_dir, tmp_path):
@@ -377,8 +377,8 @@ def test_cli_audit_tampered_model_exit_2_with_summary(cli_env, model_dir, tmp_pa
     code, out, summary = cli_env(GATE_LOOSE, model=bad)
     assert code == 2
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert md.startswith("# ❌ НЕ ПРОЙДЕНО — помилка конфігурації/артефактів") and "SHA" in md.upper()
-    assert "❌ НЕ ПРОЙДЕНО — помилка конфігурації/артефактів" in summary.read_text(encoding="utf-8")
+    assert md.startswith("# ❌ FAILED – configuration/artifact error") and "SHA" in md.upper()
+    assert "❌ FAILED – configuration/artifact error" in summary.read_text(encoding="utf-8")
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["passed"] is False and data["error"]
 
@@ -392,15 +392,15 @@ def test_cli_audit_skew_report_of_another_model_exit_2(cli_env, tmp_path, extra)
     code, out, summary = cli_env(GATE_LOOSE, "--skew-report", str(p))
     assert code == 2
     md = (out / "summary.md").read_text(encoding="utf-8")
-    assert "another model" in md and "помилка конфігурації/артефактів" in md
+    assert "another model" in md and "configuration/artifact error" in md
     assert "another model" in summary.read_text(encoding="utf-8")
 
 
 def test_cli_audit_bad_yaml_exit_2_with_summary(cli_env):
     code, out, summary = cli_env("target_fpr: [0.01\n")
     assert code == 2
-    assert "помилка конфігурації/артефактів" in (out / "summary.md").read_text(encoding="utf-8")
-    assert "помилка конфігурації/артефактів" in summary.read_text(encoding="utf-8")
+    assert "configuration/artifact error" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "configuration/artifact error" in summary.read_text(encoding="utf-8")
 
 
 def test_cli_audit_records_model_target_fpr(cli_env):
@@ -408,7 +408,7 @@ def test_cli_audit_records_model_target_fpr(cli_env):
     assert code == 0
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["meta"]["model_target_fpr"] is None  # the tiny test model has no meta.target_fpr
-    assert "target_fpr моделі не вказано — звірку пропущено" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "the model's target_fpr is not given – the check was skipped" in (out / "summary.md").read_text(encoding="utf-8")
 
 
 # --- single-transaction baseline in the gate report (informational) ----------------------------------------
@@ -427,7 +427,7 @@ def baseline(df, model, tm, model_dir):
             for r in ("first", "max")}
 
 
-SECTION = "## Звичайний аудит (атака на одну транзакцію) проти епізодного"
+SECTION = "## Conventional audit (single-transaction attack) vs episode audit"
 
 
 def test_baseline_section_in_summary(base, baseline):
@@ -442,17 +442,17 @@ def test_baseline_section_in_summary(base, baseline):
     for rule, b in baseline.items():
         row = next(line for line in sec.splitlines() if line.startswith(f"| `{rule}`"))
         assert _pct(b.evaded_tx_share) in row and _pct(b.evaded_amount_share) in row
-        assert f"{b.n_evaded} з {b.n_ops}" in row and _pct(b.replay_ver[0]) in row
+        assert f"{b.n_evaded} of {b.n_ops}" in row and _pct(b.replay_ver[0]) in row
         assert _pct(b.replay_uplift[2]) in row and str(b.meta["queries"]) in row
-    assert "(основне)" in next(line for line in sec.splitlines() if line.startswith("| `first`"))
+    assert "(primary)" in next(line for line in sec.splitlines() if line.startswith("| `first`"))
     w = res[run_key("random", 2)]
     assert _pct(w.uplift[0]) in sec and _pct(w.ver_adv[0]) in sec and "`random/2`" in sec
     cmp = baseline_comparison(baseline["first"], res, "random/2")
     assert cmp["n_runs"] == 2 and _pct(cmp["uplift_mean_runs"]) in sec
     assert _pct(cmp["uplift_min_runs"]) in sec and _pct(cmp["uplift_max_runs"]) in sec
     assert _pct(cmp["adv_minus_replay"][0]) in sec
-    assert "не впливає на вердикт" in sec and "стані самої цільової картки" in sec
-    assert "раніше за оригінальну операцію" in sec
+    assert "does not affect the gate verdict" in sec and "state of the target card itself" in sec
+    assert "earlier than the original operation" in sec
     # informational only: the verdict and the checks do not change
     md0 = summary_markdown(checks, res, {})
     assert SECTION not in md0
@@ -483,11 +483,11 @@ def test_baseline_interpretation_direction(baseline):
     stronger = dict(cmp, adv_minus_replay=(-0.4, -0.5, -0.3))
     same = dict(cmp, adv_minus_replay=(0.01, -0.05, 0.07))
     t = baseline_interpretation(high, weaker)
-    assert t.startswith("Показник ухилення окремих операцій не є оцінкою втрат") and "лише 30,0 %" in t
-    assert "знайдена ним атака слабша за епізодну: приріст 28,0 % проти 60,0 %" in t
-    assert "узгоджується" in baseline_interpretation(inside, weaker)
-    assert "сильніша за епізодну" in baseline_interpretation(high, stronger)
-    assert "статистично не відрізняється" in baseline_interpretation(high, same)
+    assert t.startswith("The per-operation evasion rate is not a loss estimate") and "yield only 30.0 %" in t
+    assert "the attack it finds is weaker than the episode attack: uplift 28.0 % vs 60.0 %" in t
+    assert "is consistent with" in baseline_interpretation(inside, weaker)
+    assert "stronger than the episode attack" in baseline_interpretation(high, stronger)
+    assert "statistically indistinguishable" in baseline_interpretation(high, same)
     for x in (high, inside):
         for c in (weaker, stronger, same):
             text = baseline_interpretation(x, c)
@@ -513,7 +513,7 @@ def test_write_gate_outputs_with_baseline(base, baseline, tmp_path):
     assert json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))["baseline"] == {
         "error": "RuntimeError: boom"}
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
-    assert SECTION in md and "RuntimeError: boom" in md and "✅ ПРОЙДЕНО" in md.split("\n## ")[0]
+    assert SECTION in md and "RuntimeError: boom" in md and "✅ PASSED" in md.split("\n## ")[0]
 
 
 def test_baseline_comparison_failure_is_a_note_not_a_verdict(base, baseline, tmp_path, monkeypatch):
@@ -531,7 +531,7 @@ def test_baseline_comparison_failure_is_a_note_not_a_verdict(base, baseline, tmp
     assert saved["baseline"] == {"error": "RuntimeError: comparison boom"}
     assert saved["passed"] is True and data["passed"] is True
     md = (tmp_path / "summary.md").read_text(encoding="utf-8")
-    assert "comparison boom" in md and "✅ ПРОЙДЕНО" in md.split("\n## ")[0]
+    assert "comparison boom" in md and "✅ PASSED" in md.split("\n## ")[0]
 
 
 def test_cli_audit_runs_baseline_informational(cli_env):
@@ -565,4 +565,4 @@ def test_cli_audit_bad_single_threat_exit_2(cli_env, tmp_path):
     bad.write_text("knowledge: score\n")
     code, out, _ = cli_env(GATE_LOOSE, "--single-threat", str(bad))
     assert code == 2
-    assert "помилка конфігурації/артефактів" in (out / "summary.md").read_text(encoding="utf-8")
+    assert "configuration/artifact error" in (out / "summary.md").read_text(encoding="utf-8")

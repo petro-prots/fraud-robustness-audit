@@ -1,4 +1,4 @@
-"""Gate report: ``out/audit.json`` (every run, every check, the verdict) and the Ukrainian Markdown summary
+"""Gate report: ``out/audit.json`` (every run, every check, the verdict) and the English Markdown summary
 for ``$GITHUB_STEP_SUMMARY`` / ``out/summary.md``."""
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ from .audit import BaselineResult, _num, _pct, baseline_to_json, strategy_dict, 
 from .metrics import uplift_ci
 from .gate import Check, GateConfig, parse_run_key, passed
 
-VERDICT_OK, VERDICT_FAIL = "ПРОЙДЕНО", "НЕ ПРОЙДЕНО"
+VERDICT_OK, VERDICT_FAIL = "PASSED", "FAILED"
 
 _TITLE = {
-    "ver_uplift": "приріст VER під атакою – верхня межа {conf} % інтервалу VER_adv − VER_clean, "
-                  "найгірша атака × seed",
-    "recall_clean": "recall на чистих операціях test при τ",
-    "feasibility": "частка виконаних змагальних операцій у межах моделі загроз (мінімум за прогонами)",
-    "skew": "розбіжності рішень навчального і продуктивного шляхів ознак",
+    "ver_uplift": "VER uplift under attack – upper {conf} % bound of the VER_adv − VER_clean interval, "
+                  "worst attack × seed",
+    "recall_clean": "recall on clean test operations at τ",
+    "feasibility": "share of executed adversarial operations within the threat model (minimum over runs)",
+    "skew": "decision mismatches between the training and serving feature paths",
 }
 
 
@@ -44,14 +44,14 @@ def _pct_exact(x: float) -> str:
         s = f"{100 * x:.{d}f}"
         if float(s) != 100.0:
             break
-    return f"{s} %".replace(".", ",")
+    return f"{s} %"
 
 
 def _threshold(c: Check) -> str:
     if c.threshold is None:
-        return "не задано (δ = null)"
+        return "not set (δ = null)"
     return {"ver_uplift": f"≤ {_pct(c.threshold)}", "recall_clean": f"≥ {_num(c.threshold, 2)}",
-            "feasibility": "= 100,0 %", "skew": "= 0 (і всі ознаки в допуску)"}[c.name]
+            "feasibility": "= 100.0 %", "skew": "= 0 (and all features within tolerance)"}[c.name]
 
 
 def _ci(t) -> str:
@@ -76,7 +76,7 @@ def baseline_comparison(b: BaselineResult, results: dict, worst_key: str) -> dic
 
 
 def baseline_interpretation(b: BaselineResult, cmp: dict) -> str:
-    """One plain Ukrainian sentence in two parts, both decided by intervals.
+    """One plain English sentence in two parts, both decided by intervals.
 
     (a) The per-operation evaded amount share vs the replay VER interval: above its upper bound, the
     conventional figure is not a loss estimate. (b) The paired ``ver_adv_i − ver_replay_i`` interval: lower
@@ -85,45 +85,45 @@ def baseline_interpretation(b: BaselineResult, cmp: dict) -> str:
     claim, rep = b.evaded_amount_share, b.replay_ver
     d = cmp["adv_minus_replay"]
     if claim > rep[2]:
-        a = (f"Показник ухилення окремих операцій не є оцінкою втрат: за звичайним аудитом ухиляються операції "
-             f"на {_pct(claim)} суми шахрайства, але ці самі операції, виконані як епізод, виводять лише "
-             f"{_pct(rep[0])}")
+        a = (f"The per-operation evasion rate is not a loss estimate: under the conventional audit, operations "
+             f"worth {_pct(claim)} of the fraud amount evade, but the same operations executed as an episode "
+             f"yield only {_pct(rep[0])}")
     elif claim < rep[1]:
-        a = (f"Показник ухилення окремих операцій ({_pct(claim)} суми шахрайства) нижчий за те, що ці самі "
-             f"операції виводять як епізод ({_pct(rep[0])})")
+        a = (f"The per-operation evasion rate ({_pct(claim)} of the fraud amount) is lower than what the same "
+             f"operations yield as an episode ({_pct(rep[0])})")
     else:
-        a = (f"Показник ухилення окремих операцій ({_pct(claim)} суми шахрайства) узгоджується з тим, що ці самі "
-             f"операції виводять як епізод ({_pct(rep[0])})")
+        a = (f"The per-operation evasion rate ({_pct(claim)} of the fraud amount) is consistent with what the same "
+             f"operations yield as an episode ({_pct(rep[0])})")
     ru, wu = _pct(b.replay_uplift[0]), _pct(cmp["worst_uplift"][0])
-    gap = f"різниця VER {_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}]"
+    gap = f"VER difference {_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}]"
     if d[1] > 0:
-        part = f"знайдена ним атака слабша за епізодну: приріст {ru} проти {wu} ({gap})"
+        part = f"the attack it finds is weaker than the episode attack: uplift {ru} vs {wu} ({gap})"
     elif d[2] < 0:
-        part = f"знайдена ним атака сильніша за епізодну: приріст {ru} проти {wu} ({gap})"
+        part = f"the attack it finds is stronger than the episode attack: uplift {ru} vs {wu} ({gap})"
     else:
-        part = f"знайдена ним атака статистично не відрізняється від епізодної: приріст {ru} проти {wu} ({gap})"
+        part = f"the attack it finds is statistically indistinguishable from the episode attack: uplift {ru} vs {wu} ({gap})"
     return f"{a}; {part}."
 
 
-_RULE_NAME = {"first": "перший невідхилений кандидат", "max": "найбільша сума серед невідхилених"}
+_RULE_NAME = {"first": "first non-declined candidate", "max": "largest amount among non-declined candidates"}
 
 
 def _baseline_section(baselines: dict, results: dict, worst_key: str, conf: int,
                       error: str | None = None) -> list[str]:
-    lines = ["", "## Звичайний аудит (атака на одну транзакцію) проти епізодного", "",
-             "Інформаційне порівняння: не впливає на вердикт шлюзу."]
+    lines = ["", "## Conventional audit (single-transaction attack) vs episode audit", "",
+             "Informational comparison: does not affect the gate verdict."]
     if error is not None:
-        return lines + ["", f"Базову лінію не обчислено через помилку (вердикт і код виходу не змінено): `{error}`"]
+        return lines + ["", f"The baseline could not be computed because of an error (verdict and exit code unchanged): `{error}`"]
     b = next(iter(baselines.values()))  # primary: the rule of single-transaction.yaml
     cmp = baseline_comparison(b, results, worst_key)
     tms = b.meta["single_threat_model"]["params"]
     ep = b.meta["episode_params"]
-    lines += ["", f"| правило вибору суми | ухилених операцій | частка ухиленої суми (оригінальні суми) "
-              f"| сума знайдених операцій / сума A | VER повтору як епізоду [{conf} %] | приріст повтору до "
-              f"VER_clean [{conf} %] | запитів |", "|---|---:|---:|---:|---|---|---:|"]
+    lines += ["", f"| amount rule | evaded operations | evaded amount share (original amounts) "
+              f"| amount of found operations / amount A | VER of replay as episode [{conf} %] | uplift of replay over "
+              f"VER_clean [{conf} %] | queries |", "|---|---:|---:|---:|---|---|---:|"]
     for rule, x in baselines.items():
-        mark = " (основне)" if x is b else ""
-        lines.append(f"| `{rule}` – {_RULE_NAME[rule]}{mark} | {_pct(x.evaded_tx_share)} ({x.n_evaded} з {x.n_ops}) "
+        mark = " (primary)" if x is b else ""
+        lines.append(f"| `{rule}` – {_RULE_NAME[rule]}{mark} | {_pct(x.evaded_tx_share)} ({x.n_evaded} of {x.n_ops}) "
                      f"| {_pct(x.evaded_amount_share)} | {_num(x.chosen_amount_ratio, 3)} "
                      f"| {_pct(x.replay_ver[0])} [{_pct(x.replay_ver[1])}; {_pct(x.replay_ver[2])}] "
                      f"| {_pct(x.replay_uplift[0])} [{_pct(x.replay_uplift[1])}; {_pct(x.replay_uplift[2])}] "
@@ -131,38 +131,38 @@ def _baseline_section(baselines: dict, results: dict, worst_key: str, conf: int,
     va, wu, d = cmp["worst_ver_adv"], cmp["worst_uplift"], cmp["adv_minus_replay"]
     lines += [
         "",
-        f"Епізодний аудит: найгірший прогін `{worst_key}` – VER_adv {_pct(va[0])} [{_pct(va[1])}; {_pct(va[2])}], "
-        f"приріст {_pct(wu[0])} [{_pct(wu[1])}; {_pct(wu[2])}]; середній приріст за {cmp['n_runs']} прогонами "
-        f"атака × seed {_pct(cmp['uplift_mean_runs'])} (від {_pct(cmp['uplift_min_runs'])} до "
-        f"{_pct(cmp['uplift_max_runs'])}). Парна різниця VER_adv (`{worst_key}`) − VER повтору (`{b.amount_rule}`): "
+        f"Episode audit: worst run `{worst_key}` – VER_adv {_pct(va[0])} [{_pct(va[1])}; {_pct(va[2])}], "
+        f"uplift {_pct(wu[0])} [{_pct(wu[1])}; {_pct(wu[2])}]; mean uplift over {cmp['n_runs']} "
+        f"attack × seed runs {_pct(cmp['uplift_mean_runs'])} (from {_pct(cmp['uplift_min_runs'])} to "
+        f"{_pct(cmp['uplift_max_runs'])}). Paired difference VER_adv (`{worst_key}`) − VER of replay (`{b.amount_rule}`): "
         f"{_pct(d[0])} [{_pct(d[1])}; {_pct(d[2])}].",
         "",
         baseline_interpretation(b, cmp),
         "",
-        f"- Звичайний аудит: кожна реальна шахрайська операція цільових епізодів атакується окремо випадковим "
-        f"пошуком (до {tms['single_tx_budget']} запитів на операцію, лише рішення моделі): сума "
-        f"{_num(tms['amount_min'], 2)}–{_num(tms['amount_max'], 2)} $, зсув часу до {tms['max_shift_days']} днів "
-        f"(з перенесенням у {ep['window_days']}-денне вікно епізоду цілими добами, тож кандидат може опинитися "
-        f"раніше за оригінальну операцію: {b.meta['n_wrapped_earlier_than_original']} з {b.meta['queries']} "
-        "запитів), мерчант. Стан картки – записаний потік: історія до епізоду і всі інші реальні операції "
-        "епізоду до часу кандидата; агрегати не перераховуються, реакції банку немає. Якщо невідхиленого "
-        "кандидата немає – лишається оригінальна операція (не ухилена).",
-        "- Перевага звичайного аудиту: він запитує модель на стані самої цільової картки, тоді як епізодний "
-        "нападник розвідує лише на запасних картках.",
-        f"- Повтор: знайдені операції кожного епізоду впорядковуються за часом (не ближче ніж "
-        f"{ep['min_gap_secs']} с одна до одної) і виконуються як епізод з перерахунком агрегатів, "
-        f"`max_declines` = {ep['max_declines']} і ρ = {_num(ep['rho'], 2)}; для правила `{b.amount_rule}` поріг "
-        f"ρ·A досягли {b.meta['n_replay_success']} з {b.n_targets} епізодів, заблоковано карток: "
+        f"- Conventional audit: each real fraud operation of the target episodes is attacked separately by random "
+        f"search (up to {tms['single_tx_budget']} queries per operation, model decisions only): amount "
+        f"{_num(tms['amount_min'], 2)}–{_num(tms['amount_max'], 2)} $, time shift up to {tms['max_shift_days']} days "
+        f"(wrapped into the {ep['window_days']}-day episode window in whole days, so a candidate can land "
+        f"earlier than the original operation: {b.meta['n_wrapped_earlier_than_original']} of {b.meta['queries']} "
+        "queries), merchant. The card state is the recorded stream: the history before the episode and all other "
+        "real operations of the episode up to the candidate's time; aggregates are not recomputed and there is no "
+        "bank reaction. If there is no non-declined candidate, the original operation is kept (not evaded).",
+        "- Advantage of the conventional audit: it queries the model on the state of the target card itself, "
+        "whereas the episode attacker reconnoitres on spare cards only.",
+        f"- Replay: the found operations of each episode are ordered by time (at least "
+        f"{ep['min_gap_secs']} s apart) and executed as an episode with aggregates recomputed, "
+        f"`max_declines` = {ep['max_declines']} and ρ = {_num(ep['rho'], 2)}; for rule `{b.amount_rule}` the "
+        f"ρ·A threshold was reached in {b.meta['n_replay_success']} of {b.n_targets} episodes, cards blocked: "
         f"{b.meta['n_replay_blocked']}.",
-        f"- Ті самі {b.n_targets} цільових епізодів, що й в епізодному аудиті (seed розподілу {b.meta['seed']}); "
-        "час: " + ", ".join(f"`{r}` {x.meta['wall_seconds']} с" for r, x in baselines.items()) + ".",
+        f"- The same {b.n_targets} target episodes as in the episode audit (split seed {b.meta['seed']}); "
+        "time: " + ", ".join(f"`{r}` {x.meta['wall_seconds']} s" for r, x in baselines.items()) + ".",
     ]
     return lines
 
 
 def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=None,
                      baseline: dict | None = None, baseline_error: str | None = None) -> str:
-    """Ukrainian Markdown: verdict, checks, recommendations, attacks × seeds, baseline, the conventional
+    """English Markdown: verdict, checks, recommendations, attacks × seeds, baseline, the conventional
     (single-transaction) audit comparison when ``baseline`` (``{amount_rule: BaselineResult}``, the first
     entry is the primary rule) or ``baseline_error`` is given (informational), clean quality,
     the worst run's strategy, metadata. ``results`` is ``{run_key: AuditResult}``; ``meta`` holds the
@@ -179,123 +179,124 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     delta = up.threshold
     failed = [c for c in checks if not c.passed]
 
-    lines = [f"# {'✅ ' + VERDICT_OK if ok else '❌ ' + VERDICT_FAIL} – шлюз стійкості до епізодних атак", ""]
+    lines = [f"# {'✅ ' + VERDICT_OK if ok else '❌ ' + VERDICT_FAIL} – episode-attack robustness gate", ""]
     if ok:
-        lines.append("Усі перевірки шлюзу пройдено.")
+        lines.append("All gate checks passed.")
     else:
-        lines.append("Не пройдено: " + ", ".join(f"`{c.name}`" for c in failed) + ". Що робити – у розділі "
-                     "«Рекомендації».")
+        lines.append("Failed: " + ", ".join(f"`{c.name}`" for c in failed) + ". What to do – see the "
+                     "\"Recommendations\" section.")
     lines += ["",
-              f"Найгірший випадок: атака `{w_attack}`, seed атаки {w_seed}; верхня межа {conf} % інтервалу "
-              f"приросту VER_adv − VER_clean {_pct(up.value)} при "
-              + (f"δ = {_pct(delta)}." if delta is not None else "незаданому δ."),
+              f"Worst case: attack `{w_attack}`, attack seed {w_seed}; upper {conf} % bound of the "
+              f"VER_adv − VER_clean uplift interval {_pct(up.value)} against "
+              + (f"δ = {_pct(delta)}." if delta is not None else "an unset δ."),
               ""]
     per_card = int(wm["n_target_cards"]) == int(w.n_targets)
-    unit = ("на одну скомпрометовану картку (один цільовий епізод на картку)" if per_card else "на епізод")
-    head = f"У доларах (орієнтовно: частка × медіанна сума епізоду A = {_num(med, 2)} $): "
+    unit = ("per compromised card (one target episode per card)" if per_card else "per episode")
+    head = f"In dollars (approximately: share × median episode amount A = {_num(med, 2)} $): "
     if up.value is None or not math.isfinite(up.value):
-        lines.append(head + "не обчислено – приріст VER у найгіршому прогоні не скінченний.")
+        lines.append(head + "not computed – the VER uplift of the worst run is not finite.")
     elif delta is not None:
-        lines.append(head + f"атака додає шахраю до ~{_num(up.value * med, 0)} $ {unit} при допустимих "
+        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * med, 0)} $ {unit} against an allowed "
                      f"~{_num(delta * med, 0)} $.")
     else:
-        lines.append(head + f"атака додає шахраю до ~{_num(up.value * med, 0)} $ {unit}; допустиму величину "
-                     "не задано.")
-    lines += ["", "## Перевірки", "", "| перевірка | значення | поріг | результат |", "|---|---:|---|---|"]
+        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * med, 0)} $ {unit}; the allowed "
+                     "amount is not set.")
+    lines += ["", "## Checks", "", "| check | value | threshold | result |", "|---|---:|---|---|"]
     for c in checks:
         title = _TITLE[c.name].format(conf=conf)
         show = c.name == "ver_uplift" or (not c.passed and c.name == "feasibility")
-        where = f" (прогін `{c.worst}`)" if show and c.worst and len(results) > 1 else ""
+        where = f" (run `{c.worst}`)" if show and c.worst and len(results) > 1 else ""
         lines.append(f"| `{c.name}` – {title}{where} | {_value(c)} | {_threshold(c)} "
-                     f"| {'✅ так' if c.passed else '❌ ні'} |")
+                     f"| {'✅ yes' if c.passed else '❌ no'} |")
     if "skew" not in by:
-        lines += ["", "Звіт звірки шляхів ознак (`--skew-report`) не передано: перевірку `skew` не виконано."]
+        lines += ["", "No feature-path skew report (`--skew-report`) was passed: the `skew` check was not run."]
 
     if failed:
-        lines += ["", "## Рекомендації", ""]
+        lines += ["", "## Recommendations", ""]
         for c in failed:
             lines.append(f"- `{c.name}`: {c.recommendation}")
 
-    lines += ["", "## Атаки × seed", "",
-              f"Розподіл карток на цільові й запасні однаковий для всіх прогонів (seed {wm['seed']}); змінюється "
-              "лише випадковий потік атаки. Шлюз бере найгірший прогін.", "",
-              f"| атака | seed атаки | VER_adv [{conf} %] | приріст [{conf} %] | ASR | операцій розвідки "
-              "| оцінок стратегій | |",
+    lines += ["", "## Attacks × seed", "",
+              f"The split of cards into target and spare is the same for all runs (seed {wm['seed']}); only the "
+              "attack's random stream changes. The gate takes the worst run.", "",
+              f"| attack | attack seed | VER_adv [{conf} %] | uplift [{conf} %] | ASR | recon operations "
+              "| strategy evaluations | |",
               "|---|---:|---|---|---|---:|---:|---|"]
     for key, r in results.items():
         a, s = parse_run_key(key)
-        mark = "**⚠ найгірший**" if key == worst_key else ""
+        mark = "**⚠ worst**" if key == worst_key else ""
         lines.append(f"| {a} | {s} | {_ci(r.ver_adv)} | {_ci(r.uplift)} | {_pct(r.asr)} "
-                     f"({r.meta['n_success']} з {r.n_targets}) | {r.recon_ops} | {r.meta['recon']['evals']} | {mark} |")
+                     f"({r.meta['n_success']} of {r.n_targets}) | {r.recon_ops} | {r.meta['recon']['evals']} | {mark} |")
 
-    lines += ["", "## Базова лінія і припущення", "",
-              f"- VER_clean (повтор реальних шахрайських операцій цільових епізодів): {_ci(w.ver_clean)}; "
-              f"без атаки поріг ρ·A досягли {wm['n_clean_success']} з {w.n_targets} епізодів.",
-              "- Обидва прогони (VER_clean і VER_adv) стартують зі стану картки до початку епізоду, а легітимні "
-              "операції картки всередині вікна епізоду не відтворюються, тож VER_clean – це повтор лише "
-              "шахрайських операцій, а не історичний результат банку.",
-              f"- VER > 1 (через нижню межу суми операції) у найгіршому прогоні: змагальних епізодів "
-              f"{wm['n_ver_adv_gt_1']} (макс. {_num(wm['max_ver_adv'])}), реальних {wm['n_ver_clean_gt_1']} "
-              f"(макс. {_num(wm['max_ver_clean'])}); значення не обрізаються.",
-              f"- Цільових епізодів: {w.n_targets} (карток: {wm['n_target_cards']}); запасних карток для розвідки: "
-              f"{len(w.spare_cards)}; бюджет розвідки {wm['recon_budget_ops']} операцій на прогін.",
-              f"- Інтервали: percentile bootstrap за епізодами ({wm['n_boot']} повторів, приріст – парний); межа "
-              f"ASR – Clopper–Pearson."]
+    lines += ["", "## Baseline and assumptions", "",
+              f"- VER_clean (replay of the real fraud operations of the target episodes): {_ci(w.ver_clean)}; "
+              f"without an attack the ρ·A threshold was reached in {wm['n_clean_success']} of {w.n_targets} episodes.",
+              "- VER_clean replays the real fraud operations of each target episode without the card's legitimate "
+              "operations inside the episode window (same for the attack): both runs (VER_clean and VER_adv) start "
+              "from the card state before the episode begins, so VER_clean is a replay of the fraud operations "
+              "only, not the bank's historical outcome.",
+              f"- VER > 1 (because of the lower bound of the operation amount) in the worst run: adversarial episodes "
+              f"{wm['n_ver_adv_gt_1']} (max {_num(wm['max_ver_adv'])}), real {wm['n_ver_clean_gt_1']} "
+              f"(max {_num(wm['max_ver_clean'])}); values are not clipped.",
+              f"- Target episodes: {w.n_targets} (cards: {wm['n_target_cards']}); spare cards for reconnaissance: "
+              f"{len(w.spare_cards)}; reconnaissance budget {wm['recon_budget_ops']} operations per run.",
+              f"- Intervals: percentile bootstrap over episodes ({wm['n_boot']} resamples, uplift paired); ASR "
+              f"bound – Clopper–Pearson."]
 
     if baseline or baseline_error is not None:
         lines += _baseline_section(baseline or {}, results, worst_key, conf, baseline_error)
 
     gate = meta.get("gate") or {}
-    lines += ["", "## Якість моделі на чистих даних (при τ)", ""]
+    lines += ["", "## Model quality on clean data (at τ)", ""]
     if "target_fpr" in gate:
-        lines += [f"Цільовий FPR на операцію (`gate.yaml`): {_pct(gate['target_fpr'])}; τ = {wm['model']['tau']}.", ""]
-    lines += ["| період | recall | FPR | precision | операцій | шахрайських |", "|---|---:|---:|---:|---:|---:|"]
+        lines += [f"Target per-operation FPR (`gate.yaml`): {_pct(gate['target_fpr'])}; τ = {wm['model']['tau']}.", ""]
+    lines += ["| period | recall | FPR | precision | operations | fraud |", "|---|---:|---:|---:|---:|---:|"]
     for p in ("val", "test"):
         q = w.clean_quality[p]
         lines.append(f"| {p} | {_num(q['recall'], 4)} | {_num(q['fpr'], 4)} | {_num(q['precision'], 4)} "
                      f"| {q['n']} | {q['n_fraud']} |")
 
     b = strategy_dict(w.best, merchants)
-    lines += ["", f"## Стратегія найгіршого прогону (`{worst_key}`)", "",
-              f"Операцій k = {b['k']}, сумарно ≈ {_pct(b['u'])} від A; план у порядку запланованого часу (день від "
-              "опівночі дня початку епізоду), до перенесення у вікно і розсування операцій:", "",
-              "| № | частка A | день | година | категорія |", "|---:|---:|---:|---:|---|"]
+    lines += ["", f"## Strategy of the worst run (`{worst_key}`)", "",
+              f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A; plan in order of planned time (day counted from "
+              "midnight of the episode start day), before wrapping into the window and spacing the operations:", "",
+              "| # | share of A | day | hour | category |", "|---:|---:|---:|---:|---|"]
     for i, op in enumerate(b["ops"], 1):
         lines.append(f"| {i} | {_pct(op['share_of_A'])} | {op['day_index']} | {op['time_of_day']} "
                      f"| {op.get('category', '–')} |")
 
-    run_walls = ", ".join(f"{k} {r.meta['wall_seconds']} с" for k, r in results.items())
-    lines += ["", "## Метадані", "",
-              f"- seed розподілу {wm['seed']}; seed атак: "
+    run_walls = ", ".join(f"{k} {r.meta['wall_seconds']} s" for k, r in results.items())
+    lines += ["", "## Metadata", "",
+              f"- split seed {wm['seed']}; attack seeds: "
               + ", ".join(str(s) for s in sorted({parse_run_key(k)[1] for k in results}))
-              + f"; git `{wm['git_sha']}` (незакомічені зміни: {wm['git_dirty']})",
-              f"- платформа: {wm['platform']['platform']}; процесів: {wm['n_jobs']}"
-              + (f"; час шлюзу {meta['wall_seconds']} с" if "wall_seconds" in meta else "")
-              + (f" (з завантаженням даних і моделі {meta['wall_seconds_with_loading']} с)"
+              + f"; git `{wm['git_sha']}` (uncommitted changes: {wm['git_dirty']})",
+              f"- platform: {wm['platform']['platform']}; processes: {wm['n_jobs']}"
+              + (f"; gate time {meta['wall_seconds']} s" if "wall_seconds" in meta else "")
+              + (f" (including data and model loading {meta['wall_seconds_with_loading']} s)"
                  if "wall_seconds_with_loading" in meta else ""),
-              f"- час прогонів: {run_walls}",
-              f"- модель: `{wm['model']['dir']}`, τ = {wm['model']['tau']}, SHA-256 `model.json`: "
+              f"- run times: {run_walls}",
+              f"- model: `{wm['model']['dir']}`, τ = {wm['model']['tau']}, SHA-256 `model.json`: "
               f"`{wm['model']['model_json_sha256']}`",
-              f"- модель загроз: `{wm['threat_model']['file']}`, SHA-256 `{wm['threat_model']['sha256']}`"]
+              f"- threat model: `{wm['threat_model']['file']}`, SHA-256 `{wm['threat_model']['sha256']}`"]
     if meta.get("gate_file"):
-        lines.append(f"- шлюз: `{meta['gate_file']}`, SHA-256 `{meta.get('gate_sha256')}`")
+        lines.append(f"- gate: `{meta['gate_file']}`, SHA-256 `{meta.get('gate_sha256')}`")
     if "model_target_fpr" in meta:
         mt = meta["model_target_fpr"]
-        lines.append("- target_fpr моделі не вказано — звірку пропущено" if mt is None
-                     else f"- target_fpr моделі (`model.json`): {mt}, збігається з `gate.yaml`")
+        lines.append("- the model's target_fpr is not given – the check was skipped" if mt is None
+                     else f"- the model's target_fpr (`model.json`): {mt}, matches `gate.yaml`")
     if gate:
-        lines.append("- параметри шлюзу: " + ", ".join(f"{k} = {v}" for k, v in gate.items()))
-    lines += ["- версії: " + ", ".join(f"{k} {v}" for k, v in wm["versions"].items()), ""]
+        lines.append("- gate parameters: " + ", ".join(f"{k} = {v}" for k, v in gate.items()))
+    lines += ["- versions: " + ", ".join(f"{k} {v}" for k, v in wm["versions"].items()), ""]
     return "\n".join(lines)
 
 
 def error_summary(message: str) -> str:
     """Minimal summary when the audit could not run (configuration or artifact error): CI must show why."""
-    return (f"# ❌ {VERDICT_FAIL} — помилка конфігурації/артефактів\n\n"
-            "Аудит не виконано, тож шлюз закритий (exit 2). Причина:\n\n"
+    return (f"# ❌ {VERDICT_FAIL} – configuration/artifact error\n\n"
+            "The audit did not run, so the gate is closed (exit 2). Reason:\n\n"
             f"```\n{message}\n```\n\n"
-            "Виправте конфігурацію (`gate.yaml`, модель загроз, звіт skew) або артефакти моделі (`models/`, "
-            "перевірка SHA-256 у `manifest.json`) і повторіть аудит; не обходьте перевірку цілісності.\n")
+            "Fix the configuration (`gate.yaml`, threat model, skew report) or the model artifacts (`models/`, "
+            "SHA-256 check in `manifest.json`) and rerun the audit; do not bypass the integrity check.\n")
 
 
 def write_error_outputs(out_dir: Path | str, message: str) -> str:

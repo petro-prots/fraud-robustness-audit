@@ -1,7 +1,6 @@
 # fraud-robustness-audit
 
 `fraudaudit`: episode-level adversarial robustness audit of a fraud-detection MLP, run as a GitHub Actions gate (master's thesis tool).
-Інструмент аудиту стійкості MLP-моделі виявлення шахрайства до епізодних атак ухилення; працює як шлюз у GitHub Actions.
 
 ## Data
 
@@ -69,7 +68,7 @@ Wall time: 19 min 31 s in total (feature preparation 9 s, `mlp.fit` 19 min 19 s,
 
 ## Audit gate
 
-`fraudaudit audit --data data --model models --threat threat-models/realistic.yaml --gate gate.yaml --out out/` runs every attack of `gate.yaml` (`attacks: [random, es]`) with every attack seed (`attack_seeds: [1, 2, 3]`) on the same target/spare card split (`--seed`, default 42), one run after another, each with its own process pool. Checks (`fraudaudit.gate.decide`): `ver_uplift` (worst run: upper bound of the paired bootstrap interval of VER_adv − VER_clean ≤ `delta`; `delta: null` fails closed), `recall_clean` (clean test recall at τ ≥ `recall_clean_min`), `feasibility` (every run's `feasible_share` = 1) and, with `--skew-report out/skew.json` (written by `fraudaudit skew --out out/skew.json`), `skew`. Writes `out/audit.json` (every run, checks, verdict) and the Ukrainian `out/summary.md` (appended to `$GITHUB_STEP_SUMMARY` when set); exit code 1 if a check fails, 2 on a configuration error.
+`fraudaudit audit --data data --model models --threat threat-models/realistic.yaml --gate gate.yaml --out out/` runs every attack of `gate.yaml` (`attacks: [random, es]`) with every attack seed (`attack_seeds: [1, 2, 3]`) on the same target/spare card split (`--seed`, default 42), one run after another, each with its own process pool. Checks (`fraudaudit.gate.decide`): `ver_uplift` (worst run: upper bound of the paired bootstrap interval of VER_adv − VER_clean ≤ `delta`; `delta: null` fails closed), `recall_clean` (clean test recall at τ ≥ `recall_clean_min`), `feasibility` (every run's `feasible_share` = 1) and, with `--skew-report out/skew.json` (written by `fraudaudit skew --out out/skew.json`), `skew`. Writes `out/audit.json` (every run, checks, verdict) and the English `out/summary.md` (appended to `$GITHUB_STEP_SUMMARY` when set); exit code 1 if a check fails, 2 on a configuration error.
 
 ### Conventional-audit baseline (informational)
 
@@ -94,4 +93,4 @@ Results:
 - `chosen_amount_ratio` (amounts of the chosen candidates / sum of A, no cap);
 - the replay: the chosen operations of each episode run as one episode through `run_episode` (recomputed aggregates, `min_gap_secs`, `max_declines`, ρ of the episode threat model), with VER and its paired uplift over VER_clean.
 
-The summary section «Звичайний аудит (атака на одну транзакцію) проти епізодного» compares these with the worst episode run, the mean and range of the uplift over all attack × seed runs, and the paired bootstrap of VER_adv − VER_replay. In `audit.json` they are under `baseline` (`primary`, `rules`, `comparison`).
+The summary section "Conventional audit (single-transaction attack) vs episode audit" compares these with the worst episode run, the mean and range of the uplift over all attack × seed runs, and the paired bootstrap of VER_adv − VER_replay. In `audit.json` they are under `baseline` (`primary`, `rules`, `comparison`).

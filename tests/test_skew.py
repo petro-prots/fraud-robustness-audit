@@ -183,7 +183,7 @@ def test_skew_cli_writes_step_summary(df, real_model_dir, tmp_path, monkeypatch)
     monkeypatch.setattr("fraudaudit.data.load_raw", lambda d: df)
     rc = cli.main(["skew", "--data", "unused", "--model", str(real_model_dir), "--cards", "5", "--n-jobs", "1"])
     text = summary.read_text(encoding="utf-8")
-    assert "Звірка навчального і продуктивного шляхів ознак" in text
+    assert "Training vs serving feature path comparison" in text
     assert rc == 0 and "PASS" in text and "max_abs_p_diff" not in text
 
 
