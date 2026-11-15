@@ -43,6 +43,8 @@
       "test": 2145,
       "val": 1256
     },
+    "git_dirty": true,
+    "git_sha": "c1625d0",
     "iforest_flag_share_train_balanced": 0.7802437543869019,
     "n_base_features": 27,
     "platform": {
@@ -50,6 +52,7 @@
       "platform": "Linux-6.10.14-linuxkit-aarch64-with-glibc2.41",
       "system": "Linux"
     },
+    "provenance_note": "trained from uncommitted code on top of c1625d0; that code was committed together with these artifacts in f3adaea",
     "rows": {
       "fit": 1070966,
       "test": 555719,
@@ -91,6 +94,7 @@
     "pandas": "2.2.3",
     "python": "3.12.16",
     "scikit-learn": "1.5.2",
+    "scipy": "1.18.1",
     "skops": "0.10.0",
     "tensorflow": "2.18.0"
   }

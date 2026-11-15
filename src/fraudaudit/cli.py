@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import platform
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,6 +27,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def git_info(cwd: Path | None = None) -> dict:
+    """Code version of a run: env GIT_SHA / GIT_DIRTY (CI, Docker without git), else git, else "unknown"."""
+    sha = os.environ.get("GIT_SHA")
+    if sha:
+        dirty_env = os.environ.get("GIT_DIRTY")
+        dirty = "unknown" if dirty_env is None else dirty_env.strip().lower() in ("1", "true", "yes")
+        return {"git_sha": sha, "git_dirty": dirty}
+    try:
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True,
+                             text=True, check=True).stdout.strip()
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True,
+                                text=True, check=True).stdout
+        return {"git_sha": sha, "git_dirty": bool(status.strip())}
+    except (OSError, subprocess.CalledProcessError):
+        return {"git_sha": "unknown", "git_dirty": "unknown"}
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.model.pipeline import train_model
@@ -34,7 +53,8 @@ def cmd_train(args: argparse.Namespace) -> int:
     model, report = train_model(df, seed=args.seed, epochs=args.epochs,
                                 sample_frac=args.sample_frac, verbose=2)
     meta = dict(report, platform={"system": platform.system(), "machine": platform.machine(),
-                                  "platform": platform.platform()})
+                                  "platform": platform.platform()},
+                **git_info())
     model.save(args.out, meta=meta)
     print(json.dumps(meta, indent=2, sort_keys=True), flush=True)
     return 0

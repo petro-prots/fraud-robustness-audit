@@ -20,6 +20,7 @@ from pathlib import Path
 import keras
 import numpy as np
 import pandas as pd
+import scipy
 import skops
 import skops.io as sio
 import sklearn
@@ -77,6 +78,7 @@ def _versions() -> dict:
         "keras": keras.__version__,
         "numpy": np.__version__,
         "scikit-learn": sklearn.__version__,
+        "scipy": scipy.__version__,
         "skops": skops.__version__,
         "pandas": pd.__version__,
     }

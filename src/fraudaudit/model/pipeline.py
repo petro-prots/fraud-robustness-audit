@@ -15,6 +15,7 @@ Data-handling corrections of the approved design:
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -186,7 +187,11 @@ def train_model(df: pd.DataFrame, seed: int, epochs: int = EPOCHS,
 
     model = FraudModel(mlp=mlp, scaler=ds.scaler, iforest=ds.iforest, encoder=ds.encoder, tau=0.5)
     p_val = model.predict_proba(ds.F["val"])
-    model.tau = threshold_at_fpr(ds.y["val"], p_val, TARGET_FPR)
+    tau = threshold_at_fpr(ds.y["val"], p_val, TARGET_FPR)
+    if not math.isfinite(tau):
+        raise ValueError(f"threshold_at_fpr returned a non-finite tau ({tau!r}): no threshold in "
+                         f"[0, 1] keeps FPR on val within {TARGET_FPR}; refusing to save the model")
+    model.tau = tau
     p_test = model.predict_proba(ds.F["test"])
 
     report = {

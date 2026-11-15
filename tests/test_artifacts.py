@@ -42,7 +42,7 @@ def test_roundtrip_same_predictions(tmp_path, parts):
     assert set(m["sha256"]) == {"mlp.keras", "scaler.skops", "iforest.skops", "encoder.json", "model.json"}
     info = json.loads((tmp_path / "model.json").read_text())
     assert info["feature_columns"] == list(FEATURE_COLUMNS)
-    assert {"python", "tensorflow", "keras", "numpy", "scikit-learn", "skops", "pandas"} <= set(info["versions"])
+    assert {"python", "tensorflow", "keras", "numpy", "scikit-learn", "scipy", "skops", "pandas"} <= set(info["versions"])
     assert a.manifest == m
 
 

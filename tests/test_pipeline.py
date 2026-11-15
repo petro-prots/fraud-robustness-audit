@@ -5,6 +5,8 @@ import pytest
 from fraudaudit.data import period
 from fraudaudit.features.columns import FEATURE_COLUMNS
 from fraudaudit.model.artifacts import load_artifacts
+from fraudaudit.cli import git_info
+from fraudaudit.model import pipeline
 from fraudaudit.model.pipeline import FraudModel, build_datasets, build_mlp, train_model
 
 
@@ -33,6 +35,12 @@ def test_balancing_only_fit(sparkov_like):
     assert set(ds.train_rows) <= fit_rows
     assert int((ds.y_train == 0).sum()) == int((ds.y_train == 1).sum())
     assert int((ds.y_train == 0).sum()) == int(((per == "fit") & (df["is_fraud"] == 0)).sum())
+    # fitted components saw only fit rows
+    fit = df[per == "fit"]
+    assert ds.scaler.n_samples_seen_ == int((per == "fit").sum())
+    assert ds.iforest.n_features_in_ == len(FEATURE_COLUMNS) == 34
+    assert set(ds.encoder.merchants) == set(fit["merchant"].str.removeprefix("fraud_"))
+    assert set(ds.encoder.states) == set(fit["state"])
     # val / test: unbalanced, every row exactly once
     for name in ("val", "test"):
         rows = ds.rows[name]
@@ -59,3 +67,24 @@ def test_train_smoke(sparkov_like, tmp_path):
     one = loaded.predict_proba(F[:1])
     assert one.shape == (1,) and one[0] == pytest.approx(p[0], abs=1e-6)
     assert loaded.tau == pytest.approx(model.tau)
+
+
+def test_nonfinite_tau_rejected(sparkov_like, monkeypatch):
+    monkeypatch.setattr(pipeline, "threshold_at_fpr", lambda y, p, fpr: float("inf"))
+    with pytest.raises(ValueError, match="non-finite tau"):
+        train_model(sparkov_like, seed=0, epochs=1)
+
+
+def test_git_info_from_env(monkeypatch):
+    monkeypatch.setenv("GIT_SHA", "abc123")
+    monkeypatch.setenv("GIT_DIRTY", "1")
+    assert git_info() == {"git_sha": "abc123", "git_dirty": True}
+    monkeypatch.setenv("GIT_DIRTY", "false")
+    assert git_info()["git_dirty"] is False
+
+
+def test_git_info_without_git(monkeypatch, tmp_path):
+    monkeypatch.delenv("GIT_SHA", raising=False)
+    monkeypatch.delenv("GIT_DIRTY", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))  # no git binary reachable
+    assert git_info(tmp_path) == {"git_sha": "unknown", "git_dirty": "unknown"}

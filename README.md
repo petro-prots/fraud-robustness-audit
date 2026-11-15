@@ -27,7 +27,7 @@ The package is installed in editable mode (`pip install -e .`), so mounting the 
 
 ## Pinned versions
 
-All versions in `requirements.txt` are exact (`==`) and were resolved as specified (no deviations from the starting versions). `scipy==1.18.1` was added as an explicit pin (the version pip resolved with scikit-learn), because `fraudaudit.metrics` imports it directly. Python 3.12; `jupyterlab==4.2.5` in the dev stage only.
+All versions in `requirements.txt` are exact (`==`) and were resolved as specified (no deviations from the starting versions). `keras==3.15.1` (the version TensorFlow 2.18.0 resolved to, recorded in `models/model.json`) and `scipy==1.18.1` were added as explicit pins (`fraudaudit.metrics` imports scipy directly). Python 3.12; `jupyterlab==4.2.5` in the dev stage only.
 
 ## Data periods and fraud episodes
 
@@ -56,5 +56,13 @@ Run of 2026-11-15, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Lin
 |---|---:|---:|---:|---:|---:|
 | `val` | 0.9777 | 0.0098 | 0.3579 | 1 228 | 2 203 |
 | `test` | 0.9524 | 0.0086 | 0.3014 | 2 043 | 4 735 |
+
+Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SHA` / `GIT_DIRTY` if set, else from `git`, else `"unknown"`. The image has no git, so pass them in Docker:
+
+    docker run --rm -v "$PWD":/app -w /app -e GIT_SHA="$(git rev-parse HEAD)" \
+      -e GIT_DIRTY="$(test -z "$(git status --porcelain)" && echo 0 || echo 1)" \
+      --entrypoint fraudaudit fraudaudit:dev train --data data --out models --seed 42
+
+The committed baseline was trained from uncommitted code on top of `c1625d0`; that code was committed with the artifacts in `f3adaea` (`meta.provenance_note`; the provenance fields were added afterwards by re-saving the same artifacts, predictions unchanged).
 
 Wall time: 19 min 31 s in total (feature preparation 9 s, `mlp.fit` 19 min 19 s, ~57 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
