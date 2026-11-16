@@ -9,8 +9,6 @@
     "merch_lat",
     "merch_long",
     "age",
-    "trans_month",
-    "trans_year",
     "latitudinal_distance",
     "longitudinal_distance",
     "category_food_dining",
@@ -40,16 +38,16 @@
   "meta": {
     "batch_size": 32,
     "epochs": 20,
-    "feature_set": "bachelor+hour",
+    "feature_set": "bachelor+hour-calendar",
     "fraud_rows": {
       "fit": 6250,
       "test": 2145,
       "val": 1256
     },
     "git_dirty": false,
-    "git_sha": "1a51b7b9793e83d3ff759236b2badb54976afd7d",
-    "iforest_flag_share_train_balanced": 0.7391111850738525,
-    "n_base_features": 29,
+    "git_sha": "2f3dce579cbac0be210f84bcfff3aee9ae091433",
+    "iforest_flag_share_train_balanced": 0.8188329339027405,
+    "n_base_features": 27,
     "platform": {
       "machine": "aarch64",
       "platform": "Linux-6.10.14-linuxkit-aarch64-with-glibc2.41",
@@ -62,34 +60,34 @@
     },
     "sample_frac": null,
     "seconds": {
-      "fit": 1435.5,
-      "prepare": 12.6,
-      "total": 1453.1
+      "fit": 1577.6,
+      "prepare": 13.3,
+      "total": 1595.3
     },
     "seed": 42,
     "target_fpr": 0.01,
-    "tau": 0.005090115591883659,
+    "tau": 0.013072659261524677,
     "test": {
-      "fp": 4620,
-      "fpr": 0.00834576768417592,
+      "fp": 5002,
+      "fpr": 0.009035828994858863,
       "n": 555719,
       "n_fraud": 2145,
-      "precision": 0.3103448275862069,
-      "recall": 0.9692307692307692,
-      "tp": 2079
+      "precision": 0.29469825155104346,
+      "recall": 0.9743589743589743,
+      "tp": 2090
     },
     "train_balanced_rows": 2129432,
     "val": {
-      "fp": 2000,
-      "fpr": 0.008910551429475213,
+      "fp": 2191,
+      "fpr": 0.009761509090990095,
       "n": 225709,
       "n_fraud": 1256,
-      "precision": 0.38022931515339325,
-      "recall": 0.9769108280254777,
-      "tp": 1227
+      "precision": 0.36010514018691586,
+      "recall": 0.981687898089172,
+      "tp": 1233
     }
   },
-  "tau": 0.005090115591883659,
+  "tau": 0.013072659261524677,
   "versions": {
     "keras": "3.15.1",
     "numpy": "2.0.2",

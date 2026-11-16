@@ -2,9 +2,9 @@
   "format": 1,
   "sha256": {
     "encoder.json": "09f96aca430cea603ab149695bfb1d7f59536d80a4f9e950d85dd3e90acca9fc",
-    "iforest.skops": "facfa5e80b2f5e87c59ccb50e1500498f7c255e56ab7216983d3f64de8f60e41",
-    "mlp.keras": "d9732b460a32755146c56813ee09d47f84620bad21f53f7b3e267220a8d0255c",
-    "model.json": "999162e31ba16d7687beec7ebcc2255108b0802395d7b8318fced01c003c54df",
-    "scaler.skops": "a9bda65e298a02728227ed4edc115299fa98a2eb5e670695da70d854d2d83435"
+    "iforest.skops": "84ca6967b53158888d64f0c936241f9ab8bb599a0ebee646c5e7bc27e589fb38",
+    "mlp.keras": "822f5bf36653e578e64dba686afe0942707e74a1c8314997bba598e2ef97fc42",
+    "model.json": "b4b27cc0f23bf01ad0abcb2f014db055005bc2405d1afa65e63d794af6ba84af",
+    "scaler.skops": "fadd1359841e6c39bafe492a266275bdefad9d60ccb57b195e53be813703d380"
   }
 }

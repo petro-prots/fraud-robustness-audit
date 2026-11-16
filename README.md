@@ -42,7 +42,7 @@ Features (`fraudaudit.features.columns`, `meta.feature_set: "bachelor+hour-calen
 
 `fraudaudit train --data data --out models --seed 42` (`fraudaudit.model.pipeline`). Architecture and hyperparameters as in the bachelor listings: `StandardScaler` → `IsolationForest()` flag (`predict(X) > -1`, the 35th input) → MLP Dense 55 relu, BN, Dense 26 sigmoid, BN, Dense 12 sigmoid, BN, Dense 1 sigmoid; `Adamax(0.01)`, `BinaryCrossentropy`, 20 epochs, batch 32. Corrections: features on the whole time-ordered stream; encoder, scaler and IsolationForest (`random_state=seed`) fit on `fit` rows only; fraud rows of `fit` resampled with replacement up to the number of legit `fit` rows (`val`/`test` unbalanced); τ = `threshold_at_fpr(y_val, p_val, 0.01)` on clean `val`, decision `p >= τ`.
 
-Run of 2026-11-15, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Linux aarch64, 6 CPUs for Docker), TensorFlow 2.18.0 on CPU (not guaranteed bit-identical on other platforms):
+Run of 2026-11-16, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Linux aarch64, 6 CPUs for Docker), TensorFlow 2.18.0 on CPU (not guaranteed bit-identical on other platforms):
 
 | | rows | fraud rows |
 |---|---:|---:|
@@ -51,14 +51,16 @@ Run of 2026-11-15, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Lin
 | `val` | 225 709 | 1 256 |
 | `test` | 555 719 | 2 145 |
 
-τ = 0.005090115591883659
+τ = 0.013072659261524677
 
 | at τ | recall | FPR | precision | TP | FP |
 |---|---:|---:|---:|---:|---:|
-| `val` | 0.9769 | 0.0089 | 0.3802 | 1 227 | 2 000 |
-| `test` | 0.9692 | 0.0083 | 0.3103 | 2 079 | 4 620 |
+| `val` | 0.9817 | 0.0098 | 0.3601 | 1 233 | 2 191 |
+| `test` | 0.9744 | 0.0090 | 0.2947 | 2 090 | 5 002 |
 
-The previous baseline without time of day (34 features, τ = 0.047462500631809235: test recall 0.9524, FPR 0.0086, precision 0.3014; val recall 0.9777, FPR 0.0098) is kept in `models-bachelor/` for comparison; the current code does not load it (see `models-bachelor/README.md`).
+Test recall by month (Jun–Dec 2020) stays between 0.963 and 0.985 and test FPR between 0.82 % and 1.02 %, so the score is stable over the test period.
+
+The previous `bachelor+hour` baseline with the calendar features (36 features, τ = 0.005090115591883659: test recall 0.9692, FPR 0.0083, precision 0.3103) is kept in `models-bachelor-hour/` (see its README). The older baseline without time of day (34 features incl. the calendar features, τ = 0.047462500631809235: test recall 0.9524, FPR 0.0086, precision 0.3014; val recall 0.9777, FPR 0.0098) is kept in `models-bachelor/` for comparison; the current code does not load it (see `models-bachelor/README.md`).
 
 Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SHA` / `GIT_DIRTY` if set, else from `git`, else `"unknown"`. The image has no git, so pass them in Docker:
 
@@ -66,9 +68,9 @@ Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SH
       -e GIT_DIRTY="$(test -z "$(git status --porcelain)" && echo 0 || echo 1)" \
       --entrypoint fraudaudit fraudaudit:dev train --data data --out models --seed 42
 
-The committed baseline was trained from the clean tree at `1a51b7b` (`meta.git_sha`, `git_dirty: false`).
+The committed baseline was trained from the clean tree at `2f3dce5` (`meta.git_sha`, `git_dirty: false`).
 
-Wall time: 24 min 13 s in total (feature preparation 13 s, `mlp.fit` 23 min 56 s, ~72 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
+Wall time: 26 min 35 s in total (feature preparation 13 s, `mlp.fit` 26 min 18 s, ~79 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
 
 ## Audit gate
 
