@@ -1,5 +1,9 @@
-"""Fixed feature order of the model: 29 base features (the 27 of the bachelor model + time of day
-``hour_sin``/``hour_cos``) and 7 windowed aggregates."""
+"""Fixed feature order of the model: 27 base features (the 27 of the bachelor model without the
+calendar features ``trans_month``/``trans_year``, + time of day ``hour_sin``/``hour_cos``) and
+7 windowed aggregates.
+
+The calendar features were dropped (ruling R23): ``trans_year`` x ``trans_month`` put the test
+period (Jun-Dec 2020) outside the training support, so models extrapolated on test."""
 from __future__ import annotations
 
 # The 14 Sparkov categories, sorted; the first one is the baseline dropped by
@@ -13,7 +17,7 @@ CATEGORY_DUMMIES = tuple(f"category_{c}" for c in CATEGORIES[1:])
 
 BASE_COLUMNS: tuple[str, ...] = (
     "merchant", "amt", "state", "lat", "long", "city_pop", "merch_lat", "merch_long",
-    "age", "trans_month", "trans_year", "latitudinal_distance", "longitudinal_distance",
+    "age", "latitudinal_distance", "longitudinal_distance",
     *CATEGORY_DUMMIES,
     "gender_M",
     "hour_sin", "hour_cos",  # time of day on the unit circle (not in the bachelor set; ruling R16)

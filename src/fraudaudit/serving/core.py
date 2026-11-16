@@ -1,6 +1,6 @@
-"""Serving path: the 36 features of one operation from the card state, and the decision.
+"""Serving path: the 34 features of one operation from the card state, and the decision.
 
-The 29 base features come from a numpy path for a single operation that reproduces
+The 27 base features come from a numpy path for a single operation that reproduces
 ``BaseEncoder.transform`` value for value (pinned by ``tests/test_serving.py``); building a
 one-row DataFrame per operation would dominate the time of ``decide``.
 """
@@ -66,8 +66,6 @@ class Serving:
         out[_COL["merch_long"]] = tx.merch_long
         trans_date = tx.ts.normalize()
         out[_COL["age"]] = np.round((trans_date - prof.dob).days / 365.25)  # half-to-even, as transform
-        out[_COL["trans_month"]] = trans_date.month
-        out[_COL["trans_year"]] = trans_date.year
         out[_COL["latitudinal_distance"]] = abs(np.round(np.float64(tx.merch_lat) - np.float64(prof.lat), 3))
         out[_COL["longitudinal_distance"]] = abs(np.round(np.float64(tx.merch_long) - np.float64(prof.long), 3))
         if cat > 0:
@@ -79,7 +77,7 @@ class Serving:
         return out
 
     def features(self, state: CardState, tx: Tx) -> np.ndarray:
-        """FEATURE_COLUMNS (float32, length 36) of ``tx`` given the card history in ``state``."""
+        """FEATURE_COLUMNS (float32, length 34) of ``tx`` given the card history in ``state``."""
         f = np.empty(len(FEATURE_COLUMNS), dtype=np.float32)
         f[:_N_BASE] = self._base(state, tx)
         f[_N_BASE:] = state.aggregates(tx.ts)

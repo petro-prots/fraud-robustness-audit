@@ -1,6 +1,7 @@
-"""The 29 base features and a JSON-serializable encoder.
+"""The 27 base features and a JSON-serializable encoder.
 
-27 features follow Appendix B of the bachelor thesis; ``hour_sin``/``hour_cos`` add the time of
+25 features follow Appendix B of the bachelor thesis (its 27 without the non-stationary calendar
+features ``trans_month``/``trans_year``, ruling R23); ``hour_sin``/``hour_cos`` add the time of
 day (``hour_features``), which the bachelor set lacks. The encoder never looks at
 other rows in ``transform``, so one-row frames (serving path) give the same
 values as batches.
@@ -77,8 +78,6 @@ class BaseEncoder:
         trans_date = ts.dt.normalize()
         days = (trans_date - pd.to_datetime(df["dob"])).dt.days
         out["age"] = np.round(days / 365.25)  # half-to-even, as Python/numpy round
-        out["trans_month"] = trans_date.dt.month
-        out["trans_year"] = trans_date.dt.year
         out["latitudinal_distance"] = np.abs(np.round(df["merch_lat"] - df["lat"], 3))
         out["longitudinal_distance"] = np.abs(np.round(df["merch_long"] - df["long"], 3))
         cat = df["category"].astype(str)

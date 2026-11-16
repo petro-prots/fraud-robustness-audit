@@ -20,8 +20,8 @@ def _row(sparkov_like, **over):
     return r
 
 
-def test_29_base_36_feature_columns(sparkov_like):
-    assert len(BASE_COLUMNS) == 29 and len(set(BASE_COLUMNS)) == 29
+def test_27_base_34_feature_columns(sparkov_like):
+    assert len(BASE_COLUMNS) == 27 and len(set(BASE_COLUMNS)) == 27
     assert BASE_COLUMNS[-2:] == ("hour_sin", "hour_cos")
     enc = BaseEncoder().fit(_fit_df(sparkov_like))
     out = enc.transform(sparkov_like)
@@ -29,7 +29,13 @@ def test_29_base_36_feature_columns(sparkov_like):
     assert (out.dtypes == "float32").all()
     assert out.index.equals(sparkov_like.index)
     assert not out.isna().any().any()
-    assert len(FEATURE_COLUMNS) == 36
+    assert len(FEATURE_COLUMNS) == 34
+
+
+def test_no_calendar_features():
+    # ruling R23: trans_year x trans_month put the test period outside the training support
+    assert "trans_month" not in FEATURE_COLUMNS and "trans_year" not in FEATURE_COLUMNS
+    assert {"age", "hour_sin", "hour_cos"} <= set(BASE_COLUMNS)
 
 
 def test_age_rounding(sparkov_like):
@@ -39,7 +45,7 @@ def test_age_rounding(sparkov_like):
     # date part only: time of day is ignored; 20.0 y exactly -> 20
     b = enc.transform(_row(sparkov_like, dob="2000-06-15", ts=pd.Timestamp("2020-06-15 00:00:00")))
     assert b["age"].iloc[0] == 20
-    assert b["trans_month"].iloc[0] == 6 and b["trans_year"].iloc[0] == 2020
+    assert "trans_month" not in b.columns and "trans_year" not in b.columns
 
 
 @pytest.mark.parametrize("ts, want_sin, want_cos", [
