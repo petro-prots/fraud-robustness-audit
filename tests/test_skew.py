@@ -47,7 +47,7 @@ def test_skew_passes_on_consistent_paths(df, count_model):
     assert rep.passed
     assert rep.decision_mismatches == 0
     assert rep.n_tx > 0
-    for col in ("cnt_1d", "cnt_7d", "cnt_30d", "secs_since_prev"):
+    for col in ("cnt_1d", "cnt_7d", "cnt_30d", "secs_since_prev", "cnt_1h", "cnt_cat_24h"):
         assert rep.max_abs_diff[col] == 0.0
     assert set(rep.max_abs_diff) == set(FEATURE_COLUMNS)
 
@@ -64,8 +64,8 @@ def test_skew_detects_injected_fault(df, count_model, monkeypatch):
     operations of the same second) by monkeypatching ``CardState.aggregates``; the check must flag it."""
     real = CardState.aggregates
 
-    def same_second_counted(self, ts):
-        out = real(self, ts)
+    def same_second_counted(self, ts, amt, category):
+        out = real(self, ts, amt, category)
         t = pd.Timestamp(ts).value
         same = sum(1 for x in self._t if x == t)
         out[:3] += same  # cnt_1d, cnt_7d, cnt_30d

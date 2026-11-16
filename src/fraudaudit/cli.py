@@ -31,7 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     skew.add_argument("--model", type=Path, default=Path("models"), help="artifact directory")
     skew.add_argument("--cards", type=int, default=50, help="number of sampled cards")
     skew.add_argument("--seed", type=int, default=42)
-    skew.add_argument("--atol", type=float, default=1e-4, help="tolerance of the mean_amt_* columns only")
+    skew.add_argument("--atol", type=float, default=1e-4,
+                      help="tolerance of the float aggregate columns only (mean_amt_*, sum_1h, amt_ratio_30d)")
     skew.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
     skew.add_argument("--out", type=Path, default=None, help="also write the report as JSON (for audit --skew-report)")
 

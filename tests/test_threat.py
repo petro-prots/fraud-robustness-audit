@@ -130,8 +130,9 @@ def test_contexts_for_equals_context_for(setup):
     for b, e in zip(bulk, eps):
         c = context_for(df, e)
         assert b.profile == c.profile
-        assert b.state._t == c.state._t and b.state._a == c.state._a and b.state._now == c.state._now
-        np.testing.assert_array_equal(b.state.aggregates(e.start), c.state.aggregates(e.start))
+        assert b.state._t == c.state._t and b.state._a == c.state._a and b.state._c == c.state._c and b.state._now == c.state._now
+        np.testing.assert_array_equal(b.state.aggregates(e.start, 50.0, "travel"),
+                                      c.state.aggregates(e.start, 50.0, "travel"))
 
 
 # ---- realize / feasible ----------------------------------------------------------------------

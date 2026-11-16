@@ -15,8 +15,11 @@ T0 = pd.Timestamp("2020-02-01 10:00:00")
 DAY = pd.Timedelta(days=1)
 SEC = pd.Timedelta(seconds=1)
 N_BASE = len(BASE_COLUMNS)
-COUNT_COLS = [N_BASE + AGG_COLUMNS.index(c) for c in ("cnt_1d", "cnt_7d", "cnt_30d", "secs_since_prev")]
-MEAN_COLS = [N_BASE + AGG_COLUMNS.index(c) for c in ("mean_amt_1d", "mean_amt_7d", "mean_amt_30d")]
+COUNT_COLS = [N_BASE + AGG_COLUMNS.index(c)
+              for c in ("cnt_1d", "cnt_7d", "cnt_30d", "secs_since_prev", "cnt_1h", "cnt_cat_24h")]
+MEAN_COLS = [N_BASE + AGG_COLUMNS.index(c)
+             for c in ("mean_amt_1d", "mean_amt_7d", "mean_amt_30d", "sum_1h", "amt_ratio_30d")]
+LOG1P_1 = float(np.log1p(1.0))
 
 
 class StubModel:
@@ -108,7 +111,7 @@ def test_from_history_takes_only_last_30d_before_at(sparkov_like):
     state = CardState.from_history(profile_of(df, card), df, at=at)
     want = g[(g["ts"] < at) & (g["ts"] >= at - 30 * DAY)]
     assert len(state) == len(want)
-    agg = state.aggregates(at)
+    agg = state.aggregates(at, 1.0, "home")
     assert agg[2] == len(want)
     assert agg[5] == pytest.approx(want["amt"].mean() if len(want) else 0.0)
 
@@ -121,11 +124,11 @@ def test_state_truncates_30d():
     assert len(s) == 3  # first op is exactly 30 days old: still needed
     s.push(Tx(T0 + 30 * DAY + SEC, 40.0, "fraud_A", "home", 40.0, -80.0))
     assert len(s) == 3  # now strictly older than 30 days: dropped
-    agg = s.aggregates(T0 + 40 * DAY)
+    agg = s.aggregates(T0 + 40 * DAY, 1.0, "home")
     assert agg[2] == 3 and agg[5] == pytest.approx(30.0)
     # a query going back in time cannot be answered from a truncated state
     with pytest.raises(ValueError):
-        s.aggregates(T0 + 30 * DAY)
+        s.aggregates(T0 + 30 * DAY, 1.0, "home")
     with pytest.raises(ValueError):
         s.push(Tx(T0 + 29 * DAY, 1.0, "fraud_A", "home", 40.0, -80.0))
 
@@ -149,7 +152,7 @@ def test_window_lower_bound_inclusive(days, k):
     s = CardState(_profile())
     s.push(Tx(t - days * DAY - SEC, 100.0, "fraud_A", "home", 40.0, -80.0))  # just outside
     s.push(Tx(t - days * DAY, 10.0, "fraud_A", "home", 40.0, -80.0))  # exactly w earlier: inside
-    agg = s.aggregates(t)
+    agg = s.aggregates(t, 1.0, "home")
     assert agg[k] == 1 and agg[3 + k] == pytest.approx(10.0)
     assert agg[2] == 2  # both within 30 days
     assert agg[6] == days * 86_400
@@ -159,16 +162,17 @@ def test_same_second_ops_not_counted():
     s = CardState(_profile())
     s.push(Tx(T0 - 3600 * SEC, 10.0, "fraud_A", "home", 40.0, -80.0))
     s.push(Tx(T0, 30.0, "fraud_A", "home", 40.0, -80.0))
-    agg = s.aggregates(T0)
+    agg = s.aggregates(T0, 1.0, "home")
     assert agg[0] == 1 and agg[3] == pytest.approx(10.0) and agg[6] == 3600
 
 
 def test_first_tx_defaults():
     s = CardState(_profile())
-    np.testing.assert_array_equal(s.aggregates(T0), [0, 0, 0, 0.0, 0.0, 0.0, NO_PREV_SECS])
+    np.testing.assert_array_equal(s.aggregates(T0, 1.0, "home"), [0, 0, 0, 0.0, 0.0, 0.0, NO_PREV_SECS, 0, 0.0, 0,
+                                                                  LOG1P_1])
     s.push(Tx(T0, 10.0, "fraud_A", "home", 40.0, -80.0))
-    agg = s.aggregates(T0 + 31 * DAY)  # only op is older than 30 days
-    np.testing.assert_array_equal(agg, [0, 0, 0, 0.0, 0.0, 0.0, NO_PREV_SECS])
+    agg = s.aggregates(T0 + 31 * DAY, 1.0, "home")  # only op is older than 30 days
+    np.testing.assert_array_equal(agg, [0, 0, 0, 0.0, 0.0, 0.0, NO_PREV_SECS, 0, 0.0, 0, LOG1P_1])
 
 
 def test_copy_is_independent():
@@ -177,7 +181,7 @@ def test_copy_is_independent():
     c = s.copy()
     c.push(Tx(T0 + DAY, 20.0, "fraud_A", "home", 40.0, -80.0))
     assert len(s) == 1 and len(c) == 2
-    assert s.aggregates(T0 + DAY)[2] == 1
+    assert s.aggregates(T0 + DAY, 1.0, "home")[2] == 1
 
 
 def _serving_for(df, tau, p):
@@ -234,3 +238,71 @@ def test_decide_with_real_model(sparkov_like):
         serving.decide(state, tx)
         times.append(time.perf_counter() - a)
     assert np.median(times) < 0.020  # loose smoke bound; ~1 ms expected on CPU
+
+
+# ---- behavioural features (Task 23) ----------------------------------------------------------------
+
+def _push(s, t, amt, cat):
+    s.push(Tx(t, float(amt), "fraud_A", cat, 40.0, -80.0))
+
+
+def test_behavioural_state_boundaries():
+    from fraudaudit.features.columns import AGG_COLUMNS as A
+    i = {c: A.index(c) for c in ("cnt_1h", "sum_1h", "cnt_cat_24h", "amt_ratio_30d", "mean_amt_30d")}
+    s = CardState(_profile())
+    _push(s, T0 - DAY - SEC, 1000, "travel")  # outside 24 h
+    _push(s, T0 - DAY, 30, "travel")  # exactly 24 h: inside
+    _push(s, T0 - 3600 * SEC - SEC, 50, "travel")  # outside 1 h
+    _push(s, T0 - 3600 * SEC, 10, "home")  # exactly 1 h: inside
+    _push(s, T0 - 60 * SEC, 5, "travel")
+    _push(s, T0, 999, "travel")  # same second: never counted
+    agg = s.aggregates(T0, 90.0, "travel")
+    assert agg[i["cnt_1h"]] == 2 and agg[i["sum_1h"]] == pytest.approx(15.0)
+    assert agg[i["cnt_cat_24h"]] == 3  # 30 (T0 - 1 d), 50, 5; not 1000, not home, not the same-second op
+    assert agg[i["amt_ratio_30d"]] == pytest.approx(np.log1p(90.0 / agg[i["mean_amt_30d"]]))
+    assert s.aggregates(T0, 90.0, "home")[i["cnt_cat_24h"]] == 1
+    assert s.aggregates(T0, 90.0, "kids_pets")[i["cnt_cat_24h"]] == 0
+
+
+def test_behavioural_categories_survive_truncation_copy_and_history(sparkov_like):
+    s = CardState(_profile())
+    _push(s, T0, 10, "travel")
+    _push(s, T0 + 10 * DAY, 20, "home")
+    _push(s, T0 + 31 * DAY, 30, "home")  # drops the first op
+    k = AGG_COLUMNS.index("cnt_cat_24h")
+    assert len(s) == 2 and s._c == ["home", "home"]
+    c = s.copy()
+    _push(c, T0 + 31 * DAY + SEC, 1, "home")
+    assert s._c == ["home", "home"] and c._c == ["home", "home", "home"]
+    assert c.aggregates(T0 + 31 * DAY + 2 * SEC, 1.0, "home")[k] == 2
+    assert s.aggregates(T0 + 31 * DAY + 2 * SEC, 1.0, "home")[k] == 1
+    # from_history keeps every operation's category
+    df = sparkov_like
+    card = df["cc_num"].iloc[0]
+    g = df[df["cc_num"] == card]
+    at = g["ts"].iloc[-1]
+    st = CardState.from_history(profile_of(df, card), df, at=at)
+    want = g[(g["ts"] < at) & (g["ts"] >= at - 30 * DAY)].sort_values("ts", kind="stable")
+    assert st._c == want["category"].tolist()
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_serving_matches_batch_on_dense_cards(seed):
+    """Dense bursty cards (many 1 h and same-category neighbours, exact boundaries, same-second ops):
+    the incremental state equals the batch aggregates (counts exactly)."""
+    from fraudaudit.features.aggregates import batch_aggregates
+    from test_aggregates import _dense
+
+    df = _dense(seed)
+    want = batch_aggregates(df).to_numpy()
+    got = np.empty_like(want)
+    for card, g in df.sort_values("ts", kind="stable").groupby("cc_num", sort=False):
+        s = CardState(_profile(int(card)))
+        for idx, r in zip(g.index, g.itertuples(index=False)):
+            got[idx] = s.aggregates(r.ts, r.amt, r.category).astype(np.float32)
+            _push(s, r.ts, r.amt, r.category)
+    cnt = [AGG_COLUMNS.index(c) for c in ("cnt_1d", "cnt_7d", "cnt_30d", "secs_since_prev", "cnt_1h", "cnt_cat_24h")]
+    flt = [AGG_COLUMNS.index(c) for c in ("mean_amt_1d", "mean_amt_7d", "mean_amt_30d", "sum_1h", "amt_ratio_30d")]
+    np.testing.assert_array_equal(got[:, cnt], want[:, cnt])
+    np.testing.assert_allclose(got[:, flt], want[:, flt], rtol=1e-6, atol=1e-4)
+    assert (want[:, AGG_COLUMNS.index("cnt_cat_24h")] > 2).any()

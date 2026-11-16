@@ -363,11 +363,11 @@ def test_original_stream_includes_later_real_ops(df):
             for x in (0, 10, 20, 30, 40)]  # op 0, then a burst of 4 later ops
     at = s + pd.Timedelta(hours=5)
     st = original_stream_state(ctx, real, 0, at)
-    assert st.aggregates(at)[0] == 4  # cnt_1d: the 4 later ops, not op 0 itself
+    assert st.aggregates(at, 1.0, "home")[0] == 4  # cnt_1d: the 4 later ops, not op 0 itself
     st2 = original_stream_state(ctx, real, 2, at)
-    assert st2.aggregates(at)[0] == 4  # ops 0, 1, 3, 4
+    assert st2.aggregates(at, 1.0, "home")[0] == 4  # ops 0, 1, 3, 4
     early = s + pd.Timedelta(seconds=25)
-    assert original_stream_state(ctx, real, 0, early).aggregates(early)[0] == 2  # only ops 1, 2 are before
+    assert original_stream_state(ctx, real, 0, early).aggregates(early, 1.0, "home")[0] == 2  # only ops 1, 2 are before
 
 
 def test_single_tx_shifted_past_burst_sees_it(df, tm, tms):

@@ -152,7 +152,8 @@ def test_false_block_rate_windows_reset():
 def real_model_dir(tmp_path_factory):
     from conftest import make_sparkov_like
     from fraudaudit.model.pipeline import train_model
-    model, _ = train_model(make_sparkov_like(n_cards=12), seed=0, epochs=1)
+    # 16 cards: with the 38-feature set a 1-epoch model on 12 cards saturates val scores (tau = inf)
+    model, _ = train_model(make_sparkov_like(n_cards=16), seed=0, epochs=1)
     d = tmp_path_factory.mktemp("model")
     model.save(d, meta={"seed": 0})
     return d
@@ -162,7 +163,7 @@ def test_false_block_rate_identical_for_n_jobs(real_model_dir):
     from conftest import make_sparkov_like
     from fraudaudit.model.artifacts import load_artifacts
     from fraudaudit.model.pipeline import FraudModel
-    df = make_sparkov_like(n_cards=12)
+    df = make_sparkov_like(n_cards=16)
     model = FraudModel.from_artifacts(load_artifacts(real_model_dir))
     kw = dict(tau_after_decline=model.tau / 2, model_dir=real_model_dir)
     a = false_block_rate(df, model, model.tau, 2, n_jobs=1, **kw)

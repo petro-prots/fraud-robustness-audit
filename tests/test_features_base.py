@@ -20,7 +20,7 @@ def _row(sparkov_like, **over):
     return r
 
 
-def test_27_base_34_feature_columns(sparkov_like):
+def test_27_base_38_feature_columns(sparkov_like):
     assert len(BASE_COLUMNS) == 27 and len(set(BASE_COLUMNS)) == 27
     assert BASE_COLUMNS[-2:] == ("hour_sin", "hour_cos")
     enc = BaseEncoder().fit(_fit_df(sparkov_like))
@@ -29,7 +29,7 @@ def test_27_base_34_feature_columns(sparkov_like):
     assert (out.dtypes == "float32").all()
     assert out.index.equals(sparkov_like.index)
     assert not out.isna().any().any()
-    assert len(FEATURE_COLUMNS) == 34
+    assert len(FEATURE_COLUMNS) == 38
 
 
 def test_no_calendar_features():

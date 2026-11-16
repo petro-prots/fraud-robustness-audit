@@ -1,4 +1,4 @@
-"""Serving path: the 34 features of one operation from the card state, and the decision.
+"""Serving path: the 38 features of one operation from the card state, and the decision.
 
 The 27 base features come from a numpy path for a single operation that reproduces
 ``BaseEncoder.transform`` value for value (pinned by ``tests/test_serving.py``); building a
@@ -77,10 +77,10 @@ class Serving:
         return out
 
     def features(self, state: CardState, tx: Tx) -> np.ndarray:
-        """FEATURE_COLUMNS (float32, length 34) of ``tx`` given the card history in ``state``."""
+        """FEATURE_COLUMNS (float32, length 38) of ``tx`` given the card history in ``state``."""
         f = np.empty(len(FEATURE_COLUMNS), dtype=np.float32)
         f[:_N_BASE] = self._base(state, tx)
-        f[_N_BASE:] = state.aggregates(tx.ts)
+        f[_N_BASE:] = state.aggregates(tx.ts, tx.amt, tx.category)
         if not np.isfinite(f).all():
             bad = [FEATURE_COLUMNS[i] for i in np.flatnonzero(~np.isfinite(f))]
             raise ValueError(f"non-finite features: {bad}")

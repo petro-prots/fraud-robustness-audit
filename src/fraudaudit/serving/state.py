@@ -2,7 +2,10 @@
 
 Same contract as the batch path (``features/aggregates.py``): an earlier operation j counts for a
 query at time t iff ``t_j < t`` (same-second operations never see each other, even if already
-pushed) and ``t_j >= t - w``; ``secs_since_prev`` is capped at ``NO_PREV_SECS``.
+pushed) and ``t_j >= t - w``; ``secs_since_prev`` is capped at ``NO_PREV_SECS``. The behavioural
+features (Task 23) follow the same rule: ``cnt_1h``/``sum_1h`` over ``[t - 1 h, t)``, ``cnt_cat_24h`` over the
+operations of the queried operation's category in ``[t - 24 h, t)`` (the state keeps every operation's
+category), ``amt_ratio_30d`` from the queried amount and ``mean_amt_30d``.
 
 Time only moves forward. ``now`` is the latest of ``at`` (``from_history``) and every pushed
 timestamp; queries and pushes before ``now`` raise ``ValueError``. Because of that, ``push`` may
@@ -17,7 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from ..features.aggregates import NO_PREV_SECS, WINDOW_DAYS
+from ..features.aggregates import CAT_WINDOW_SECS, HOUR_SECS, NO_PREV_SECS, WINDOW_DAYS, amt_ratio
 from ..features.columns import AGG_COLUMNS
 
 _NS = 1_000_000_000
@@ -25,6 +28,9 @@ _DAY_NS = 86_400 * _NS
 _WINDOWS_NS = tuple(d * _DAY_NS for d in WINDOW_DAYS)
 _KEEP_NS = max(_WINDOWS_NS)  # 30 days
 _NO_PREV_NS = NO_PREV_SECS * _NS
+_HOUR_NS = HOUR_SECS * _NS
+_CAT_NS = CAT_WINDOW_SECS * _NS
+_COL = {c: i for i, c in enumerate(AGG_COLUMNS)}
 
 
 @dataclass(frozen=True)
@@ -72,12 +78,14 @@ def profile_of(df: pd.DataFrame, cc_num: int) -> CardProfile:
 
 
 class CardState:
-    """Owner profile + operations of the last 30 days as time-ordered parallel lists ``ts_ns``, ``amt``."""
+    """Owner profile + operations of the last 30 days as time-ordered parallel lists ``ts_ns``, ``amt``,
+    ``category``."""
 
     def __init__(self, profile: CardProfile) -> None:
         self.profile = profile
         self._t: list[int] = []  # ns, non-decreasing
         self._a: list[float] = []
+        self._c: list[str] = []
         self._now: int | None = None  # ns; None = no time seen yet
 
     @classmethod
@@ -91,9 +99,11 @@ class CardState:
         t = h["ts"].to_numpy(dtype="datetime64[ns]").view("int64")
         m = (t < at_ns) & (t >= at_ns - _KEEP_NS)
         t, amt = t[m], h["amt"].to_numpy(dtype=np.float64)[m]
+        cat = h["category"].astype(str).to_numpy()[m]
         order = np.argsort(t, kind="stable")
         s._t = t[order].tolist()
         s._a = amt[order].tolist()
+        s._c = cat[order].tolist()
         s._now = at_ns
         return s
 
@@ -105,8 +115,9 @@ class CardState:
             raise ValueError(f"{what} at {pd.Timestamp(ts_ns)} is before the state time "
                              f"{pd.Timestamp(self._now)}; time only moves forward")
 
-    def aggregates(self, ts: pd.Timestamp) -> np.ndarray:
-        """AGG_COLUMNS for an operation at ``ts`` (float64, length 7); the state is not changed."""
+    def aggregates(self, ts: pd.Timestamp, amt: float, category: str) -> np.ndarray:
+        """AGG_COLUMNS for an operation of ``amt`` in ``category`` at ``ts`` (float64, length 11); the state
+        is not changed."""
         t = pd.Timestamp(ts).value
         self._check_time(t, "query")
         times, amts = self._t, self._a
@@ -120,6 +131,13 @@ class CardState:
                 out[3 + k] = sum(amts[lo:hi]) / n
         gap = t - times[hi - 1] if hi > 0 else _NO_PREV_NS
         out[6] = min(gap, _NO_PREV_NS) / _NS
+        lo = bisect_left(times, t - _HOUR_NS, 0, hi)
+        out[_COL["cnt_1h"]] = hi - lo
+        out[_COL["sum_1h"]] = sum(amts[lo:hi])
+        lo = bisect_left(times, t - _CAT_NS, 0, hi)
+        category = str(category)
+        out[_COL["cnt_cat_24h"]] = sum(1 for c in self._c[lo:hi] if c == category)
+        out[_COL["amt_ratio_30d"]] = amt_ratio(float(amt), out[_COL["mean_amt_30d"]])
         return out
 
     def push(self, tx: Tx) -> None:
@@ -128,13 +146,14 @@ class CardState:
         self._check_time(t, "push")
         self._t.append(t)
         self._a.append(float(tx.amt))
+        self._c.append(str(tx.category))
         self._now = t
         drop = bisect_left(self._t, t - _KEEP_NS)  # keep t_j >= now - 30d
         if drop:
-            del self._t[:drop], self._a[:drop]
+            del self._t[:drop], self._a[:drop], self._c[:drop]
 
     def copy(self) -> "CardState":
         c = CardState(self.profile)
-        c._t, c._a = list(self._t), list(self._a)
+        c._t, c._a, c._c = list(self._t), list(self._a), list(self._c)
         c._now = self._now
         return c

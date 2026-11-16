@@ -1,6 +1,7 @@
 """Fixed feature order of the model: 27 base features (the 27 of the bachelor model without the
 calendar features ``trans_month``/``trans_year``, + time of day ``hour_sin``/``hour_cos``) and
-7 windowed aggregates.
+11 windowed aggregates (the 7 of the plan + 4 pre-registered behavioural features of Task 23:
+``cnt_1h``, ``sum_1h``, ``cnt_cat_24h``, ``amt_ratio_30d``) - 38 features.
 
 The calendar features were dropped (ruling R23): ``trans_year`` x ``trans_month`` put the test
 period (Jun-Dec 2020) outside the training support, so models extrapolated on test."""
@@ -25,6 +26,8 @@ BASE_COLUMNS: tuple[str, ...] = (
 
 AGG_COLUMNS: tuple[str, ...] = (
     "cnt_1d", "cnt_7d", "cnt_30d", "mean_amt_1d", "mean_amt_7d", "mean_amt_30d", "secs_since_prev",
+    # behavioural features (Task 23): short window, category velocity, amount deviation
+    "cnt_1h", "sum_1h", "cnt_cat_24h", "amt_ratio_30d",
 )
 
 FEATURE_COLUMNS: tuple[str, ...] = BASE_COLUMNS + AGG_COLUMNS

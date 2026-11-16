@@ -1,13 +1,14 @@
 """Training and inference of the bachelor fraud-detection model.
 
 Architecture and hyperparameters follow the bachelor listings exactly: StandardScaler ->
-IsolationForest flag (``predict(X) > -1``) as the last (35th) input -> MLP
+IsolationForest flag (``predict(X) > -1``) as the last (39th) input -> MLP
 (Dense 55 relu, BN, Dense 26 sigmoid, BN, Dense 12 sigmoid, BN, Dense 1 sigmoid),
 Adamax(0.01), BinaryCrossentropy, 20 epochs, batch 32 (Keras default).
 
-Feature set ``bachelor+hour-calendar`` (rulings R16, R23): the 27 bachelor base features without
-the calendar features ``trans_month``/``trans_year`` (25), the time of day ``hour_sin``/``hour_cos``
-and 7 windowed aggregates (34 features).
+Feature set ``bachelor+hour-calendar+behav`` (rulings R16, R23, Task 23): the 27 bachelor base features
+without the calendar features ``trans_month``/``trans_year`` (25), the time of day ``hour_sin``/``hour_cos``,
+7 windowed aggregates and 4 behavioural features ``cnt_1h``, ``sum_1h``, ``cnt_cat_24h``, ``amt_ratio_30d``
+(38 features).
 
 Data-handling corrections of the approved design:
 
@@ -42,8 +43,8 @@ from .artifacts import Artifacts, save_artifacts
 TARGET_FPR = 0.01
 EPOCHS = 20
 BATCH_SIZE = 32  # Keras default, as in the listing (mlp.fit without batch_size)
-N_INPUTS = len(FEATURE_COLUMNS) + 1  # 34 features + IsolationForest flag
-FEATURE_SET = "bachelor+hour-calendar"  # 25 bachelor base features + hour_sin/hour_cos + 7 aggregates
+N_INPUTS = len(FEATURE_COLUMNS) + 1  # 38 features + IsolationForest flag
+FEATURE_SET = "bachelor+hour-calendar+behav"  # 25 bachelor base + hour_sin/hour_cos + 7 aggregates + 4 behavioural
 PERIODS = ("fit", "val", "test")
 
 
@@ -73,7 +74,7 @@ def iforest_flag(iforest: IsolationForest, Xs: np.ndarray) -> np.ndarray:
 
 
 class FraudModel:
-    """scaler -> IsolationForest flag -> MLP; ``predict_proba`` takes the 34 FEATURE_COLUMNS."""
+    """scaler -> IsolationForest flag -> MLP; ``predict_proba`` takes the 38 FEATURE_COLUMNS."""
 
     def __init__(self, *, mlp: keras.Model, scaler: StandardScaler, iforest: IsolationForest,
                  encoder: BaseEncoder, tau: float) -> None:
@@ -113,10 +114,10 @@ class Datasets:
     encoder: BaseEncoder
     scaler: StandardScaler
     iforest: IsolationForest
-    F: dict[str, np.ndarray]  # period -> (n, 34) float32 features, unbalanced
+    F: dict[str, np.ndarray]  # period -> (n, 38) float32 features, unbalanced
     y: dict[str, np.ndarray]
     rows: dict[str, np.ndarray]  # period -> source `row` ids
-    X_train: np.ndarray  # balanced fit rows, scaled + flag, (n, 35)
+    X_train: np.ndarray  # balanced fit rows, scaled + flag, (n, 39)
     y_train: np.ndarray
     train_rows: np.ndarray
 

@@ -5,9 +5,9 @@ After the ML Test Score principle "training and serving features compute the sam
 (serving path) and compared with ``features(df, encoder)`` (batch path) on the same rows.
 
 Tolerance: integer-valued columns (``cnt_*``, ``secs_since_prev``) and every base feature must be
-exactly equal; only the three float means (``mean_amt_*``) get ``atol`` (+ 1e-6 relative, the same
-as ``np.allclose`` in ``tests/test_serving.py``), because float32 rounding of a float64 mean may
-differ by one ulp between a summation over a window and a running list.
+exactly equal; only the float sums and means (``mean_amt_*``, ``sum_1h``, ``amt_ratio_30d``) get ``atol``
+(+ 1e-6 relative, the same as ``np.allclose`` in ``tests/test_serving.py``), because float32 rounding of a
+float64 sum may differ by one ulp between a difference of cumulative sums and a summation over a list.
 
 Decisions: every replayed operation goes through ``Serving.decide`` (single-row compiled call)
 and is compared with the batch decision ``p_batch >= tau`` (a flip is a tie, counted in ``n_ties`` and not a
@@ -32,7 +32,8 @@ from .model.pipeline import features
 from .serving.core import Serving
 from .serving.state import CardState, Tx, profile_of
 
-_MEAN_IDX = np.array([FEATURE_COLUMNS.index(c) for c in AGG_COLUMNS if c.startswith("mean_amt_")])
+FLOAT_AGG_COLUMNS = tuple(c for c in AGG_COLUMNS if c.startswith("mean_amt_") or c in ("sum_1h", "amt_ratio_30d"))
+_MEAN_IDX = np.array([FEATURE_COLUMNS.index(c) for c in FLOAT_AGG_COLUMNS])
 _RTOL = 1e-6
 _P_TIE = 1e-4  # score noise bound (same as the mean_amt atol): real model, 99k ops, batch vs single-row |dp| reaches 5e-6
 _REPLAY_COLS = ["cc_num", "ts", "row", "amt", "merchant", "category", "merch_lat", "merch_long",
@@ -147,7 +148,7 @@ def summary_markdown(rep: SkewReport, atol: float) -> str:
         "",
         f"- Cards: {rep.n_cards}, operations: {rep.n_tx}",
         f"- Largest discrepancy among all {len(rep.max_abs_diff)} features: `{worst[0]}` = {worst[1]:.3g} "
-        f"(tolerance for means only: {atol:g}, the rest exact)",
+        f"(tolerance for float sums and means only: {atol:g}, the rest exact)",
         f"- Decision mismatches: {rep.decision_mismatches}; largest |Δp|: {rep.max_abs_p_diff:.3g}",
         f"- Ties ignored (decision flips within float32 noise of tau, |dp| <= {_P_TIE:g}): {rep.n_ties}",
         f"- Result: **{'PASS' if rep.passed else 'FAIL'}**",
