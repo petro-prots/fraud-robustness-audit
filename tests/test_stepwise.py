@@ -385,17 +385,21 @@ def test_harden_rejects_stepwise_for_generation(df, tm):
     with pytest.raises(ValueError, match="held-out"):
         hmod.check_generation_attack("stepwise")
     with pytest.raises(ValueError, match="only"):
-        hmod.check_generation_attack("random")
+        hmod.check_generation_attack("nonsense")
     hmod.check_generation_attack("es")
+    hmod.check_generation_attack("random")
+    with pytest.raises(ValueError, match="held-out"):
+        hmod.units(gen_attacks=("es", "random", "stepwise"))
     with pytest.raises(ValueError, match="held-out"):  # before any data or model work
-        hmod.harden(df, None, tm, None, rounds=1, model_dir="nowhere", out_dir="nowhere", gen_attack="stepwise")
+        hmod.harden(df, None, tm, None, rounds=1, model_dir="nowhere", out_dir="nowhere",
+                    gen_attacks=("es", "stepwise"))
 
 
-def test_cli_harden_gen_attack_flag():
+def test_cli_harden_gen_attacks_flag():
     from fraudaudit.cli import build_parser
-    a = build_parser().parse_args(["harden", "--gen-attack", "stepwise"])
-    assert a.gen_attack == "stepwise"
-    assert build_parser().parse_args(["harden"]).gen_attack == "es"
+    a = build_parser().parse_args(["harden", "--gen-attacks", "es,stepwise"])
+    assert a.gen_attacks == ["es", "stepwise"]
+    assert build_parser().parse_args(["harden"]).gen_attacks == ["es", "random"]
 
 
 # ---- audit dispatch -------------------------------------------------------------------------------------
@@ -471,13 +475,13 @@ def test_gate_summary_marks_stepwise_held_out(audit_df, audit_model, tm, audit_m
                      confidence=0.95, one_sided=True, spares_period="test")
     results = {"stepwise/1": r}
     md = summary_markdown(decide(cfg, results), results, {}, MerchantTable.from_df(audit_df))
-    assert "stepwise (held-out, never used in hardening)" in md
-    assert "Worst case: attack `stepwise` (held-out, never used in hardening)" in md
+    assert "stepwise (held-out, never generates hardening data)" in md
+    assert "Worst case: attack `stepwise` (held-out, never generates hardening data)" in md
     assert "Closed-loop stepwise policy" in md
 
 
 def test_cli_harden_refuses_stepwise_before_loading(tmp_path, capsys):
     from fraudaudit.cli import main
-    rc = main(["harden", "--gen-attack", "stepwise", "--data", str(tmp_path / "none"), "--out", str(tmp_path / "o")])
+    rc = main(["harden", "--gen-attacks", "stepwise", "--data", str(tmp_path / "none"), "--out", str(tmp_path / "o")])
     assert rc == 2 and "held-out" in capsys.readouterr().err
     assert not (tmp_path / "o").exists()

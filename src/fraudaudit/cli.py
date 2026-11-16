@@ -67,26 +67,28 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--seed", type=int, default=42)
     cal.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
 
-    hard = sub.add_parser("harden", help="round-based adversarial retraining (ES examples on the H half of the "
-                                          "fit episodes); writes every round's model and harden-report.json/.md")
+    hard = sub.add_parser("harden", help="round-based adversarial retraining (ES and random-search examples on the "
+                                          "H half of the fit episodes); writes every round's model and "
+                                          "harden-report.json/.md")
     hard.add_argument("--data", type=Path, default=Path("data"))
     hard.add_argument("--model", type=Path, default=Path("models"), help="input model (artifact directory)")
     hard.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
     hard.add_argument("--gate", type=Path, default=Path("gate.yaml"),
-                      help="δ (early stop), confidence, one_sided; read only")
+                      help="δ (early stop), attacks of the val mini-audit, confidence, one_sided; read only")
     hard.add_argument("--out", type=Path, default=Path("models-harden"),
                       help="round-{r}/ model directories and harden-report.json/.md")
-    hard.add_argument("--rounds", type=int, default=3)
+    hard.add_argument("--rounds", type=int, default=5, help="at most this many rounds (early stop at val ≤ δ)")
     hard.add_argument("--seed", type=int, default=42)
     hard.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
     hard.add_argument("--epochs", type=int, default=20, help="20 as in train; lower only for probes")
     hard.add_argument("--budget-ops", type=int, default=20000,
-                      help="ES reconnaissance budget per generation unit (harden_budget_ops)")
+                      help="reconnaissance budget per generation unit, ES and random alike (harden_budget_ops)")
     hard.add_argument("--share-among-fraud", type=float, default=0.5,
                       help="adversarial rows / all fraud rows of fit before balancing (design §11)")
     hard.add_argument("--no-baseline-audit", action="store_true", help="skip the round-0 mini-audit of the input model")
-    hard.add_argument("--gen-attack", default="es",
-                      help="attack that generates hardening data: only es; the held-out stepwise attack is refused")
+    hard.add_argument("--gen-attacks", type=_names, default=["es", "random"],
+                      help="comma-separated attacks that generate hardening data (default es,random); the held-out "
+                           "stepwise attack is refused")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -95,6 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="JSONL: cc_num, ts, amt, merchant, category, merch_lat, merch_long; in time order")
     decide.add_argument("--output", type=Path, default=None, help="JSONL output (default: stdout)")
     return parser
+
+
+def _names(text: str) -> list[str]:
+    """``--gen-attacks``: comma-separated names (validated by ``harden.check_generation_attack``)."""
+    vals = [x.strip() for x in text.split(",") if x.strip()]
+    if not vals:
+        raise argparse.ArgumentTypeError(f"expected comma-separated attack names, got {text!r}")
+    return vals
 
 
 def _deltas(text: str) -> list[float]:
@@ -316,7 +326,8 @@ def cmd_harden(args: argparse.Namespace) -> int:
 
     t0 = time.perf_counter()
     try:
-        check_generation_attack(args.gen_attack)
+        for a in args.gen_attacks:
+            check_generation_attack(a)
         gate_bytes = args.gate.read_bytes()
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
@@ -331,7 +342,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
                                   epochs=args.epochs, baseline_audit=not args.no_baseline_audit,
                                   share_among_fraud=args.share_among_fraud,
                                   threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True),
-                                  gen_attack=args.gen_attack)
+                                  gen_attacks=tuple(args.gen_attacks))
     meta = {"seed": int(args.seed), **git_info(), "input_model": str(args.model),
             "input_model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),
             "threat_sha256": hashlib.sha256(args.threat.read_bytes()).hexdigest(), "gate_file": str(args.gate),

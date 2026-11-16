@@ -199,7 +199,7 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
                      "\"Recommendations\" section.")
     lines += ["",
               f"Worst case: attack `{w_attack}`"
-              + (" (held-out, never used in hardening)" if w_attack in HELD_OUT_ATTACKS else "")
+              + (" (held-out, never generates hardening data)" if w_attack in HELD_OUT_ATTACKS else "")
               + f", attack seed {w_seed}; {_side(w)} upper {conf} % bound of the "
               f"VER_adv − VER_clean uplift {_pct(up.value)} against "
               + (f"δ = {_pct(delta)}." if delta is not None else "an unset δ."),
@@ -235,7 +235,10 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               "attack's random stream changes. The gate takes the worst run."
               + (" The stepwise attack is held-out: a closed-loop policy that chooses each next operation after "
                  "the bank's decision on the previous one; it never generated hardening data, so it checks whether "
-                 "robustness transfers to an attacker with a different search principle."
+                 "robustness transfers to an attacker with a different search principle. With `max_declines = 1` "
+                 "the first decline blocks the card, so the policy is effectively open-loop there: its strength "
+                 "comes from a low-dimensional structured search space (geometric amounts, a fixed cadence, one "
+                 "merchant category), not from adapting to declines."
                  if any(parse_run_key(k)[0] in HELD_OUT_ATTACKS for k in results) else ""), "",
               f"| attack | attack seed | VER_adv [{conf} %, two-sided] | uplift "
               + (f"(one-sided upper {conf} % bound)" if w.meta.get("one_sided") else f"[{conf} %]")
@@ -246,7 +249,7 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
         a, s = parse_run_key(key)
         mark = "**⚠ worst**" if key == worst_key else ""
         if a in HELD_OUT_ATTACKS:
-            a = f"{a} (held-out, never used in hardening)"
+            a = f"{a} (held-out, never generates hardening data)"
         lines.append(f"| {a} | {s} | {_ci(r.ver_adv)} | {_uplift(r)} | {_pct(r.asr)} "
                      f"({r.meta['n_success']} of {r.n_targets}) | {r.recon_ops} | {r.meta['recon']['evals']} | {mark} |")
 

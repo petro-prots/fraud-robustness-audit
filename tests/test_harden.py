@@ -18,7 +18,7 @@ from fraudaudit.threat import MerchantTable, ThreatModel, contexts_for
 
 ROOT = Path(__file__).resolve().parents[1]
 TM_PATH = ROOT / "threat-models" / "realistic.yaml"
-UNITS = ((1, 1), (2, 1), (1, 3))  # (ES seed, max_declines): small, both max_declines values
+UNITS = (("es", 1, 1), ("es", 2, 1), ("es", 1, 3), ("random", 1, 1), ("random", 2, 3))  # (attack, seed, md)
 
 
 @pytest.fixture(scope="module")
@@ -34,7 +34,7 @@ def tm():
 
 @pytest.fixture(scope="module")
 def gate_cfg():
-    return GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.10, attacks=["random", "es"],
+    return GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.10, attacks=["random", "es", "stepwise"],
                       attack_seeds=[1, 2, 3], confidence=0.95, one_sided=True, spares_period="fit")
 
 
@@ -198,7 +198,8 @@ def test_generation_identical_for_n_jobs(df, model, model_dir, tm):
     assert a == b
     assert sum(u["n_slots"] for u in a) == len(slots)
     assert all(u["n_feasible_ops"] == u["n_ops"] for u in a)  # every generated operation is in the threat model
-    assert {(u["seed"], u["max_declines"]) for u in a} == set(UNITS)
+    assert [(u["attack"], u["seed"], u["max_declines"]) for u in a] == list(UNITS)
+    assert {u["attack"] for u in a} == {"es", "random"}
     for u in a:
         for e in u["episodes"]:
             ts = [pd.Timestamp(o["ts"]) for o in e["ops"]]
@@ -213,8 +214,15 @@ def test_round_reports_and_files(hardened):
     r0, r1 = reports
     assert r0.n_adv_rows == 0 and r1.model_dir == str(out / "round-1")
     assert final.tau == r1.tau
-    for r in reports:
-        assert set(r.val_uplift) == {1} and r.val_uplift_worst_upper == r.val_uplift[1]["upper"]
+    for r in reports:  # the mini-audit is the gate's 3-attack ensemble (stepwise only measures)
+        assert set(r.val_uplift) == {"random/1", "es/1", "stepwise/1"}
+        assert r.val_uplift_worst_upper == max(v["upper"] for v in r.val_uplift.values())
+        assert r.val_uplift[r.val_uplift_worst_run]["upper"] == r.val_uplift_worst_upper
+        assert set(r.val_uplift_by_attack) == {"random", "es", "stepwise"}
+        assert r.val_uplift_by_attack["stepwise"]["worst_upper"] == r.val_uplift["stepwise/1"]["upper"]
+    assert info["mini_audit_attacks"] == ["random", "es", "stepwise"] and info["gen_attacks"] == ["es", "random"]
+    # generation used both attacks, never stepwise: every adversarial row comes from an es or random unit
+    assert {u["attack"] for u in r1.units} == {"es", "random"} and len(r1.units) == 8
     assert (out / "round-1" / "adversarial-rows.csv").exists()
     meta = {"input_model": "m", "threat_file": "t", "gate_file": "g", "delta": 0.1, "rounds": 1, "seed": 7,
             "git_sha": "x", "git_dirty": False, "platform": "p", "wall_seconds": 1.0, "threat_sha256": "a",
@@ -223,6 +231,7 @@ def test_round_reports_and_files(hardened):
     assert data["final_round"] == 1 and json.loads((out / "harden-report.json").read_text())["final_round"] == 1
     md = (out / "harden-report.md").read_text()
     assert md.startswith("# Adversarial hardening") and "| 1 |" in md and "held-out" in md
+    assert "random search" in md and "stepwise" in md and "worst upper per attack" in md
     assert "Test false positives (diagnostic only)" in md and "| month |" in md and "| category |" in md
     assert "df" not in data["data"]
 
@@ -230,23 +239,29 @@ def test_round_reports_and_files(hardened):
 def test_multi_round_reload_replay_and_early_stop(df, model, model_dir, tm, gate_cfg, tmp_path):
     common = dict(seed=7, model_dir=model_dir, n_jobs=1, budget_ops=40, epochs=1, gen_seeds=(1,),
                   gen_max_declines=(1, 3), mini_audit_seeds=(1,), baseline_audit=False)
-    final, reports, info = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=None), rounds=2,
+    # without δ no early stop: exactly the 5-round cap (the default), never more
+    assert hmod.ROUNDS == 5
+    final, reports, info = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=None),
                                        out_dir=tmp_path / "a", **common)
-    assert [r.round for r in reports] == [1, 2]                      # no early stop without δ
-    r2 = reports[-1]
-    assert r2.model_dir == str(tmp_path / "a" / "round-2") and final.tau == r2.tau
-    reloaded = FraudModel.from_artifacts(load_artifacts(tmp_path / "a" / "round-2"))
+    assert [r.round for r in reports] == [1, 2, 3, 4, 5]
+    assert not (tmp_path / "a" / "round-6").exists()
+    r5 = reports[-1]
+    assert r5.model_dir == str(tmp_path / "a" / "round-5") and final.tau == r5.tau  # final = last round reached
+    reloaded = FraudModel.from_artifacts(load_artifacts(tmp_path / "a" / "round-5"))
     assert reloaded.tau == final.tau
-    assert set(r2.n_rows_by_generation_round) == {"1", "2"}         # replay of both generation rounds
-    q = hmod.round_quotas(r2.quota, 2)
-    for g, n in r2.n_rows_by_generation_round.items():
+    assert set(r5.n_rows_by_generation_round) == {"1", "2", "3", "4", "5"}  # replay of every generation round
+    q = hmod.round_quotas(r5.quota, 5)
+    for g, n in r5.n_rows_by_generation_round.items():
         assert n <= q[int(g)] + tm.k_max / 2
-    assert sum(r2.n_rows_by_generation_round.values()) == r2.n_adv_rows
+    assert sum(r5.n_rows_by_generation_round.values()) == r5.n_adv_rows
+    for r in reports:
+        assert {u["attack"] for u in r.units} == {"es", "random"}
+        assert set(r.val_uplift) == {"random/1", "es/1", "stepwise/1"}
     fp = info["fp_diagnostic"] if "fp_diagnostic" in info else info["test_fp_diagnostic"]
     for name in ("baseline", "final"):
         assert sum(v[name]["fp"] for v in fp["by_month"].values()) == fp["total"][name]["fp"]
         assert sum(v[name]["fp"] for v in fp["by_category"].values()) == fp["total"][name]["fp"]
-    _, early, _ = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=10.0), rounds=2,
+    _, early, _ = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=10.0),
                               out_dir=tmp_path / "b", **common)
     assert [r.round for r in early] == [1]                           # upper bound <= δ after round 1: stop
     assert not (tmp_path / "b" / "round-2").exists()
@@ -255,6 +270,16 @@ def test_multi_round_reload_replay_and_early_stop(df, model, model_dir, tm, gate
 def test_cli_harden_parser_defaults():
     from fraudaudit.cli import build_parser
     a = build_parser().parse_args(["harden"])
-    assert str(a.out) == "models-harden" and a.rounds == 3 and a.budget_ops == 20000 and a.epochs == 20
+    assert str(a.out) == "models-harden" and a.rounds == 5 and a.budget_ops == 20000 and a.epochs == 20
     assert str(a.model) == "models" and str(a.gate) == "gate.yaml" and a.seed == 42
-    assert a.share_among_fraud == 0.5 and len(hmod.units()) == 32
+    assert a.share_among_fraud == 0.5 and a.gen_attacks == ["es", "random"]
+
+
+def test_generation_units_es_and_random():
+    """64 units: attack {es, random} × seeds 1..16 × max_declines {1, 3}; stepwise never generates."""
+    u = hmod.units()
+    assert len(u) == 64 and len(set(u)) == 64
+    assert {a for a, _, _ in u} == {"es", "random"} and hmod.GEN_ATTACKS == ("es", "random")
+    assert {s for _, s, _ in u} == set(range(1, 17)) and {md for _, _, md in u} == {1, 3}
+    assert sum(a == "random" for a, _, _ in u) == 32
+    assert hmod.slot_assignment(130, 64, 1)[0] == [0, 64, 128]

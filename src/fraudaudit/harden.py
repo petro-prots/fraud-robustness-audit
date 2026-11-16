@@ -15,17 +15,18 @@ A of the real episode, keeping a slot only if no fraud operation of the card lie
 (neither with each other nor with real fraud), so the batch features after insertion see the same card history
 as the generation context (the card's history before the slot, as in the audit) – except the card's own
 legitimate operations inside the episode window, which are in the batch features but not in the generation
-state (the audit's ``REPLAY`` assumption) – and no ``val`` row's aggregates change. Several attacks on the one real episode start would pile up in one window
-and inflate the count aggregates of every inserted row.
+state (the audit's ``REPLAY`` assumption) – and no ``val`` row's aggregates change. Several attacks on the one
+real episode start would pile up in one window and inflate the count aggregates of every inserted row.
 
 One round r (1 … ``rounds``):
 
 1. generation (process pool over the units, ruling R7; each worker loads the current model): for every
-   unit (ES seed ``s`` ∈ ``GEN_SEEDS`` = 1…16, ``max_declines`` ∈ ``GEN_MAX_DECLINES``, 32 units) a (μ+λ) ES with
-   the gate's ES parameters and the budget ``HARDEN_BUDGET_OPS`` reconnoitres on the recon contexts against
+   unit (attack ``a`` ∈ ``GEN_ATTACKS`` = (es, random), seed ``s`` ∈ ``GEN_SEEDS`` = 1…16, ``max_declines`` ∈
+   ``GEN_MAX_DECLINES``, 64 units) the attack – a (μ+λ) ES with the gate's ES parameters, or the gate's random
+   search – with the budget ``HARDEN_BUDGET_OPS`` reconnoitres on the recon contexts against
    the CURRENT model (the bank blocks after the unit's ``max_declines``); its best strategy is realised on the
-   unit's slots (slot i belongs to unit ``(i + r − 1) mod 16``, so every slot gets a fresh episode each round
-   and the units rotate) and executed with the bank's reaction; every executed operation up to the blocking
+   unit's slots (slot i belongs to unit ``(i + r − 1) mod n_units``, so every slot gets a fresh episode each
+   round and the units rotate) and executed with the bank's reaction; every executed operation up to the blocking
    decline becomes a candidate row (``is_fraud = 1``, owner fields from the card, real merchant/category and
    merchant coordinates of the realised operation, ``trans_num = adv-r{generation round}-…``);
 2. selection (ruling R22): design §11 – adversarial rows make up ``share_among_fraud`` (0.5) of the fraud rows
@@ -39,19 +40,22 @@ One round r (1 … ``rounds``):
 3. insertion and retraining: the rows are inserted into the ORIGINAL stream (``insert_rows``), features are
    recomputed with the batch path, and the whole pipeline is retrained with ``train_model`` (same procedure,
    same seed: encoder, scaler, IsolationForest, MLP; τ at FPR 1 % on clean val);
-4. mini-audit: the gate's ES with ``attack_seeds`` restricted to ``MINI_AUDIT_SEEDS``, the gate's threat model
-   and budget, targets = every ``val`` fraud episode, spares = every H episode (``audit_episodes``), one-sided
-   uplift as in the gate; clean recall/FPR on ``val``. Stop when the worst upper bound ≤ δ or after
-   ``rounds`` rounds.
+4. mini-audit: the gate's ensemble (``gate.yaml`` ``attacks``: random, es and the held-out stepwise) with
+   ``attack_seeds`` restricted to ``MINI_AUDIT_SEEDS``, the gate's threat model and budget, targets = every
+   ``val`` fraud episode, spares = every H episode (``audit_episodes``), one-sided uplift as in the gate; clean
+   recall/FPR on ``val``. Stop when the worst upper bound over every attack × seed ≤ δ or after ``rounds``
+   (default ``ROUNDS`` = 5) rounds. The final model is the last round reached (no pick among the rounds).
 
 Round 0 is the same mini-audit on the input model (the starting point of the curve). Every round's model is
 saved to ``out/round-{r}/``; ``out/harden-report.json`` and ``out/harden-report.md`` hold the per-round
-numbers. Only ES is used for hardening (``GEN_ATTACK``; ``check_generation_attack`` rejects anything else and
-refuses the held-out ``stepwise`` attack explicitly); the gate's random search never is, so it partially acts
-as a held-out attack, and the closed-loop stepwise attack is fully held out.
+numbers. ES and random search generate hardening data (``GEN_ATTACKS``; ``check_generation_attack`` rejects
+anything else and refuses the held-out ``stepwise`` attack explicitly). The stepwise attack only measures: it
+runs in the val mini-audit (so it takes part in the early-stop decision) but never produces a training row; in
+the final gate on the test period it is the held-out check.
 
-Determinism (R7): unit (s, md) of round r: oracle ``default_rng([seed, 5, r, s, md, 1])``, ES
-``default_rng([seed, 5, r, s, md, 2])``; slot i realisation ``default_rng([seed, 6, r, i])``; selection
+Determinism (R7): unit (a, s, md) of round r: oracle ``default_rng([seed, 5, r, s, md, t1])``, attack
+``default_rng([seed, 5, r, s, md, t2])`` with (t1, t2) = (1, 2) for es and (3, 4) for random; slot i
+realisation ``default_rng([seed, 6, r, i])``; selection
 ``default_rng([seed, 7, r])``; host split ``split_cards(H, seed)``. Results are identical for any ``n_jobs``.
 """
 from __future__ import annotations
@@ -80,23 +84,33 @@ from .threat import EpisodeContext, MerchantTable, ThreatModel, contexts_for, fe
 HARDEN_BUDGET_OPS = 20_000
 GEN_SEEDS = tuple(range(1, 17))
 GEN_MAX_DECLINES = (1, 3)
+GEN_ATTACKS = ("es", "random")  # the attacks that generate hardening data (each with HARDEN_BUDGET_OPS)
 SHARE = 0.5  # share_among_fraud: adversarial rows / (adversarial + real fraud rows of fit)
-ROUNDS = 3
+ROUNDS = 5
 MINI_AUDIT_SEEDS = (1, 2, 3)
 AGG_MEMORY_DAYS = max(WINDOW_DAYS)  # 30: the longest aggregate window
 _STREAM_GEN, _STREAM_SLOT, _STREAM_SELECT = 5, 6, 7
-GEN_ATTACK = "es"  # the only attack that generates hardening data
+# per generation attack: (oracle, attack) tags of the unit rng streams; es keeps the streams of the ES-only version
+_GEN_STREAM_TAGS = {"es": (1, 2), "random": (3, 4)}
+_DAY = pd.Timedelta(days=1)
 
 
 def check_generation_attack(name: str) -> None:
-    """``ValueError`` unless ``name`` is ``GEN_ATTACK``; a held-out gate attack (``stepwise``) is refused
-    with its own message: it must never see hardening, or it stops being a held-out check."""
+    """``ValueError`` unless ``name`` is one of ``GEN_ATTACKS``; a held-out gate attack (``stepwise``) is
+    refused with its own message: it must never generate hardening data, or it stops being a held-out check."""
     from .gate import HELD_OUT_ATTACKS
     if name in HELD_OUT_ATTACKS:
-        raise ValueError(f"attack {name!r} is the gate's held-out attack: it is never used in hardening")
-    if name != GEN_ATTACK:
-        raise ValueError(f"hardening generation supports only {GEN_ATTACK!r}, got {name!r}")
-_DAY = pd.Timedelta(days=1)
+        raise ValueError(f"attack {name!r} is the gate's held-out attack: it never generates hardening data")
+    if name not in GEN_ATTACKS:
+        raise ValueError(f"hardening generation supports only {' and '.join(map(repr, GEN_ATTACKS))}, "
+                         f"got {name!r}")
+
+
+def _generation_attack(name: str, tm: ThreatModel):
+    from .attacks.evolution import EvolutionStrategy
+    from .attacks.random_search import RandomSearch
+    check_generation_attack(name)
+    return EvolutionStrategy.from_params(tm.es) if name == "es" else RandomSearch()
 OWNER_COLUMNS = ("first", "last", "gender", "street", "city", "state", "zip", "lat", "long", "city_pop", "job",
                  "dob")
 
@@ -190,9 +204,12 @@ def insert_rows(df: pd.DataFrame, adv: pd.DataFrame) -> pd.DataFrame:
 # --- generation ----------------------------------------------------------------------------------------------
 
 
-def units(gen_seeds=GEN_SEEDS, gen_max_declines=GEN_MAX_DECLINES) -> list[tuple[int, int]]:
-    """Generation units (ES seed, max_declines): max_declines outer, seeds inner."""
-    return [(int(s), int(md)) for md in gen_max_declines for s in gen_seeds]
+def units(gen_seeds=GEN_SEEDS, gen_max_declines=GEN_MAX_DECLINES,
+          gen_attacks=GEN_ATTACKS) -> list[tuple[str, int, int]]:
+    """Generation units (attack, seed, max_declines): attack outer, max_declines, seeds inner."""
+    for a in gen_attacks:
+        check_generation_attack(a)
+    return [(str(a), int(s), int(md)) for a in gen_attacks for md in gen_max_declines for s in gen_seeds]
 
 
 def _op_dict(tx, declined: bool) -> dict:
@@ -202,16 +219,17 @@ def _op_dict(tx, declined: bool) -> dict:
 
 
 def _run_unit(serving, recon: list[EpisodeContext], slot_ctx: list[EpisodeContext], tm: ThreatModel,
-              merchants: MerchantTable, seed: int, r: int, unit: tuple[int, int], slot_ids: list[int],
+              merchants: MerchantTable, seed: int, r: int, unit: tuple[str, int, int], slot_ids: list[int],
               budget_ops: int) -> dict:
-    """ES of one unit against ``serving`` on the recon contexts, its best strategy executed on ``slot_ids``."""
-    from .attacks.evolution import EvolutionStrategy
-    s, md = unit
+    """The unit's attack (ES or random search) against ``serving`` on the recon contexts, its best strategy
+    executed on ``slot_ids``."""
+    a, s, md = unit
+    attack = _generation_attack(a, tm)
+    t_or, t_at = _GEN_STREAM_TAGS[a]
     tm_u = dataclasses.replace(tm, max_declines=md, recon_budget_ops=int(budget_ops))
     with ReconOracle(serving, recon, tm_u, merchants, tm_u.recon_budget_ops,
-                     np.random.default_rng([seed, _STREAM_GEN, r, s, md, 1]), n_jobs=1) as oracle:
-        run = EvolutionStrategy.from_params(tm.es).run(oracle, tm_u, np.random.default_rng([seed, _STREAM_GEN, r, s,
-                                                                                           md, 2]))
+                     np.random.default_rng([seed, _STREAM_GEN, r, s, md, t_or]), n_jobs=1) as oracle:
+        run = attack.run(oracle, tm_u, np.random.default_rng([seed, _STREAM_GEN, r, s, md, t_at]))
     if run.best is None:
         raise ValueError(f"harden budget {budget_ops} did not allow a single evaluation")
     best = run.best.clip(tm_u, len(merchants))
@@ -226,7 +244,8 @@ def _run_unit(serving, recon: list[EpisodeContext], slot_ctx: list[EpisodeContex
         episodes.append({"slot": int(i), "round": int(r), "ver": float(o.ver), "blocked": bool(o.blocked),
                          "ops": [_op_dict(t, d) for t, d in zip(ex, o.decisions)]})
     from .audit import strategy_dict
-    return {"seed": s, "max_declines": md, "best_fitness": float(run.best_fitness), "evals": int(run.evals),
+    return {"attack": a, "seed": s, "max_declines": md, "best_fitness": float(run.best_fitness),
+            "evals": int(run.evals),
             "ops_used": int(run.ops_used), "n_slots": len(slot_ids), "n_ops": int(n_ops),
             "n_passed": int(sum(not op["declined"] for e in episodes for op in e["ops"])),
             "n_feasible_ops": int(n_ok), "mean_ver": float(np.mean([e["ver"] for e in episodes])) if episodes
@@ -242,7 +261,7 @@ def _init_worker(model_dir, recon, slot_ctx, tm, merchants, seed, r, assign, bud
                    seed=seed, r=r, assign=assign, budget_ops=budget_ops)
 
 
-def _unit_job(job: tuple[int, tuple[int, int]]) -> dict:
+def _unit_job(job: tuple[int, tuple[str, int, int]]) -> dict:
     u, unit = job
     w = _WORKER
     return _run_unit(w["serving"], w["recon"], w["slot_ctx"], w["tm"], w["merchants"], w["seed"], w["r"], unit,
@@ -258,7 +277,7 @@ def slot_assignment(n_slots: int, n_units: int, r: int) -> list[list[int]]:
 
 
 def generate_round(model, recon: list[EpisodeContext], slot_ctx: list[EpisodeContext], tm: ThreatModel,
-                   merchants: MerchantTable, seed: int, r: int, *, unit_list: list[tuple[int, int]],
+                   merchants: MerchantTable, seed: int, r: int, *, unit_list: list[tuple[str, int, int]],
                    budget_ops: int = HARDEN_BUDGET_OPS, n_jobs: int = 1,
                    model_dir: Path | str | None = None) -> list[dict]:
     """Every unit of round ``r`` (see the module docstring); a list of unit results in ``unit_list`` order.
@@ -330,10 +349,12 @@ class RoundReport:
     model_dir: str | None
     tau: float
     val_quality: dict                      # recall/FPR/precision on clean val at tau
-    val_uplift: dict                       # {attack_seed: {"mean", "lower", "upper"}}, one-sided upper
-    val_uplift_worst_upper: float
-    val_uplift_mean: float                 # mean over the mini-audit seeds of the uplift means
-    val_ver_adv: dict                      # {attack_seed: mean VER_adv}
+    val_uplift: dict                       # {"attack/seed": {"mean", "lower", "upper"}}, one-sided upper
+    val_uplift_worst_upper: float          # max over every attack × seed of the mini-audit
+    val_uplift_worst_run: str              # its run key ("attack/seed")
+    val_uplift_by_attack: dict             # {attack: {"worst_upper", "mean"}} over the mini-audit seeds
+    val_uplift_mean: float                 # mean over every mini-audit run of the uplift means
+    val_ver_adv: dict                      # {"attack/seed": mean VER_adv}
     val_ver_clean: float
     n_adv_rows: int = 0                    # adversarial rows in this round's training stream
     quota: int = 0
@@ -348,23 +369,36 @@ class RoundReport:
 
 
 def _mini_audit(df, model, tm, gate_cfg, seed, val_eps, h_eps, *, n_jobs, model_dir, seeds, threat_path) -> dict:
-    from .attacks.evolution import EvolutionStrategy
+    """The gate's ensemble (``gate_cfg.attacks``: random, es and the held-out stepwise) × ``seeds`` on the val
+    targets with the H spares; ``{"attack/seed": AuditResult}``. It only measures: no attack run here produces
+    training rows."""
     from .audit import audit_episodes
+    from .gate import make_attack, run_key
     res = {}
-    for s in seeds:
-        res[int(s)] = audit_episodes(df, model, tm, EvolutionStrategy.from_params(tm.es), seed, val_eps, h_eps,
-                                     spares_period="harden-H", one_sided=gate_cfg.one_sided, n_jobs=n_jobs,
-                                     model_dir=model_dir, target_periods=("val",), threat_path=threat_path,
-                                     attack_seed=int(s), confidence=gate_cfg.confidence, quality_periods=("val",))
+    for a in gate_cfg.attacks:
+        for s in seeds:
+            res[run_key(a, s)] = audit_episodes(
+                df, model, tm, make_attack(a, tm), seed, val_eps, h_eps, spares_period="harden-H",
+                one_sided=gate_cfg.one_sided, n_jobs=n_jobs, model_dir=model_dir, target_periods=("val",),
+                threat_path=threat_path, attack_seed=int(s), confidence=gate_cfg.confidence,
+                quality_periods=("val",))
     return res
 
 
 def _round_metrics(res: dict) -> dict:
-    up = {s: {"mean": r.uplift[0], "lower": r.uplift[1], "upper": r.uplift[2]} for s, r in res.items()}
+    from .gate import parse_run_key
+    up = {k: {"mean": r.uplift[0], "lower": r.uplift[1], "upper": r.uplift[2]} for k, r in res.items()}
+    worst = max(up, key=lambda k: up[k]["upper"])  # first on ties (attacks outer, seeds inner)
+    by_attack: dict = {}
+    for k, v in up.items():
+        by_attack.setdefault(parse_run_key(k)[0], []).append(v)
     first = next(iter(res.values()))
-    return {"val_uplift": up, "val_uplift_worst_upper": max(v["upper"] for v in up.values()),
+    return {"val_uplift": up, "val_uplift_worst_upper": up[worst]["upper"], "val_uplift_worst_run": worst,
+            "val_uplift_by_attack": {a: {"worst_upper": max(v["upper"] for v in vs),
+                                         "mean": float(np.mean([v["mean"] for v in vs]))}
+                                     for a, vs in by_attack.items()},
             "val_uplift_mean": float(np.mean([v["mean"] for v in up.values()])),
-            "val_ver_adv": {s: r.ver_adv[0] for s, r in res.items()}, "val_ver_clean": first.ver_clean[0],
+            "val_ver_adv": {k: r.ver_adv[0] for k, r in res.items()}, "val_ver_clean": first.ver_clean[0],
             "val_quality": first.clean_quality["val"]}
 
 
@@ -374,19 +408,19 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
            budget_ops: int = HARDEN_BUDGET_OPS, epochs: int | None = None, gen_seeds=GEN_SEEDS,
            gen_max_declines=GEN_MAX_DECLINES, mini_audit_seeds=MINI_AUDIT_SEEDS, baseline_audit: bool = True,
            threat_path: Path | str | None = None, log=None,
-           gen_attack: str = GEN_ATTACK) -> tuple[object, list[RoundReport], dict]:
+           gen_attacks=GEN_ATTACKS) -> tuple[object, list[RoundReport], dict]:
     """Round-based adversarial retraining (module docstring). ``model``/``model_dir`` is the input model.
     Returns (final model, round reports – round 0 first when ``baseline_audit`` –, info dict with the data
-    split, the augmented stream of the last round (``info["df"]``) and the selected rows). ``gen_attack``
-    must be ``"es"`` (``check_generation_attack``, checked before anything else)."""
-    check_generation_attack(gen_attack)
+    split, the augmented stream of the last round (``info["df"]``) and the selected rows). Every entry of
+    ``gen_attacks`` must be in ``GEN_ATTACKS`` (``check_generation_attack``, checked before anything else; the
+    held-out ``stepwise`` is refused)."""
+    unit_list = units(gen_seeds, gen_max_declines, gen_attacks)
     from .model.pipeline import EPOCHS, FraudModel, train_model
     say = log or (lambda m: None)
     jobs = max(1, int(n_jobs if n_jobs is not None else (os.cpu_count() or 1)))
     epochs = EPOCHS if epochs is None else int(epochs)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    unit_list = units(gen_seeds, gen_max_declines)
 
     h_eps, s_eps = fit_split(fraud_episodes(df, {"fit"}), FIT_SPLIT_SEED)
     recon_eps, host_eps = generation_split(h_eps, seed)
@@ -404,9 +438,10 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
             "recon_cards": sorted({e.card for e in recon_eps}), "host_cards": sorted({e.card for e in host_eps}),
             "n_recon_episodes": len(recon_eps), "n_host_episodes": len(host_eps), "n_slots": len(slots),
             "n_val_targets": len(val_eps), "real_fraud_rows_fit": real_fraud_fit, "quota": quota,
-            "units": [{"seed": s, "max_declines": md} for s, md in unit_list], "budget_ops": int(budget_ops),
+            "units": [{"attack": a, "seed": s, "max_declines": md} for a, s, md in unit_list],
+            "gen_attacks": [str(a) for a in gen_attacks], "budget_ops": int(budget_ops),
             "epochs": epochs, "share_among_fraud": float(share_among_fraud), "seed": int(seed), "n_jobs": jobs,
-            "mini_audit_seeds": [int(s) for s in mini_audit_seeds]}
+            "mini_audit_attacks": list(gate_cfg.attacks), "mini_audit_seeds": [int(s) for s in mini_audit_seeds]}
     say(f"H {len(h_eps)} episodes ({len(recon_eps)} recon, {len(host_eps)} hosts), S {len(s_eps)}; "
         f"{len(slots)} host slots; quota {quota} rows (share {share_among_fraud} among fraud, {real_fraud_fit} real)")
 
@@ -418,7 +453,8 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         m = _round_metrics(res)
         reports.append(RoundReport(round=0, model_dir=str(model_dir), tau=float(model.tau),
                                    seconds={"mini_audit": round(time.perf_counter() - t0, 1)}, **m))
-        say(f"round 0: val uplift worst upper {m['val_uplift_worst_upper']:.4f}, mean {m['val_uplift_mean']:.4f}")
+        say(f"round 0: val uplift worst upper {m['val_uplift_worst_upper']:.4f} ({m['val_uplift_worst_run']}), "
+            f"mean {m['val_uplift_mean']:.4f}; " + _by_attack_line(m))
 
     pool: dict[int, dict[int, dict]] = {}
     cur_model, cur_dir = model, Path(model_dir)
@@ -443,9 +479,11 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         rdir = out / f"round-{r}"
         by_round = {str(g): sum(len(x["ops"]) for x in selected if x["round"] == g) for g in range(1, r + 1)}
         # the test-period quality that train_model reports is dropped: hardening never looks at test
-        meta = dict({k: v for k, v in rep.items() if k != "test"}, harden={"round": r, "input_model": str(model_dir), "n_adv_rows": len(adv),
-                                 "quota": quota, "n_rows_by_generation_round": by_round,
-                                 "fit_split": info["fit_split"], "seed": int(seed), "budget_ops": int(budget_ops)},
+        meta = dict({k: v for k, v in rep.items() if k != "test"},
+                    harden={"round": r, "input_model": str(model_dir), "n_adv_rows": len(adv), "quota": quota,
+                            "n_rows_by_generation_round": by_round, "fit_split": info["fit_split"],
+                            "seed": int(seed), "budget_ops": int(budget_ops),
+                            "gen_attacks": info["gen_attacks"]},
                     platform={"system": platform.system(), "machine": platform.machine(),
                               "platform": platform.platform()})
         from .cli import git_info
@@ -470,14 +508,19 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
                      "total": round(time.perf_counter() - t0, 1)},
             train_report={k: rep[k] for k in ("rows", "fraud_rows", "train_balanced_rows", "val", "seconds")},
             **m))
-        say(f"round {r}: val uplift worst upper {m['val_uplift_worst_upper']:.4f}, mean {m['val_uplift_mean']:.4f} "
-            f"({t_aud:.0f} s)")
+        say(f"round {r}: val uplift worst upper {m['val_uplift_worst_upper']:.4f} ({m['val_uplift_worst_run']}), "
+            f"mean {m['val_uplift_mean']:.4f}; {_by_attack_line(m)} ({t_aud:.0f} s)")
         if gate_cfg.delta is not None and m["val_uplift_worst_upper"] <= gate_cfg.delta:
             say(f"round {r}: val uplift upper bound <= delta {gate_cfg.delta}: stop")
             break
     info["test_fp_diagnostic"] = fp_diagnostic(df, {"baseline": model, "final": cur_model})
     info.update(df=df_r, selected=selected)
     return cur_model, reports, info
+
+
+def _by_attack_line(m: dict) -> str:
+    return "per attack worst upper " + ", ".join(f"{a} {v['worst_upper']:.4f}"
+                                                 for a, v in m["val_uplift_by_attack"].items())
 
 
 def fp_diagnostic(df: pd.DataFrame, models: dict) -> dict:
@@ -531,14 +574,15 @@ def report_markdown(data: dict) -> str:
         f"(δ = {m['delta']}). Rounds run: {len(data['rounds']) - (1 if data['rounds'][0]['round'] == 0 else 0)} "
         f"of {m['rounds']}; final model: `{data['final_model_dir']}`.",
         "",
-        "Validation curve: the mini-audit runs the gate's ES (seeds "
-        f"{d['mini_audit_seeds']}, gate threat model and budget) on all {d['n_val_targets']} fraud episodes of the "
-        "val period, with the H episodes as spares; uplift = VER_adv − VER_clean, one-sided upper bound as in the "
-        "gate. The test period is not used by hardening (no rows, no targets, no decisions).",
+        "Validation curve: the mini-audit runs the gate's ensemble (attacks "
+        f"{d.get('mini_audit_attacks', ['es'])} × seeds {d['mini_audit_seeds']}, gate threat model and budget) on "
+        f"all {d['n_val_targets']} fraud episodes of the val period, with the H episodes as spares; uplift = "
+        "VER_adv − VER_clean, one-sided upper bound as in the gate; hardening stops when the worst run's bound "
+        "≤ δ. The test period is not used by hardening (no rows, no targets, no decisions).",
         "",
         "| round | adversarial rows (quota) | generated rows (passed) | val uplift mean | val uplift worst upper "
-        "| val recall | val FPR | τ | time |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "(run) | worst upper per attack | val recall | val FPR | τ | time |",
+        "|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|",
     ]
     for r in data["rounds"]:
         q = r["val_quality"]
@@ -546,15 +590,17 @@ def report_markdown(data: dict) -> str:
         tt = t.get("total", t.get("mini_audit"))
         adv = "–" if r["round"] == 0 else f"{r['n_adv_rows']} ({r['quota']})"
         gen = "–" if r["round"] == 0 else f"{r['n_generated_rows']} ({r['n_generated_passed']})"
+        per = ", ".join(f"{a} {_pct(v['worst_upper'])}" for a, v in r.get("val_uplift_by_attack", {}).items())
         lines.append(f"| {r['round']} | {adv} | {gen} | {_pct(r['val_uplift_mean'])} "
-                     f"| {_pct(r['val_uplift_worst_upper'])} | {q['recall']:.4f} | {q['fpr']:.4f} "
-                     f"| {r['tau']:.6g} | {tt:.0f} s |")
+                     f"| {_pct(r['val_uplift_worst_upper'])} ({r.get('val_uplift_worst_run', '–')}) | {per} "
+                     f"| {q['recall']:.4f} | {q['fpr']:.4f} | {r['tau']:.6g} | {tt:.0f} s |")
     lines += [
         "",
         "Round 0 is the input model. Per round: adversarial rows in the training stream (one episode per host "
         "slot, drawn from the episodes of all rounds so far), rows generated in the round, mini-audit uplift "
-        "(mean over the seeds and worst one-sided upper bound), clean val recall/FPR at τ (τ at 1 % FPR on clean "
-        "val), wall time (generation + training + mini-audit).",
+        "(mean over every attack × seed and the worst one-sided upper bound with its run; worst upper bound per "
+        "attack), clean val recall/FPR at τ (τ at 1 % FPR on clean val), wall time (generation + training + "
+        "mini-audit).",
         "",
         "Adversarial rows by generation round (equal row quotas, ruling R22): "
         + "; ".join(f"round {r['round']}: {r['n_rows_by_generation_round']}" for r in data["rounds"] if r["round"])
@@ -573,15 +619,19 @@ def report_markdown(data: dict) -> str:
         f"- Quota: adversarial rows = {d['share_among_fraud']} of all fit fraud rows before balancing (design §11): "
         f"round({d['real_fraud_rows_fit']} × {d['share_among_fraud']}/(1 − {d['share_among_fraud']})) = {d['quota']} "
         "rows per round, split equally over the generation rounds so far (ruling R22).",
-        f"- Generation: {len(d['units'])} ES units (seeds × max_declines "
+        f"- Generation: {len(d['units'])} units (attacks "
+        f"{d.get('gen_attacks', sorted({u.get('attack', 'es') for u in d['units']}))} × seeds × max_declines "
         f"{sorted({u['max_declines'] for u in d['units']})}), budget {d['budget_ops']} operations each, "
         f"{d['n_jobs']} processes; training epochs {d['epochs']}.",
         "",
         "## Attacks",
         "",
-        "Only the evolution strategy generates hardening data. The gate's random search was never used for "
-        "hardening, so in the final gate it is a partial held-out check; the closed-loop stepwise attack is fully "
-        "held out (`harden` refuses to generate with it).",
+        "Hardening data is generated by "
+        + " and ".join({"es": "the evolution strategy", "random": "random search"}.get(a, a)
+                       for a in d.get("gen_attacks", ["es"]))
+        + ". The closed-loop stepwise attack never generates hardening data (`harden` refuses it); it is part of "
+        "the val mini-audit, so it takes part in the early-stop decision, but in the final gate on the test "
+        "period it is the held-out check of whether robustness transfers to a different search principle.",
         "",
         "## Metadata",
         "",
