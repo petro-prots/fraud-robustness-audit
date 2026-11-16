@@ -33,8 +33,11 @@ from pathlib import Path
 import numpy as np
 
 from .episode import candidate_max_ops, clip_candidate, execute_candidate
+from .policy import StepwisePolicy
 from .serving.core import Serving
 from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel
+
+Candidate = Strategy | StepwisePolicy  # what the oracle evaluates: a fixed plan or a closed-loop policy
 
 
 class BudgetExhausted(Exception):
@@ -49,7 +52,7 @@ class BudgetExhausted(Exception):
 
 
 def _evaluate_cards(serving, spares: list[EpisodeContext], tm: ThreatModel, merchants: MerchantTable,
-                    seed: int, eval_idx: int, strategy) -> list[tuple[float, int, bool]]:
+                    seed: int, eval_idx: int, strategy: Candidate) -> list[tuple[float, int, bool]]:
     """(ver, executed ops, blocked) on every spare card of evaluation ``eval_idx`` (a ``Strategy`` or a
     closed-loop ``StepwisePolicy``, see ``episode.execute_candidate``)."""
     pick = np.random.default_rng([seed, eval_idx]).choice(len(spares), size=tm.cards_per_eval, replace=False)
@@ -74,7 +77,7 @@ def _init_worker(model_dir, spares, tm, merchants, seed) -> None:
     _WORKER.update(serving=_load_serving(model_dir), spares=spares, tm=tm, merchants=merchants, seed=seed)
 
 
-def _eval_job(job: tuple[int, Strategy]):
+def _eval_job(job: tuple[int, Candidate]):
     i, s = job
     w = _WORKER
     return _evaluate_cards(w["serving"], w["spares"], w["tm"], w["merchants"], w["seed"], i, s)
@@ -109,7 +112,7 @@ class ReconOracle:
         self.ops_used = 0
         self.evals = 0
         self.cards_blocked = 0
-        self.history: list[tuple[Strategy, float]] = []
+        self.history: list[tuple[Candidate, float]] = []
         self._serving = serving
         self._pool: ProcessPoolExecutor | None = None
 
@@ -117,7 +120,7 @@ class ReconOracle:
     def remaining(self) -> int:
         return self.budget_ops - self.ops_used
 
-    def _worst(self, s) -> int:
+    def _worst(self, s: Candidate) -> int:
         return self.tm.cards_per_eval * candidate_max_ops(s, self.tm)
 
     def _serving_local(self):
@@ -125,7 +128,7 @@ class ReconOracle:
             self._serving = _load_serving(self.model_dir)
         return self._serving
 
-    def _commit(self, s: Strategy, cards: list[tuple[float, int, bool]]) -> float:
+    def _commit(self, s: Candidate, cards: list[tuple[float, int, bool]]) -> float:
         ops = sum(n for _, n, _ in cards)
         assert ops <= self._worst(s) <= self.remaining
         self.ops_used += ops
@@ -135,7 +138,7 @@ class ReconOracle:
         self.history.append((s, fit))
         return fit
 
-    def evaluate(self, strategy: Strategy) -> float:
+    def evaluate(self, strategy: Candidate) -> float:
         """Mean ``ver`` of ``strategy`` on ``cards_per_eval`` spare cards; ``BudgetExhausted``
         (nothing executed, nothing charged) if the worst case does not fit."""
         s = clip_candidate(strategy, self.tm, self.merchants)
@@ -145,7 +148,7 @@ class ReconOracle:
                                 self.evals, s)
         return self._commit(s, cards)
 
-    def evaluate_many(self, strategies: list[Strategy]) -> list[float]:
+    def evaluate_many(self, strategies: list[Candidate]) -> list[float]:
         """``[evaluate(s) for s in strategies]``, with the evaluations in a process pool.
 
         Identical to the sequential calls: each round reserves the worst case of the candidates in
