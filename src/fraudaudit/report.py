@@ -9,9 +9,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit import BaselineResult, _num, _pct, baseline_to_json, spares_text, strategy_dict, to_json
+from .audit import (BaselineResult, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
+                    to_json)
 from .metrics import uplift_ci
-from .gate import Check, GateConfig, parse_run_key, passed
+from .gate import HELD_OUT_ATTACKS, Check, GateConfig, parse_run_key, passed
 
 VERDICT_OK, VERDICT_FAIL = "PASSED", "FAILED"
 
@@ -197,7 +198,9 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
         lines.append("Failed: " + ", ".join(f"`{c.name}`" for c in failed) + ". What to do – see the "
                      "\"Recommendations\" section.")
     lines += ["",
-              f"Worst case: attack `{w_attack}`, attack seed {w_seed}; {_side(w)} upper {conf} % bound of the "
+              f"Worst case: attack `{w_attack}`"
+              + (" (held-out, never used in hardening)" if w_attack in HELD_OUT_ATTACKS else "")
+              + f", attack seed {w_seed}; {_side(w)} upper {conf} % bound of the "
               f"VER_adv − VER_clean uplift {_pct(up.value)} against "
               + (f"δ = {_pct(delta)}." if delta is not None else "an unset δ."),
               ""]
@@ -229,7 +232,11 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
 
     lines += ["", "## Attacks × seed", "",
               f"The target and spare episodes are the same for all runs (seed {wm['seed']}); only the "
-              "attack's random stream changes. The gate takes the worst run.", "",
+              "attack's random stream changes. The gate takes the worst run."
+              + (" The stepwise attack is held-out: a closed-loop policy that chooses each next operation after "
+                 "the bank's decision on the previous one; it never generated hardening data, so it checks whether "
+                 "robustness transfers to an attacker with a different search principle."
+                 if any(parse_run_key(k)[0] in HELD_OUT_ATTACKS for k in results) else ""), "",
               f"| attack | attack seed | VER_adv [{conf} %, two-sided] | uplift "
               + (f"(one-sided upper {conf} % bound)" if w.meta.get("one_sided") else f"[{conf} %]")
               + " | ASR | recon operations "
@@ -238,6 +245,8 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     for key, r in results.items():
         a, s = parse_run_key(key)
         mark = "**⚠ worst**" if key == worst_key else ""
+        if a in HELD_OUT_ATTACKS:
+            a = f"{a} (held-out, never used in hardening)"
         lines.append(f"| {a} | {s} | {_ci(r.ver_adv)} | {_uplift(r)} | {_pct(r.asr)} "
                      f"({r.meta['n_success']} of {r.n_targets}) | {r.recon_ops} | {r.meta['recon']['evals']} | {mark} |")
 
@@ -271,14 +280,18 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
         lines.append(f"| {p} | {_num(q['recall'], 4)} | {_num(q['fpr'], 4)} | {_num(q['precision'], 4)} "
                      f"| {q['n']} | {q['n_fraud']} |")
 
-    b = strategy_dict(w.best, merchants)
-    lines += ["", f"## Strategy of the worst run (`{worst_key}`)", "",
-              f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A; plan in order of planned time (day counted from "
-              "midnight of the episode start day), before wrapping into the window and spacing the operations:", "",
-              "| # | share of A | day | hour | category |", "|---:|---:|---:|---:|---|"]
-    for i, op in enumerate(b["ops"], 1):
-        lines.append(f"| {i} | {_pct(op['share_of_A'])} | {op['day_index']} | {op['time_of_day']} "
-                     f"| {op.get('category', '–')} |")
+    b = candidate_dict(w.best, merchants)
+    lines += ["", f"## Strategy of the worst run (`{worst_key}`)", ""]
+    if b.get("type") == "stepwise_policy":
+        lines += policy_markdown(b)
+    else:
+        lines += [f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A; plan in order of planned time (day counted "
+                  "from midnight of the episode start day), before wrapping into the window and spacing the "
+                  "operations:", "",
+                  "| # | share of A | day | hour | category |", "|---:|---:|---:|---:|---|"]
+        for i, op in enumerate(b["ops"], 1):
+            lines.append(f"| {i} | {_pct(op['share_of_A'])} | {op['day_index']} | {op['time_of_day']} "
+                         f"| {op.get('category', '–')} |")
 
     run_walls = ", ".join(f"{k} {r.meta['wall_seconds']} s" for k, r in results.items())
     lines += ["", "## Metadata", "",

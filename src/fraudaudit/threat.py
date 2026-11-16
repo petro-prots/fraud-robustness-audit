@@ -229,6 +229,26 @@ class MerchantTable:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_index", {n: i for i, n in enumerate(self.names)})
+        blocks: list[tuple[int, int]] = []  # [start, end) of every category block, in table order
+        for i, c in enumerate(self.category):
+            if i == 0 or c != self.category[i - 1]:
+                blocks.append((i, i + 1))
+            else:
+                blocks[-1] = (blocks[-1][0], i + 1)
+        object.__setattr__(self, "_blocks", blocks)
+
+    @property
+    def categories(self) -> list[str]:
+        """Categories in table order (one per block of neighbouring merchants)."""
+        return [self.category[a] for a, _ in self._blocks]
+
+    @property
+    def n_categories(self) -> int:
+        return len(self._blocks)
+
+    def block(self, c: int) -> tuple[int, int]:
+        """Merchant index range ``[start, end)`` of category block ``c``."""
+        return self._blocks[c]
 
     @classmethod
     def from_df(cls, df: pd.DataFrame) -> "MerchantTable":

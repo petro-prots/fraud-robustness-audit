@@ -1,7 +1,7 @@
 target_fpr: 0.01          # per-operation FPR at which the model's τ was chosen (checked against models/model.json)
 recall_clean_min: 0.5     # recall on clean test operations at τ
 delta: 0.10   # approved by the author 2026-11-15 after calibration (resolution 4.1 pp on 218 episodes); fixed before hardening
-attacks: [random, es]     # attack ensemble: the verdict is the worst run
+attacks: [random, es, stepwise]  # attack ensemble: the verdict is the worst run; stepwise is held-out (never used in hardening)
 attack_seeds: [1, 2, 3]   # every attack with every seed on the same targets and spares
 confidence: 0.95          # level of all intervals
 one_sided: true           # uplift: one-sided upper bound (only uplift ≤ δ is tested); VER intervals stay two-sided

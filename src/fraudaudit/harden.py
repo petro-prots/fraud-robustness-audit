@@ -46,8 +46,9 @@ One round r (1 … ``rounds``):
 
 Round 0 is the same mini-audit on the input model (the starting point of the curve). Every round's model is
 saved to ``out/round-{r}/``; ``out/harden-report.json`` and ``out/harden-report.md`` hold the per-round
-numbers. Only ES is used for hardening; the gate's random search never is, so it partially acts as a held-out
-attack.
+numbers. Only ES is used for hardening (``GEN_ATTACK``; ``check_generation_attack`` rejects anything else and
+refuses the held-out ``stepwise`` attack explicitly); the gate's random search never is, so it partially acts
+as a held-out attack, and the closed-loop stepwise attack is fully held out.
 
 Determinism (R7): unit (s, md) of round r: oracle ``default_rng([seed, 5, r, s, md, 1])``, ES
 ``default_rng([seed, 5, r, s, md, 2])``; slot i realisation ``default_rng([seed, 6, r, i])``; selection
@@ -84,6 +85,17 @@ ROUNDS = 3
 MINI_AUDIT_SEEDS = (1, 2, 3)
 AGG_MEMORY_DAYS = max(WINDOW_DAYS)  # 30: the longest aggregate window
 _STREAM_GEN, _STREAM_SLOT, _STREAM_SELECT = 5, 6, 7
+GEN_ATTACK = "es"  # the only attack that generates hardening data
+
+
+def check_generation_attack(name: str) -> None:
+    """``ValueError`` unless ``name`` is ``GEN_ATTACK``; a held-out gate attack (``stepwise``) is refused
+    with its own message: it must never see hardening, or it stops being a held-out check."""
+    from .gate import HELD_OUT_ATTACKS
+    if name in HELD_OUT_ATTACKS:
+        raise ValueError(f"attack {name!r} is the gate's held-out attack: it is never used in hardening")
+    if name != GEN_ATTACK:
+        raise ValueError(f"hardening generation supports only {GEN_ATTACK!r}, got {name!r}")
 _DAY = pd.Timedelta(days=1)
 OWNER_COLUMNS = ("first", "last", "gender", "street", "city", "state", "zip", "lat", "long", "city_pop", "job",
                  "dob")
@@ -361,10 +373,13 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
            seed: int = 42, *, model_dir: Path | str, out_dir: Path | str, n_jobs: int | None = None,
            budget_ops: int = HARDEN_BUDGET_OPS, epochs: int | None = None, gen_seeds=GEN_SEEDS,
            gen_max_declines=GEN_MAX_DECLINES, mini_audit_seeds=MINI_AUDIT_SEEDS, baseline_audit: bool = True,
-           threat_path: Path | str | None = None, log=None) -> tuple[object, list[RoundReport], dict]:
+           threat_path: Path | str | None = None, log=None,
+           gen_attack: str = GEN_ATTACK) -> tuple[object, list[RoundReport], dict]:
     """Round-based adversarial retraining (module docstring). ``model``/``model_dir`` is the input model.
     Returns (final model, round reports – round 0 first when ``baseline_audit`` –, info dict with the data
-    split, the augmented stream of the last round (``info["df"]``) and the selected rows)."""
+    split, the augmented stream of the last round (``info["df"]``) and the selected rows). ``gen_attack``
+    must be ``"es"`` (``check_generation_attack``, checked before anything else)."""
+    check_generation_attack(gen_attack)
     from .model.pipeline import EPOCHS, FraudModel, train_model
     say = log or (lambda m: None)
     jobs = max(1, int(n_jobs if n_jobs is not None else (os.cpu_count() or 1)))
@@ -565,8 +580,8 @@ def report_markdown(data: dict) -> str:
         "## Attacks",
         "",
         "Only the evolution strategy generates hardening data. The gate's random search was never used for "
-        "hardening, so in the final gate it is a partial held-out check; the held-out stepwise attack of the plan is "
-        "not implemented yet.",
+        "hardening, so in the final gate it is a partial held-out check; the closed-loop stepwise attack is fully "
+        "held out (`harden` refuses to generate with it).",
         "",
         "## Metadata",
         "",

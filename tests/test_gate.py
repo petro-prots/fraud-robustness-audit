@@ -76,7 +76,7 @@ def by_name(checks):
 
 def test_gate_yaml_committed_values():
     c = GateConfig.from_yaml(GATE_PATH)
-    assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.10, attacks=["random", "es"],
+    assert c == GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.10, attacks=["random", "es", "stepwise"],
                            attack_seeds=[1, 2, 3], confidence=0.95, one_sided=True, spares_period="fit")
 
 

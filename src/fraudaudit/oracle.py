@@ -12,6 +12,10 @@ the worst case ``cards_per_eval · k`` against ``remaining`` and raises ``Budget
 executing anything if it does not fit, so ``ops_used <= budget_ops`` always and an evaluation is
 never cut in the middle.
 
+Candidates are fixed ``Strategy`` plans or closed-loop ``StepwisePolicy`` objects (the held-out stepwise
+attack): a policy's worst case is ``cards_per_eval · k_max`` (it decides how many operations to make
+while it runs), and only its actually executed operations are charged.
+
 Determinism: evaluation number ``i`` (0, 1, ... over the oracle's lifetime) picks its spare cards
 with ``default_rng([seed, i])`` and realizes the strategy on card number ``j`` of that pick with
 ``default_rng([seed, i, j])``; ``seed`` is drawn once from the ``rng`` given to the constructor.
@@ -28,9 +32,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .episode import run_episode
+from .episode import candidate_max_ops, clip_candidate, execute_candidate
 from .serving.core import Serving
-from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel, realize
+from .threat import EpisodeContext, MerchantTable, Strategy, ThreatModel
 
 
 class BudgetExhausted(Exception):
@@ -45,14 +49,14 @@ class BudgetExhausted(Exception):
 
 
 def _evaluate_cards(serving, spares: list[EpisodeContext], tm: ThreatModel, merchants: MerchantTable,
-                    seed: int, eval_idx: int, strategy: Strategy) -> list[tuple[float, int, bool]]:
-    """(ver, executed ops, blocked) on every spare card of evaluation ``eval_idx``."""
+                    seed: int, eval_idx: int, strategy) -> list[tuple[float, int, bool]]:
+    """(ver, executed ops, blocked) on every spare card of evaluation ``eval_idx`` (a ``Strategy`` or a
+    closed-loop ``StepwisePolicy``, see ``episode.execute_candidate``)."""
     pick = np.random.default_rng([seed, eval_idx]).choice(len(spares), size=tm.cards_per_eval, replace=False)
     out = []
     for j, c in enumerate(pick):
-        ctx = spares[int(c)]
-        txs = realize(strategy, ctx, tm, merchants, np.random.default_rng([seed, eval_idx, j]))
-        o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
+        o, _ = execute_candidate(serving, spares[int(c)], strategy, tm, merchants,
+                                 np.random.default_rng([seed, eval_idx, j]))
         out.append((o.ver, o.n_ops, o.blocked))
     return out
 
@@ -113,8 +117,8 @@ class ReconOracle:
     def remaining(self) -> int:
         return self.budget_ops - self.ops_used
 
-    def _worst(self, s: Strategy) -> int:
-        return self.tm.cards_per_eval * s.k
+    def _worst(self, s) -> int:
+        return self.tm.cards_per_eval * candidate_max_ops(s, self.tm)
 
     def _serving_local(self):
         if self._serving is None:
@@ -134,7 +138,7 @@ class ReconOracle:
     def evaluate(self, strategy: Strategy) -> float:
         """Mean ``ver`` of ``strategy`` on ``cards_per_eval`` spare cards; ``BudgetExhausted``
         (nothing executed, nothing charged) if the worst case does not fit."""
-        s = strategy.clip(self.tm, len(self.merchants))
+        s = clip_candidate(strategy, self.tm, self.merchants)
         if self._worst(s) > self.remaining:
             raise BudgetExhausted(f"worst case {self._worst(s)} ops > remaining {self.remaining}")
         cards = _evaluate_cards(self._serving_local(), self.spares, self.tm, self.merchants, self.seed,
@@ -149,7 +153,7 @@ class ReconOracle:
         executed operations in list order; the next round starts from the actual ``remaining``.
         When the next candidate does not fit even alone, ``BudgetExhausted`` is raised with the
         fitness of the candidates evaluated so far in ``.fitness``."""
-        todo = [s.clip(self.tm, len(self.merchants)) for s in strategies]
+        todo = [clip_candidate(s, self.tm, self.merchants) for s in strategies]
         done: list[float] = []
         while todo:
             room, n = self.remaining, 0

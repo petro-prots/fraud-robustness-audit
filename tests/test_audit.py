@@ -410,9 +410,9 @@ def _spy_run_episode(monkeypatch, module):
 
 
 def test_tau_after_decline_reaches_every_run_episode_call(df, model, tm, model_dir, monkeypatch):
-    from fraudaudit import oracle as oracle_mod
+    from fraudaudit import episode as episode_mod  # the oracle and the target leg run candidates through it
     tm2 = dataclasses.replace(tm, tau_after_decline=1e-9)
-    seen_a, seen_o = _spy_run_episode(monkeypatch, audit_mod), _spy_run_episode(monkeypatch, oracle_mod)
+    seen_a, seen_o = _spy_run_episode(monkeypatch, audit_mod), _spy_run_episode(monkeypatch, episode_mod)
     r = run_audit(df, model, tm2, RandomSearch(), seed=7, n_jobs=1, model_dir=model_dir,
                   target_periods=ALL, threat_path=TM_PATH, spares_period="test", one_sided=False)
     assert seen_a and seen_o and set(seen_a) == {1e-9} and set(seen_o) == {1e-9}

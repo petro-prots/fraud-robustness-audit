@@ -85,6 +85,8 @@ def build_parser() -> argparse.ArgumentParser:
     hard.add_argument("--share-among-fraud", type=float, default=0.5,
                       help="adversarial rows / all fraud rows of fit before balancing (design §11)")
     hard.add_argument("--no-baseline-audit", action="store_true", help="skip the round-0 mini-audit of the input model")
+    hard.add_argument("--gen-attack", default="es",
+                      help="attack that generates hardening data: only es; the held-out stepwise attack is refused")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -307,13 +309,14 @@ def cmd_harden(args: argparse.Namespace) -> int:
     from fraudaudit.audit import _versions
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig
-    from fraudaudit.harden import harden, write_report
+    from fraudaudit.harden import check_generation_attack, harden, write_report
     from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
     from fraudaudit.model.pipeline import FraudModel
     from fraudaudit.threat import ThreatModel
 
     t0 = time.perf_counter()
     try:
+        check_generation_attack(args.gen_attack)
         gate_bytes = args.gate.read_bytes()
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
@@ -327,7 +330,8 @@ def cmd_harden(args: argparse.Namespace) -> int:
                                   out_dir=args.out, n_jobs=args.n_jobs, budget_ops=args.budget_ops,
                                   epochs=args.epochs, baseline_audit=not args.no_baseline_audit,
                                   share_among_fraud=args.share_among_fraud,
-                                  threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
+                                  threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True),
+                                  gen_attack=args.gen_attack)
     meta = {"seed": int(args.seed), **git_info(), "input_model": str(args.model),
             "input_model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),
             "threat_sha256": hashlib.sha256(args.threat.read_bytes()).hexdigest(), "gate_file": str(args.gate),

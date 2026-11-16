@@ -3,15 +3,22 @@
 The attacker sends the operations in order. Every attempt (passed or declined) enters the card
 state, because the bank sees the attempt. After ``max_declines`` declines the card is blocked and
 the remaining operations are not executed. ``ver`` is the share of the target sum A withdrawn.
+
+``run_episode`` executes a fixed operation list (a realised ``Strategy``); ``run_adaptive_episode``
+executes a closed-loop policy that chooses every next operation after seeing the previous decision.
+Both share the bank side (``_Bank``).
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
+from .policy import StepwisePolicy
 from .serving.core import Serving
 from .serving.state import Tx
-from .threat import EpisodeContext
+from .threat import EpisodeContext, MerchantTable, ThreatModel, realize
 
 
 @dataclass(frozen=True)
@@ -40,39 +47,125 @@ def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declin
     ``serving.tau`` is known (``ValueError`` otherwise). ``max_declines`` counts declines under
     whichever threshold was active.
     """
-    if not ctx.episode.amount > 0:
-        raise ValueError("episode amount must be > 0")
-    if max_declines is not None and max_declines < 1:
-        raise ValueError("max_declines must be None or >= 1")
-    if tau_after_decline is not None:
-        if not 0 < tau_after_decline < 1:
-            raise ValueError("tau_after_decline must be None or in (0, 1)")
-        tau = getattr(serving, "tau", None)
-        if tau is not None and not tau_after_decline < tau:
-            raise ValueError(f"tau_after_decline ({tau_after_decline}) must be < model tau ({tau})")
-    escalated = False
-    state = ctx.state.copy()
-    target = float(ctx.episode.amount)
-    passed = 0.0
-    n_declines = 0
-    blocked = False
-    decisions: list[bool] = []
+    bank = _Bank(serving, ctx, max_declines, rho, tau_after_decline)
     for tx in txs:
-        d = serving.decide(state, tx)
-        declined = d.declined
-        if escalated:
-            declined = d.p >= tau_after_decline
-        decisions.append(declined)
-        if declined:
-            n_declines += 1
-        else:
-            passed += float(tx.amt)
-        state.push(tx)
-        if declined and tau_after_decline is not None:
-            escalated = True
-        if declined and max_declines is not None and n_declines >= max_declines:
-            blocked = True
+        bank.submit(tx)
+        if bank.blocked:
             break
-    return EpisodeOutcome(passed_amount=passed, ver=passed / target, n_ops=len(decisions),
-                          n_declines=n_declines, blocked=blocked, success=round(passed * 100) >= math.ceil(round(rho * target * 100, 6)),
-                          decisions=tuple(decisions), escalated=escalated)
+    return bank.outcome()
+
+
+class _Bank:
+    """The bank's side of one episode, shared by ``run_episode`` and ``run_adaptive_episode``: every
+    attempt enters the card state, declines are counted (with the ``tau_after_decline`` escalation)
+    and the card is blocked after ``max_declines`` declines."""
+
+    def __init__(self, serving, ctx: EpisodeContext, max_declines: int | None, rho: float,
+                 tau_after_decline: float | None) -> None:
+        if not ctx.episode.amount > 0:
+            raise ValueError("episode amount must be > 0")
+        if max_declines is not None and max_declines < 1:
+            raise ValueError("max_declines must be None or >= 1")
+        if tau_after_decline is not None:
+            if not 0 < tau_after_decline < 1:
+                raise ValueError("tau_after_decline must be None or in (0, 1)")
+            tau = getattr(serving, "tau", None)
+            if tau is not None and not tau_after_decline < tau:
+                raise ValueError(f"tau_after_decline ({tau_after_decline}) must be < model tau ({tau})")
+        self.serving, self.max_declines, self.rho = serving, max_declines, rho
+        self.tau_after_decline = tau_after_decline
+        self.state = ctx.state.copy()
+        self.target = float(ctx.episode.amount)
+        self.passed = 0.0
+        self.n_declines = 0
+        self.blocked = False
+        self.escalated = False
+        self.decisions: list[bool] = []
+
+    def submit(self, tx: Tx) -> bool:
+        """Decide ``tx`` and push it into the state; returns the declined flag (all the attacker sees)."""
+        if self.blocked:
+            raise RuntimeError("the card is blocked")
+        d = self.serving.decide(self.state, tx)
+        declined = d.declined
+        if self.escalated:
+            declined = d.p >= self.tau_after_decline
+        declined = bool(declined)
+        self.decisions.append(declined)
+        if declined:
+            self.n_declines += 1
+        else:
+            self.passed += float(tx.amt)
+        self.state.push(tx)
+        if declined and self.tau_after_decline is not None:
+            self.escalated = True
+        if declined and self.max_declines is not None and self.n_declines >= self.max_declines:
+            self.blocked = True
+        return declined
+
+    def outcome(self) -> EpisodeOutcome:
+        passed, target = self.passed, self.target
+        return EpisodeOutcome(passed_amount=passed, ver=passed / target, n_ops=len(self.decisions),
+                              n_declines=self.n_declines, blocked=self.blocked,
+                              success=round(passed * 100) >= math.ceil(round(self.rho * target * 100, 6)),
+                              decisions=tuple(self.decisions), escalated=self.escalated)
+
+
+def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, merchants: MerchantTable,
+                         rng: np.random.Generator, *,
+                         tau_after_decline: float | None) -> tuple[EpisodeOutcome, list[Tx]]:
+    """Closed-loop episode: ``policy`` decides every next operation AFTER seeing the decision on the
+    previous one. Returns the outcome (as ``run_episode``) and the executed operations, in order.
+
+    ``policy.act(ctx, tm, merchants, rng)`` is a generator: ``next`` gives the first operation, ``send(declined)``
+    the next one, ``StopIteration`` ends the episode. Only the declined flag is sent (``knowledge: decision``;
+    no score). The bank side is the same as in ``run_episode`` (shared ``_Bank``): every attempt enters the
+    state, ``tm.max_declines`` blocks the card, ``tau_after_decline`` escalates the threshold after the first
+    decline, success is ``>= tm.rho·A`` in whole cents. At most ``tm.k_max`` operations are executed. A policy
+    that proposes a fixed list gives exactly ``run_episode`` on that list.
+    """
+    bank = _Bank(serving, ctx, tm.max_declines, tm.rho, tau_after_decline)
+    executed: list[Tx] = []
+    gen = policy.act(ctx, tm, merchants, rng)
+    try:
+        tx = next(gen, None)
+        while tx is not None:
+            declined = bank.submit(tx)
+            executed.append(tx)
+            if bank.blocked or len(executed) >= tm.k_max:
+                break
+            try:
+                tx = gen.send(declined)
+            except StopIteration:
+                tx = None
+    finally:
+        gen.close()
+    return bank.outcome(), executed
+
+
+# --- candidates of the attacks: a fixed Strategy or a closed-loop StepwisePolicy -----------------------------
+
+
+def clip_candidate(c, tm: ThreatModel, merchants: MerchantTable):
+    """``c`` with every field in range (``Strategy.clip`` / ``StepwisePolicy.clip``)."""
+    if isinstance(c, StepwisePolicy):
+        return c.clip(tm, merchants.n_categories)
+    return c.clip(tm, len(merchants))
+
+
+def candidate_max_ops(c, tm: ThreatModel) -> int:
+    """Most operations one episode of ``c`` can execute: ``k`` of a strategy, ``k_max`` of a policy."""
+    return int(tm.k_max) if isinstance(c, StepwisePolicy) else int(c.k)
+
+
+def execute_candidate(serving, ctx: EpisodeContext, c, tm: ThreatModel, merchants: MerchantTable,
+                      rng: np.random.Generator) -> tuple[EpisodeOutcome, list[Tx]]:
+    """One episode of candidate ``c`` on ``ctx`` with the bank's reaction of ``tm``; returns the outcome and
+    the executed operations. A ``Strategy`` is realised in advance (``realize``) and run by ``run_episode``
+    (the executed operations are the time-ordered prefix the bank saw); a ``StepwisePolicy`` runs closed-loop
+    (``run_adaptive_episode``). ``rng`` is consumed by ``realize`` or by the policy."""
+    if isinstance(c, StepwisePolicy):
+        return run_adaptive_episode(serving, ctx, c, tm, merchants, rng, tau_after_decline=tm.tau_after_decline)
+    txs = realize(c, ctx, tm, merchants, rng)
+    o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
+    return o, txs[:o.n_ops]

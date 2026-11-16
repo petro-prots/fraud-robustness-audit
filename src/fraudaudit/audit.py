@@ -52,13 +52,14 @@ import pandas as pd
 
 from .attacks.random_search import Attack
 from .data import FIT_SPLIT_SEED, SPARES_PERIODS, fit_split, fit_split_meta, fraud_episodes, period, split_cards
-from .episode import run_episode
+from .episode import clip_candidate, execute_candidate, run_episode
 from .metrics import clopper_pearson_upper, uplift_ci, uplift_se, ver_ci
 from .oracle import ReconOracle
+from .policy import StepwisePolicy
 from .serving.core import Serving
 from .serving.state import Tx
 from .threat import (EpisodeContext, MerchantTable, SingleTxThreatModel, Strategy, ThreatModel, _spread,
-                     contexts_for, feasible_ops, realize)
+                     contexts_for, feasible_ops)
 
 CONFIDENCE = 0.95
 N_BOOT = 2000
@@ -76,7 +77,7 @@ class AuditResult:
     asr_upper: float                       # Clopper-Pearson upper bound of asr (95 %)
     n_targets: int
     recon_ops: int                         # operations spent on spare cards
-    best: Strategy
+    best: Strategy | StepwisePolicy        # the attack's best candidate (a policy for the stepwise attack)
     clean_quality: dict                    # {"val": quality(...), "test": quality(...)} at tau
     meta: dict
     feasible_share: float                  # executed adversarial ops on target cards passing feasible_ops
@@ -118,12 +119,15 @@ def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_decline
     return run_episode(serving, ctx, real_txs, max_declines, rho, tau_after_decline=tau_after_decline)
 
 
-def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best: Strategy, tm: ThreatModel,
+def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm: ThreatModel,
                     merchants: MerchantTable, seed: int, i: int) -> dict:
-    """Adversarial and clean run of target ``i``; plain types only (crosses process boundaries)."""
-    txs = realize(best, ctx, tm, merchants, np.random.default_rng([seed, _STREAM_TARGET, i]))
-    adv = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
-    executed = txs[:adv.n_ops]  # time-ordered prefix: the ops the bank actually saw
+    """Adversarial and clean run of target ``i``; plain types only (crosses process boundaries).
+
+    Dispatch on the candidate type (``execute_candidate``): a fixed ``Strategy`` is realised and run by
+    ``run_episode``, a ``StepwisePolicy`` runs closed-loop (``run_adaptive_episode``). ``executed`` are the
+    operations the bank actually saw; each is checked against the threat model."""
+    adv, executed = execute_candidate(serving, ctx, best, tm, merchants,
+                                      np.random.default_rng([seed, _STREAM_TARGET, i]))
     n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
     clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline)
     return {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
@@ -273,12 +277,13 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
                                            else [seed, _STREAM_ATTACK, int(attack_seed)])
         run = attack.run(oracle, tm, attack_rng)
         recon = {"attack": type(attack).__name__, "attack_params": _attack_params(attack),
+                 "held_out": bool(getattr(attack, "held_out", False)),
                  "evals": int(run.evals), "ops_used": int(run.ops_used),
                  "best_fitness": float(run.best_fitness), "cards_blocked": int(oracle.cards_blocked),
                  "n_spare_episodes": len(spares)}
     if run.best is None:
         raise ValueError(f"the recon budget {tm.recon_budget_ops} did not allow a single evaluation")
-    best = run.best.clip(tm, len(merchants))
+    best = clip_candidate(run.best, tm, merchants)
 
     clean = [episode_txs(df, ctx.episode) for ctx in targets]
     idx = list(range(len(targets)))
@@ -586,11 +591,45 @@ def strategy_dict(s: Strategy, merchants: MerchantTable | None = None) -> dict:
             "merchant": [int(x) for x in s.merchant], "ops": ops}
 
 
+def policy_dict(p: StepwisePolicy, merchants: MerchantTable | None = None) -> dict:
+    """The stepwise policy as JSON: ``type: "stepwise_policy"``, its parameters and, with ``merchants``, the
+    name of the preferred category."""
+    d = {"type": "stepwise_policy", **p.as_dict()}
+    if merchants is not None and p.cat_pref < merchants.n_categories:
+        d["category"] = merchants.categories[p.cat_pref]
+    return d
+
+
+def candidate_dict(c, merchants: MerchantTable | None = None) -> dict:
+    """``policy_dict`` for a ``StepwisePolicy``, ``strategy_dict`` for a ``Strategy``."""
+    return policy_dict(c, merchants) if isinstance(c, StepwisePolicy) else strategy_dict(c, merchants)
+
+
+def policy_markdown(b: dict) -> list[str]:
+    """Markdown lines describing a ``policy_dict``."""
+    lo, hi = (b["hour"] - b["hour_jitter"]) % 24, (b["hour"] + b["hour_jitter"]) % 24
+    band = "the whole day" if b["hour_jitter"] >= 12 else (f"{int(lo):02d}:{int(lo % 1 * 60):02d}–"
+                                                          f"{int(hi):02d}:{int(hi % 1 * 60):02d}")
+    return [
+        "Closed-loop stepwise policy (every next operation is chosen after the bank's decision on the previous one):",
+        "",
+        "| parameter | value |", "|---|---|",
+        f"| first amount `s0` (share of the maximal amount) | {_pct(b['s0'])} |",
+        f"| multiplier after a passed operation `g` | {_num(b['g'])} |",
+        f"| multiplier after a declined operation `b` | {_num(b['b'])} |",
+        f"| active hours (`hour` ± `hour_jitter`) | {band} |",
+        f"| delay between operations `gap_h` | {_num(b['gap_h'], 2)} h |",
+        f"| preferred category `cat_pref` | {b.get('category', b['cat_pref'])} |",
+        f"| switch category after a decline | {'yes' if b['switch_on_decline'] else 'no'} |",
+        f"| stop at withdrawn share `u` of A | {_pct(b['u'])} |",
+    ]
+
+
 def to_json(r: AuditResult, merchants: MerchantTable | None = None) -> dict:
-    """Every field of ``r``; the best strategy via ``strategy_dict`` (categories need ``merchants``)."""
+    """Every field of ``r``; the best candidate via ``candidate_dict`` (categories need ``merchants``)."""
     def ci(t):
         return {"mean": t[0], "lower": t[1], "upper": t[2]}
-    best = strategy_dict(r.best, merchants)
+    best = candidate_dict(r.best, merchants)
     return {"ver_adv": ci(r.ver_adv), "ver_clean": ci(r.ver_clean), "uplift": ci(r.uplift), "asr": r.asr, "asr_upper": r.asr_upper,
             "n_targets": r.n_targets, "recon_ops": r.recon_ops, "feasible_share": r.feasible_share,
             "best": best, "clean_quality": r.clean_quality, "meta": r.meta, "per_target": r.per_target,
@@ -675,24 +714,31 @@ def summary_markdown(data: dict) -> str:
         "",
         "## Best strategy",
         "",
-        f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A. The table is the strategy plan in order of "
-        "planned time, before wrapping into the window and spacing the operations (min_gap_secs), not the order "
-        "of the operations actually executed:",
-        "",
-        "| # | share of A | day | hour | category |",
-        "|---:|---:|---:|---:|---|",
     ]
-    for i, op in enumerate(b["ops"], 1):
-        lines.append(f"| {i} | {_pct(op['share_of_A'])} | {op['day_index']} | {op['time_of_day']} "
-                     f"| {op.get('category', '–')} |")
+    if b.get("type") == "stepwise_policy":
+        lines += policy_markdown(b) + [""]
+    else:
+        lines += [
+            f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A. The table is the strategy plan in order of "
+            "planned time, before wrapping into the window and spacing the operations (min_gap_secs), not the "
+            "order of the operations actually executed:",
+            "",
+            "| # | share of A | day | hour | category |",
+            "|---:|---:|---:|---:|---|",
+        ]
+        for i, op in enumerate(b["ops"], 1):
+            lines.append(f"| {i} | {_pct(op['share_of_A'])} | {op['day_index']} | {op['time_of_day']} "
+                         f"| {op.get('category', '–')} |")
+        lines += [
+            "",
+            "The day is counted from midnight of the episode start day (0 – the start day). An operation planned "
+            f"before the episode start is moved one day later, and one that falls beyond the "
+            f"{m['threat_model']['params']['window_days']}-day window is moved one day "
+            "earlier; the time of day is kept. Amounts are clipped to the single-operation limits and rounded to "
+            "cents, so the actual amount may differ slightly from the share of A.",
+            "",
+        ]
     lines += [
-        "",
-        "The day is counted from midnight of the episode start day (0 – the start day). An operation planned "
-        f"before the episode start is moved one day later, and one that falls beyond the "
-        f"{m['threat_model']['params']['window_days']}-day window is moved one day "
-        "earlier; the time of day is kept. Amounts are clipped to the single-operation limits and rounded to "
-        "cents, so the actual amount may differ slightly from the share of A.",
-        "",
         "## Model quality on clean data (at τ)",
         "",
         "| period | recall | FPR | precision | operations | fraud |",

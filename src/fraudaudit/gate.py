@@ -5,7 +5,7 @@
     target_fpr: 0.01        # FPR per operation the model's τ was chosen for (checked against model.json)
     recall_clean_min: 0.5   # recall on clean test operations at τ
     delta: 0.05             # allowed uplift VER_adv − VER_clean (share of the episode amount A)
-    attacks: [random, es]   # the ensemble: every attack ...
+    attacks: [random, es, stepwise]  # the ensemble: every attack ... (stepwise: held-out, never used in hardening)
     attack_seeds: [1, 2, 3] # ... with every attack seed, on the same target/spare split
     confidence: 0.95        # level of every interval
     one_sided: true         # the uplift upper bound is one-sided (the gate tests only uplift ≤ δ); VER stays two-sided
@@ -33,7 +33,8 @@ import yaml
 
 from .data import SPARES_PERIODS
 
-ATTACKS = ("random", "es")
+ATTACKS = ("random", "es", "stepwise")
+HELD_OUT_ATTACKS = ("stepwise",)  # never used in hardening (``harden.check_generation_attack`` rejects them)
 GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence", "one_sided",
              "spares_period")
 
@@ -141,10 +142,13 @@ def parse_run_key(key: str) -> tuple[str, int]:
 def make_attack(name: str, tm):
     from .attacks.evolution import EvolutionStrategy
     from .attacks.random_search import RandomSearch
+    from .attacks.stepwise import StepwiseAttack
     if name == "random":
         return RandomSearch()
     if name == "es":
         return EvolutionStrategy.from_params(tm.es)
+    if name == "stepwise":
+        return StepwiseAttack()
     raise ValueError(f"unknown attack {name!r}")
 
 
