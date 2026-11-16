@@ -55,16 +55,16 @@ Run of 2026-11-16, seed 42, Docker `fraudaudit:dev` on an Apple-silicon Mac (Lin
 | `val` | 225 709 | 1 256 |
 | `test` | 555 719 | 2 145 |
 
-τ = 0.013072659261524677
+τ = 0.012350881472229958
 
 | at τ | recall | FPR | precision | TP | FP |
 |---|---:|---:|---:|---:|---:|
-| `val` | 0.9817 | 0.0098 | 0.3601 | 1 233 | 2 191 |
-| `test` | 0.9744 | 0.0090 | 0.2947 | 2 090 | 5 002 |
+| `val` | 0.9817 | 0.0100 | 0.3547 | 1 233 | 2 243 |
+| `test` | 0.9767 | 0.0091 | 0.2945 | 2 095 | 5 019 |
 
-Test recall by month (Jun–Dec 2020) stays between 0.963 and 0.985 and test FPR between 0.82 % and 1.02 %, so the score is stable over the test period.
+Test recall by month (Jun–Dec 2020) stays between 0.965 and 0.993 and test FPR between 0.77 % and 1.03 %, so the score is stable over the test period.
 
-The previous `bachelor+hour` baseline with the calendar features (36 features, τ = 0.005090115591883659: test recall 0.9692, FPR 0.0083, precision 0.3103) is kept in `models-bachelor-hour/` (see its README). The older baseline without time of day (34 features incl. the calendar features, τ = 0.047462500631809235: test recall 0.9524, FPR 0.0086, precision 0.3014; val recall 0.9777, FPR 0.0098) is kept in `models-bachelor/` for comparison; the current code does not load it (see `models-bachelor/README.md`).
+The previous `bachelor+hour-calendar` baseline without the behavioural features (34 features, τ = 0.013072659261524677: test recall 0.9744, FPR 0.0090, precision 0.2947) is kept in `models-no-behav/` (see its README). The `bachelor+hour` baseline with the calendar features (36 features, τ = 0.005090115591883659: test recall 0.9692, FPR 0.0083, precision 0.3103) is kept in `models-bachelor-hour/` (see its README). The older baseline without time of day (34 features incl. the calendar features, τ = 0.047462500631809235: test recall 0.9524, FPR 0.0086, precision 0.3014; val recall 0.9777, FPR 0.0098) is kept in `models-bachelor/` for comparison; the current code does not load it (see `models-bachelor/README.md`).
 
 Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SHA` / `GIT_DIRTY` if set, else from `git`, else `"unknown"`. The image has no git, so pass them in Docker:
 
@@ -72,9 +72,9 @@ Every run records `git_sha` and `git_dirty` in `meta`: from the env vars `GIT_SH
       -e GIT_DIRTY="$(test -z "$(git status --porcelain)" && echo 0 || echo 1)" \
       --entrypoint fraudaudit fraudaudit:dev train --data data --out models --seed 42
 
-The committed baseline was trained from the clean tree at `2f3dce5` (`meta.git_sha`, `git_dirty: false`).
+The committed baseline was trained from the clean tree at `41dea63` (`meta.git_sha`, `git_dirty: false`).
 
-Wall time: 26 min 35 s in total (feature preparation 13 s, `mlp.fit` 26 min 18 s, ~79 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
+Wall time: 26 min 13 s in total (feature preparation 13 s, `mlp.fit` 25 min 54 s, ~78 s per epoch of 66 545 steps; `load_raw` not included). The full numbers are in `models/model.json` (`meta`). `FraudModel.predict_proba` on one row: ~1.1 ms.
 
 ## Audit gate
 
