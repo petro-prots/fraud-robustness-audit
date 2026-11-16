@@ -6,7 +6,10 @@ and of the paired uplift VER_adv − VER_clean.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
+import pandas as pd
 from scipy.stats import beta
 from sklearn.metrics import roc_curve
 
@@ -83,3 +86,163 @@ def uplift_se(ver_adv: np.ndarray, ver_clean: np.ndarray, n_boot: int = 2000, se
     means ``uplift_ci`` uses (same ``seed``)."""
     d = _paired(ver_adv, ver_clean)
     return float(_boot_means(d, n_boot, seed).std(ddof=1))
+
+
+# --- false blocks of legitimate cards (bank-policy Pareto front) ----------------------------------------------
+
+
+@dataclass(frozen=True)
+class FalseBlockResult:
+    """Legitimate behaviour of the test period under one bank policy.
+
+    A (card, window) pair exists when the card has at least one legitimate operation in that calendar window
+    (``window_days`` from the test start). ``share_blocked_card_windows`` is the metric of the Pareto front."""
+    share_blocked_card_windows: float
+    share_blocked_cards: float          # cards blocked in at least one window / cards with legitimate test ops
+    mean_declines_per_card_window: float
+    decline_rate: float                 # declined / decided operations (operations after a block are not decided)
+    n_card_windows: int
+    n_blocked_card_windows: int
+    n_cards: int
+    n_blocked_cards: int
+    n_ops: int                          # legitimate test operations replayed
+    n_decided_ops: int
+    n_declines: int
+    window_days: int
+    max_declines: int | None
+    tau: float
+    tau_after_decline: float | None
+
+
+class _TauServing:
+    """``inner`` with the decision ``p >= tau`` for a given ``tau`` (the bank policy's threshold)."""
+
+    def __init__(self, inner, tau: float) -> None:
+        self.inner, self.tau = inner, float(tau)
+
+    def decide(self, state, tx):
+        from .serving.core import Decision
+        d = self.inner.decide(state, tx)
+        return Decision(p=d.p, declined=bool(d.p >= self.tau))
+
+
+_FB: dict = {}
+
+
+def _fb_init(model_dir, params) -> None:
+    from .serving.core import Serving
+    from .skew import _load_model
+    _FB["model"] = Serving(_load_model(model_dir))
+    _FB["params"] = params
+
+
+def _fb_job(args):
+    return _card_windows(args, _FB["model"], _FB["params"])
+
+
+def _card_windows(args, serving, params) -> list[tuple]:
+    """Replay of one card: ``[(window, n_ops, n_decided, n_declines, blocked)]``, in window order."""
+    from types import SimpleNamespace
+
+    from .episode import _Bank
+    from .serving.state import CardState, Tx, profile_of
+    g, test_start = args
+    tau, max_declines, tau2, window_ns = params
+    prof = profile_of(g, int(g["cc_num"].iloc[0]))
+    state = CardState.from_history(prof, g[g["ts"] < test_start], at=test_start)
+    test = g[g["ts"] >= test_start]
+    t_ns = test["ts"].to_numpy(dtype="datetime64[ns]").view("int64")
+    win = (t_ns - test_start.value) // window_ns
+    srv = _TauServing(serving, tau)
+    out = []
+    bank = None
+    cur = None
+    for w, r in zip(win.tolist(), test.itertuples(index=False)):
+        tx = Tx(ts=pd.Timestamp(r.ts), amt=float(r.amt), merchant=str(r.merchant), category=str(r.category),
+                merch_lat=float(r.merch_lat), merch_long=float(r.merch_long))
+        if w != cur:
+            if bank is not None:
+                state = bank.state
+                out.append((cur, n_ops, len(bank.decisions), bank.n_declines, bank.blocked))
+            cur, n_ops = w, 0
+            bank = _Bank(srv, SimpleNamespace(episode=SimpleNamespace(amount=1.0), state=state), max_declines, 1.0,
+                         tau2)
+        n_ops += 1
+        if bank.blocked:
+            bank.state.push(tx)  # the real operation still happens (elsewhere); only the decision is not asked
+        else:
+            bank.submit(tx)
+    if bank is not None:
+        out.append((cur, n_ops, len(bank.decisions), bank.n_declines, bank.blocked))
+    return out
+
+
+def false_block_rate(df: pd.DataFrame, model_or_serving, tau: float, max_declines: int | None,
+                     window_days: int = 30, *, tau_after_decline: float | None = None,
+                     n_jobs: int | None = None, model_dir=None) -> FalseBlockResult:
+    """Share of legitimate (card, window) pairs a bank policy would block.
+
+    Replay: the state of every card is built from all its operations before the test start (history);
+    its LEGITIMATE test-period operations are then decided one by one through the serving path in time
+    order, every one pushed into the state (the bank sees the attempt). Fraud operations of the test period are
+    excluded from the replay entirely, so the metric measures purely legitimate behaviour. Calendar windows
+    of ``window_days`` start at the test start (the earliest test operation); the bank is reset per window with the
+    same semantics as ``run_episode`` (``_Bank``): declines are counted, the threshold switches to
+    ``tau_after_decline`` after the first decline in the window, the card is blocked at ``max_declines``
+    declines (``None`` = never blocked, the decline rate is still reported). After a block, the rest of that
+    window's operations are not decided (they are pushed into the state without a decision). The decision is
+    ``p >= tau`` (the policy's own ``tau``).
+
+    ``model_or_serving``: a ``Serving`` or a fitted model. ``n_jobs > 1`` needs ``model_dir`` (every worker
+    loads its own model); results are identical for any ``n_jobs``."""
+    import multiprocessing as mp
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .data import period
+    from .serving.core import Serving
+    from .skew import _REPLAY_COLS
+    if window_days < 1:
+        raise ValueError("window_days must be >= 1")
+    if max_declines is not None and max_declines < 1:
+        raise ValueError("max_declines must be None or >= 1")
+    if tau_after_decline is not None and not (0 < tau_after_decline < tau):
+        raise ValueError("tau_after_decline must be None or in (0, tau)")
+    per = period(df)
+    is_test = (per == "test").to_numpy()
+    if not is_test.any():
+        raise ValueError("no test-period operations")
+    test_start = pd.Timestamp(df.loc[is_test, "ts"].min())
+    keep = ~(is_test & (df["is_fraud"].to_numpy() == 1))
+    sub = df.loc[keep, _REPLAY_COLS].sort_values(["ts", "row"], kind="stable")
+    cards = sub.loc[sub["ts"] >= test_start, "cc_num"].unique()
+    sub = sub[sub["cc_num"].isin(cards)]
+    groups = [(g.reset_index(drop=True), test_start) for _, g in sub.groupby("cc_num", sort=True)]
+    params = (float(tau), max_declines, tau_after_decline, window_days * 86_400 * 10**9)
+    jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs
+    if jobs > 1 and len(groups) > 1:
+        if model_dir is None:
+            raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+        with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn"),
+                                 initializer=_fb_init, initargs=(str(model_dir), params)) as ex:
+            parts = list(ex.map(_fb_job, groups, chunksize=max(1, len(groups) // (4 * jobs))))
+    else:
+        if model_dir is not None:
+            from .skew import _load_model
+            serving = Serving(_load_model(model_dir))
+        else:
+            serving = model_or_serving if hasattr(model_or_serving, "decide") else Serving(model_or_serving)
+        parts = [_card_windows(a, serving, params) for a in groups]
+    cw = [t for p in parts for t in p]
+    n_cw = len(cw)
+    n_blocked = sum(1 for t in cw if t[4])
+    n_blocked_cards = sum(1 for p in parts if any(t[4] for t in p))
+    n_decided = sum(t[2] for t in cw)
+    n_decl = sum(t[3] for t in cw)
+    return FalseBlockResult(
+        share_blocked_card_windows=n_blocked / n_cw, share_blocked_cards=n_blocked_cards / len(parts),
+        mean_declines_per_card_window=n_decl / n_cw, decline_rate=n_decl / n_decided if n_decided else 0.0,
+        n_card_windows=n_cw, n_blocked_card_windows=n_blocked, n_cards=len(parts),
+        n_blocked_cards=n_blocked_cards, n_ops=sum(t[1] for t in cw), n_decided_ops=n_decided, n_declines=n_decl,
+        window_days=int(window_days), max_declines=max_declines, tau=float(tau),
+        tau_after_decline=tau_after_decline)

@@ -53,7 +53,7 @@ import pandas as pd
 from .attacks.random_search import Attack
 from .data import FIT_SPLIT_SEED, SPARES_PERIODS, fit_split, fit_split_meta, fraud_episodes, period, split_cards
 from .episode import clip_candidate, execute_candidate, run_episode
-from .metrics import clopper_pearson_upper, uplift_ci, uplift_se, ver_ci
+from .metrics import clopper_pearson_upper, false_block_rate, uplift_ci, uplift_se, ver_ci
 from .oracle import ReconOracle
 from .policy import StepwisePolicy
 from .serving.core import Serving
@@ -83,6 +83,29 @@ class AuditResult:
     feasible_share: float                  # executed adversarial ops on target cards passing feasible_ops
     per_target: list[dict]                 # card, A, ver_adv, ver_clean, success, ops, declines, blocked
     spare_cards: list[int]
+    false_blocks: dict | None = None       # informational: false blocks of legitimate cards (metrics.FalseBlockResult
+                                           # as a dict, attached by ``attach_false_blocks``); no threshold
+
+
+def attach_false_blocks(r: AuditResult, df: pd.DataFrame, model, tm: ThreatModel, *, n_jobs: int | None = None,
+                        model_dir: Path | str | None = None) -> AuditResult:
+    """``r`` with ``false_blocks`` = ``false_block_rate`` of the bank policy of ``tm`` (tau of ``model``,
+    ``max_declines``, ``tau_after_decline``) on the legitimate test-period operations. Independent of the attack."""
+    fb = false_block_rate(df, model, float(model.tau), tm.max_declines, tau_after_decline=tm.tau_after_decline,
+                          n_jobs=n_jobs, model_dir=model_dir)
+    return dataclasses.replace(r, false_blocks=dataclasses.asdict(fb))
+
+
+def false_blocks_line(fb: dict) -> str:
+    """The informational summary line (no threshold)."""
+    md = "never blocked" if fb["max_declines"] is None else f"blocked at {fb['max_declines']} declines"
+    esc = ("" if fb["tau_after_decline"] is None else f", threshold {fb['tau_after_decline']:.4g} after the first decline")
+    return (f"False blocks of legitimate cards: {_pct(fb['share_blocked_card_windows'])} of card-months "
+            f"({fb['n_blocked_card_windows']} of {fb['n_card_windows']}), {_pct(fb['share_blocked_cards'])} of cards "
+            f"({fb['n_blocked_cards']} of {fb['n_cards']}); {md}{esc}, {fb['window_days']}-day windows from the test "
+            f"start; {fb['mean_declines_per_card_window']:.2f} declines per card-month, decline rate "
+            f"{_pct(fb['decline_rate'])} of decided legitimate operations (fraud operations excluded from the "
+            "replay; informational, no threshold).")
 
 
 def episode_txs(df: pd.DataFrame, episode) -> list[Tx]:
@@ -633,7 +656,7 @@ def to_json(r: AuditResult, merchants: MerchantTable | None = None) -> dict:
     return {"ver_adv": ci(r.ver_adv), "ver_clean": ci(r.ver_clean), "uplift": ci(r.uplift), "asr": r.asr, "asr_upper": r.asr_upper,
             "n_targets": r.n_targets, "recon_ops": r.recon_ops, "feasible_share": r.feasible_share,
             "best": best, "clean_quality": r.clean_quality, "meta": r.meta, "per_target": r.per_target,
-            "spare_cards": r.spare_cards}
+            "spare_cards": r.spare_cards, "false_blocks": r.false_blocks}
 
 
 def _pct(x: float) -> str:
@@ -711,6 +734,7 @@ def summary_markdown(data: dict) -> str:
         f"- Share of executed adversarial operations that conform to the threat model: {_pct(data['feasible_share'])} "
         f"({m['n_executed_adv_ops']} operations).",
         f"- Without an attack the ρ·A threshold was reached in {m['n_clean_success']} of {data['n_targets']} episodes.",
+        *([f"- {false_blocks_line(data['false_blocks'])}"] if data.get("false_blocks") else []),
         "",
         "## Best strategy",
         "",

@@ -26,6 +26,7 @@ Checks (``decide``):
 from __future__ import annotations
 
 import math
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,9 +154,10 @@ def make_attack(name: str, tm):
 
 
 def run_ensemble(df, model, tm, cfg: GateConfig, seed: int, *, n_jobs: int | None = None, model_dir=None,
-                 threat_path=None, log=None) -> dict:
+                 threat_path=None, log=None, false_blocks: bool = False) -> dict:
     """``run_audit`` for every attack × attack seed of ``cfg``, one after another (each run uses its own
-    process pool internally), on the same split ``seed``. Returns ``{run_key: AuditResult}``."""
+    process pool internally), on the same split ``seed``. Returns ``{run_key: AuditResult}``. ``false_blocks``
+    adds the informational false-block rate of legitimate cards (computed once, the same for every run)."""
     from . import audit
     results = {}
     for name in cfg.attacks:
@@ -168,6 +170,12 @@ def run_ensemble(df, model, tm, cfg: GateConfig, seed: int, *, n_jobs: int | Non
             if log is not None:
                 log(f"{run_key(name, s)}: uplift mean {r.uplift[0]:.4f}, upper {r.uplift[2]:.4f}, "
                     f"VER_adv {r.ver_adv[0]:.4f}, {r.meta['wall_seconds']} s")
+    if false_blocks and results:
+        first = next(iter(results.values()))
+        fb = audit.attach_false_blocks(first, df, model, tm, n_jobs=n_jobs, model_dir=model_dir).false_blocks
+        results = {k: dataclasses.replace(r, false_blocks=fb) for k, r in results.items()}
+        if log is not None:
+            log(audit.false_blocks_line(fb))
     return results
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit import (BaselineResult, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
+from .audit import (BaselineResult, false_blocks_line, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
                     to_json)
 from .metrics import uplift_ci
 from .gate import HELD_OUT_ATTACKS, Check, GateConfig, parse_run_key, passed
@@ -269,6 +269,9 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               + (f"uplift paired, one-sided upper {conf} % bound (the gate tests only uplift ≤ δ)"
                  if w.meta.get("one_sided") else "uplift paired, two-sided")
               + "; ASR bound – Clopper–Pearson."]
+
+    if w.false_blocks:
+        lines += ["", "## False blocks of legitimate cards", "", f"- {false_blocks_line(w.false_blocks)}"]
 
     if baseline or baseline_error is not None:
         lines += _baseline_section(baseline or {}, results, worst_key, conf, baseline_error)

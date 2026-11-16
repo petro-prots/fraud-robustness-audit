@@ -219,7 +219,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
         return 2
     t1 = time.perf_counter()
     results = run_ensemble(df, model, tm, cfg, args.seed, n_jobs=args.n_jobs, model_dir=args.model,
-                           threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
+                           threat_path=args.threat, false_blocks=True, log=lambda m: print(m, file=sys.stderr, flush=True))
     checks = decide(cfg, results, skew)
     baseline, baseline_error = None, None
     if tms is not None:  # informational: the conventional audit on the same targets, not a gate check
