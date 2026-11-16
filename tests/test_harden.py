@@ -124,31 +124,43 @@ def test_harden_never_touches_test_period(hardened, df):
 
 
 def test_adversarial_share(hardened, df):
+    """Design §11 / R22: adversarial rows = share_among_fraud of all fit fraud rows (0.5 -> as many as real)."""
     _, reports, info, _ = hardened
     real = int(((period(df) == "fit") & (df["is_fraud"] == 1)).sum())
-    quota = round(0.5 * real)
+    assert hmod.quota_for(real, 0.5) == real and hmod.quota_for(300, 0.25) == 100
     r1 = reports[-1]
-    assert r1.round == 1 and r1.quota == quota == info["quota"]
-    assert r1.n_adv_rows == min(quota, r1.n_generated_rows)
-    assert r1.shortfall == quota - r1.n_adv_rows
+    assert r1.round == 1 and r1.quota == real == info["quota"]
+    longest = max(len(e["ops"]) for e in info["selected"])
+    assert r1.n_adv_rows <= real + longest / 2  # whole episodes, overshoot at most half an episode
+    assert r1.shortfall == max(0, real - r1.n_adv_rows)
+    assert r1.n_rows_by_generation_round == {"1": r1.n_adv_rows}
     adv = info["df"]["trans_num"].str.startswith("adv-")
     assert int(adv.sum()) == r1.n_adv_rows and (info["df"].loc[adv, "is_fraud"] == 1).all()
 
 
-def test_select_rows_quota_and_replay():
-    def ep(slot, g, n):
-        return {"slot": slot, "round": g, "ops": [{"i": (g, slot, j)} for j in range(n)]}
-    pool = {1: {i: ep(i, 1, 3) for i in range(10)}, 2: {i: ep(i, 2, 4) for i in range(10)}}
-    sel = hmod.select_rows(pool, 2, 17, seed=1)
-    assert sum(len(x["ops"]) for x in sel) == 17                      # exactly the quota
-    assert len({x["slot"] for x in sel}) == len(sel)                  # at most one episode per slot
-    assert all(x["ops"] == pool[x["round"]][x["slot"]]["ops"][:len(x["ops"])] for x in sel)  # prefixes
-    many = hmod.select_rows(pool, 2, 10_000, seed=1)                  # fewer generated: take all
-    assert sum(len(x["ops"]) for x in many) == sum(len(pool[x["round"]][x["slot"]]["ops"]) for x in many)
-    assert len(many) == 10 and {x["round"] for x in many} == {1, 2}   # replay buffer: both rounds drawn
-    assert hmod.select_rows(pool, 2, 17, seed=1) == sel               # deterministic
-    only1 = hmod.select_rows({1: pool[1]}, 1, 5, seed=1)
-    assert {x["round"] for x in only1} == {1}
+def _pool(n_slots, lens):
+    return {g: {i: {"slot": i, "round": g, "ops": [{"i": (g, i, j)} for j in range(n)]} for i in range(n_slots)}
+            for g, n in lens.items()}
+
+
+def test_select_rows_equal_row_quotas_per_round():
+    """R22: every generation round gets quota // r rows (remainder to the newest), on disjoint slots."""
+    assert hmod.round_quotas(41, 2) == {1: 20, 2: 21} and hmod.round_quotas(10, 3) == {1: 3, 2: 3, 3: 4}
+    pool = _pool(30, {1: 3, 2: 4})
+    sel = hmod.select_rows(pool, 2, 41, seed=1)
+    by = {g: sum(len(x["ops"]) for x in sel if x["round"] == g) for g in (1, 2)}
+    assert by == {1: 21, 2: 20}  # 7 × 3 (overshoot 1 <= 1.5), 5 × 4 (stops: the 6th would overshoot by 3 > 2)
+    assert len({x["slot"] for x in sel}) == len(sel)                  # one episode per slot, disjoint
+    assert all(x["ops"] == pool[x["round"]][x["slot"]]["ops"] for x in sel)  # whole episodes
+    assert hmod.select_rows(pool, 2, 41, seed=1) == sel               # deterministic
+    # overshoot by more than half an episode stops the round
+    sel = hmod.select_rows(_pool(30, {1: 4}), 1, 5, seed=1)
+    assert [len(x["ops"]) for x in sel] == [4]
+    # fewer generated than the quota: everything there is, per round
+    few = hmod.select_rows(_pool(4, {1: 3, 2: 4}), 2, 100, seed=1)
+    assert sum(len(x["ops"]) for x in few) == 3 * len([x for x in few if x["round"] == 1]) + \
+        4 * len([x for x in few if x["round"] == 2]) and len(few) == 4
+    assert hmod.select_rows(_pool(30, {1: 3}), 1, 0, seed=1) == []
 
 
 def test_inserted_rows_change_later_aggregates(df):
@@ -211,7 +223,33 @@ def test_round_reports_and_files(hardened):
     assert data["final_round"] == 1 and json.loads((out / "harden-report.json").read_text())["final_round"] == 1
     md = (out / "harden-report.md").read_text()
     assert md.startswith("# Adversarial hardening") and "| 1 |" in md and "held-out" in md
+    assert "Test false positives (diagnostic only)" in md and "| month |" in md and "| category |" in md
     assert "df" not in data["data"]
+
+
+def test_multi_round_reload_replay_and_early_stop(df, model, model_dir, tm, gate_cfg, tmp_path):
+    common = dict(seed=7, model_dir=model_dir, n_jobs=1, budget_ops=40, epochs=1, gen_seeds=(1,),
+                  gen_max_declines=(1, 3), mini_audit_seeds=(1,), baseline_audit=False)
+    final, reports, info = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=None), rounds=2,
+                                       out_dir=tmp_path / "a", **common)
+    assert [r.round for r in reports] == [1, 2]                      # no early stop without δ
+    r2 = reports[-1]
+    assert r2.model_dir == str(tmp_path / "a" / "round-2") and final.tau == r2.tau
+    reloaded = FraudModel.from_artifacts(load_artifacts(tmp_path / "a" / "round-2"))
+    assert reloaded.tau == final.tau
+    assert set(r2.n_rows_by_generation_round) == {"1", "2"}         # replay of both generation rounds
+    q = hmod.round_quotas(r2.quota, 2)
+    for g, n in r2.n_rows_by_generation_round.items():
+        assert n <= q[int(g)] + tm.k_max / 2
+    assert sum(r2.n_rows_by_generation_round.values()) == r2.n_adv_rows
+    fp = info["fp_diagnostic"] if "fp_diagnostic" in info else info["test_fp_diagnostic"]
+    for name in ("baseline", "final"):
+        assert sum(v[name]["fp"] for v in fp["by_month"].values()) == fp["total"][name]["fp"]
+        assert sum(v[name]["fp"] for v in fp["by_category"].values()) == fp["total"][name]["fp"]
+    _, early, _ = hmod.harden(df, model, tm, dataclasses.replace(gate_cfg, delta=10.0), rounds=2,
+                              out_dir=tmp_path / "b", **common)
+    assert [r.round for r in early] == [1]                           # upper bound <= δ after round 1: stop
+    assert not (tmp_path / "b" / "round-2").exists()
 
 
 def test_cli_harden_parser_defaults():
@@ -219,3 +257,4 @@ def test_cli_harden_parser_defaults():
     a = build_parser().parse_args(["harden"])
     assert str(a.out) == "models-harden" and a.rounds == 3 and a.budget_ops == 20000 and a.epochs == 20
     assert str(a.model) == "models" and str(a.gate) == "gate.yaml" and a.seed == 42
+    assert a.share_among_fraud == 0.5 and len(hmod.units()) == 32

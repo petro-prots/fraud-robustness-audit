@@ -82,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     hard.add_argument("--epochs", type=int, default=20, help="20 as in train; lower only for probes")
     hard.add_argument("--budget-ops", type=int, default=20000,
                       help="ES reconnaissance budget per generation unit (harden_budget_ops)")
+    hard.add_argument("--share-among-fraud", type=float, default=0.5,
+                      help="adversarial rows / all fraud rows of fit before balancing (design §11)")
     hard.add_argument("--no-baseline-audit", action="store_true", help="skip the round-0 mini-audit of the input model")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
@@ -324,6 +326,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
     final, reports, info = harden(df, model, tm, cfg, rounds=args.rounds, seed=args.seed, model_dir=args.model,
                                   out_dir=args.out, n_jobs=args.n_jobs, budget_ops=args.budget_ops,
                                   epochs=args.epochs, baseline_audit=not args.no_baseline_audit,
+                                  share_among_fraud=args.share_among_fraud,
                                   threat_path=args.threat, log=lambda m: print(m, file=sys.stderr, flush=True))
     meta = {"seed": int(args.seed), **git_info(), "input_model": str(args.model),
             "input_model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),

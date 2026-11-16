@@ -12,26 +12,30 @@ the host card at start times ``real start + m·(window_days + 30) days`` (m = ±
 A of the real episode, keeping a slot only if no fraud operation of the card lies in
 ``[start − 30 d, start + window_days + 30 d)``, the full 30-day history lies in the data, and
 ``start + window_days + 30 d ≤ VAL_START``. Hence episodes of one card never share a 30-day aggregate window
-(neither with each other nor with real fraud), so the context the attacker saw at generation time (the card's
-history before the slot, as in the audit) is exactly what the batch features see after insertion, and no
-``val`` row's aggregates change. Several attacks on the one real episode start would pile up in one window
+(neither with each other nor with real fraud), so the batch features after insertion see the same card history
+as the generation context (the card's history before the slot, as in the audit) – except the card's own
+legitimate operations inside the episode window, which are in the batch features but not in the generation
+state (the audit's ``REPLAY`` assumption) – and no ``val`` row's aggregates change. Several attacks on the one real episode start would pile up in one window
 and inflate the count aggregates of every inserted row.
 
 One round r (1 … ``rounds``):
 
 1. generation (process pool over the units, ruling R7; each worker loads the current model): for every
-   unit (ES seed ``s`` ∈ ``GEN_SEEDS``, ``max_declines`` ∈ ``GEN_MAX_DECLINES``, 16 units) a (μ+λ) ES with
+   unit (ES seed ``s`` ∈ ``GEN_SEEDS`` = 1…16, ``max_declines`` ∈ ``GEN_MAX_DECLINES``, 32 units) a (μ+λ) ES with
    the gate's ES parameters and the budget ``HARDEN_BUDGET_OPS`` reconnoitres on the recon contexts against
    the CURRENT model (the bank blocks after the unit's ``max_declines``); its best strategy is realised on the
    unit's slots (slot i belongs to unit ``(i + r − 1) mod 16``, so every slot gets a fresh episode each round
    and the units rotate) and executed with the bank's reaction; every executed operation up to the blocking
    decline becomes a candidate row (``is_fraud = 1``, owner fields from the card, real merchant/category and
    merchant coordinates of the realised operation, ``trans_num = adv-r{generation round}-…``);
-2. selection: ``quota = round(share · real fraud rows of fit)``. Every slot holds one adversarial episode in
-   the training stream: the episode of a uniformly drawn generation round 1 … r (a replay buffer, so a later
-   model still sees the strategies that beat the earlier models); slots are taken in a random order, whole
-   episodes, the last one cut to a time-ordered prefix, until ``quota`` rows; if fewer rows exist, all are
-   taken and the shortfall is reported;
+2. selection (ruling R22): design §11 – adversarial rows make up ``share_among_fraud`` (0.5) of the fraud rows
+   of fit before balancing, so ``quota = round(real · share/(1 − share))`` (= the number of real fraud rows of
+   fit for 0.5). Every generation round g ≤ r gets an equal row quota ``quota // r`` (the remainder goes to the
+   newest round), a replay buffer so that a later model still sees the strategies that beat the earlier
+   models, without the longer early episodes dominating. The host slots are permuted once per round; the
+   generation rounds take disjoint slots from that order (one episode per slot) and fill their quota with whole
+   episodes, stopping when the next episode would overshoot the quota by more than half of its length. The
+   actual row counts per generation round are reported (``shortfall`` when the episodes run out);
 3. insertion and retraining: the rows are inserted into the ORIGINAL stream (``insert_rows``), features are
    recomputed with the batch path, and the whole pipeline is retrained with ``train_model`` (same procedure,
    same seed: encoder, scaler, IsolationForest, MLP; τ at FPR 1 % on clean val);
@@ -73,9 +77,9 @@ from .serving.core import Serving
 from .threat import EpisodeContext, MerchantTable, ThreatModel, contexts_for, feasible_ops, realize
 
 HARDEN_BUDGET_OPS = 20_000
-GEN_SEEDS = tuple(range(1, 9))
+GEN_SEEDS = tuple(range(1, 17))
 GEN_MAX_DECLINES = (1, 3)
-SHARE = 0.5
+SHARE = 0.5  # share_among_fraud: adversarial rows / (adversarial + real fraud rows of fit)
 ROUNDS = 3
 MINI_AUDIT_SEEDS = (1, 2, 3)
 AGG_MEMORY_DAYS = max(WINDOW_DAYS)  # 30: the longest aggregate window
@@ -262,31 +266,46 @@ def generate_round(model, recon: list[EpisodeContext], slot_ctx: list[EpisodeCon
             for u, unit in jobs]
 
 
-def select_rows(pool: dict[int, dict[int, dict]], r: int, quota: int, seed: int) -> list[dict]:
-    """Episodes for the training stream of round ``r`` (step 2 of the module docstring).
+def quota_for(real_fraud_rows: int, share_among_fraud: float) -> int:
+    """Adversarial rows so that they are ``share_among_fraud`` of all fraud rows of fit (design §11)."""
+    if not 0 <= share_among_fraud < 1:
+        raise ValueError(f"share_among_fraud must be in [0, 1), got {share_among_fraud!r}")
+    return int(round(real_fraud_rows * share_among_fraud / (1.0 - share_among_fraud)))
 
-    ``pool[g][slot]`` is the episode generated in round g for that slot. One generation round per slot is drawn
-    uniformly from those with a non-empty episode; slots in a random order; whole episodes until ``quota`` rows,
-    the last one cut to a prefix. Returns ``[{"slot", "round", "ops"}]`` with at most ``quota`` ops in total."""
+
+def round_quotas(quota: int, r: int) -> dict[int, int]:
+    """Equal row quotas of the generation rounds 1…r; the remainder goes to round r."""
+    q = {g: quota // r for g in range(1, r + 1)}
+    q[r] += quota - sum(q.values())
+    return q
+
+
+def select_rows(pool: dict[int, dict[int, dict]], r: int, quota: int, seed: int) -> list[dict]:
+    """Episodes for the training stream of round ``r`` (step 2 of the module docstring, ruling R22).
+
+    ``pool[g][slot]`` is the episode generated in round g for that slot. The slots are permuted with
+    ``default_rng([seed, 7, r])``; generation rounds 1…r in turn take the next unused slots of that order that
+    hold a non-empty episode of their round, whole episodes, until their row quota (``round_quotas``) is reached;
+    an episode that would overshoot the quota by more than half its length stops the round. Every slot is used
+    at most once. Returns ``[{"slot", "round", "ops"}]``."""
     rng = np.random.default_rng([seed, _STREAM_SELECT, r])
     slots = sorted({i for g in pool.values() for i in g})
-    choice = {}
-    for i in slots:
-        rounds = [g for g in sorted(pool) if i in pool[g] and pool[g][i]["ops"]]
-        k = int(rng.integers(0, len(rounds))) if rounds else -1
-        if rounds:
-            choice[i] = rounds[k]
-    order = rng.permutation(len(slots))
-    out, left = [], int(quota)
-    for j in order:
-        i = slots[int(j)]
-        if left <= 0:
-            break
-        if i not in choice:
-            continue
-        ops = pool[choice[i]][i]["ops"][:left]
-        out.append({"slot": i, "round": choice[i], "ops": ops})
-        left -= len(ops)
+    order = [slots[int(j)] for j in rng.permutation(len(slots))]
+    used: set[int] = set()
+    out = []
+    for g, q in round_quotas(int(quota), r).items():
+        rows = 0
+        for i in order:
+            if rows >= q:
+                break
+            if i in used or i not in pool.get(g, {}) or not pool[g][i]["ops"]:
+                continue
+            ops = pool[g][i]["ops"]
+            if rows + len(ops) - q > len(ops) / 2:
+                break
+            out.append({"slot": i, "round": g, "ops": ops})
+            used.add(i)
+            rows += len(ops)
     return out
 
 
@@ -337,7 +356,8 @@ def _round_metrics(res: dict) -> dict:
             "val_quality": first.clean_quality["val"]}
 
 
-def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROUNDS, share: float = SHARE,
+def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROUNDS,
+           share_among_fraud: float = SHARE,
            seed: int = 42, *, model_dir: Path | str, out_dir: Path | str, n_jobs: int | None = None,
            budget_ops: int = HARDEN_BUDGET_OPS, epochs: int | None = None, gen_seeds=GEN_SEEDS,
            gen_max_declines=GEN_MAX_DECLINES, mini_audit_seeds=MINI_AUDIT_SEEDS, baseline_audit: bool = True,
@@ -363,17 +383,17 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
     slot_ctx = contexts_for(df, slots)
     merchants = MerchantTable.from_df(df)
     real_fraud_fit = int(((period(df) == "fit") & (df["is_fraud"] == 1)).sum())
-    quota = int(round(share * real_fraud_fit))
+    quota = quota_for(real_fraud_fit, share_among_fraud)
     info = {"fit_split": fit_split_meta(h_eps, s_eps, FIT_SPLIT_SEED),
             "h_cards": sorted({e.card for e in h_eps}), "s_cards": sorted({e.card for e in s_eps}),
             "recon_cards": sorted({e.card for e in recon_eps}), "host_cards": sorted({e.card for e in host_eps}),
             "n_recon_episodes": len(recon_eps), "n_host_episodes": len(host_eps), "n_slots": len(slots),
             "n_val_targets": len(val_eps), "real_fraud_rows_fit": real_fraud_fit, "quota": quota,
             "units": [{"seed": s, "max_declines": md} for s, md in unit_list], "budget_ops": int(budget_ops),
-            "epochs": epochs, "share": float(share), "seed": int(seed), "n_jobs": jobs,
+            "epochs": epochs, "share_among_fraud": float(share_among_fraud), "seed": int(seed), "n_jobs": jobs,
             "mini_audit_seeds": [int(s) for s in mini_audit_seeds]}
     say(f"H {len(h_eps)} episodes ({len(recon_eps)} recon, {len(host_eps)} hosts), S {len(s_eps)}; "
-        f"{len(slots)} host slots; quota {quota} rows (share {share} of {real_fraud_fit})")
+        f"{len(slots)} host slots; quota {quota} rows (share {share_among_fraud} among fraud, {real_fraud_fit} real)")
 
     reports: list[RoundReport] = []
     if baseline_audit:
@@ -440,8 +460,34 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         if gate_cfg.delta is not None and m["val_uplift_worst_upper"] <= gate_cfg.delta:
             say(f"round {r}: val uplift upper bound <= delta {gate_cfg.delta}: stop")
             break
+    info["test_fp_diagnostic"] = fp_diagnostic(df, {"baseline": model, "final": cur_model})
     info.update(df=df_r, selected=selected)
     return cur_model, reports, info
+
+
+def fp_diagnostic(df: pd.DataFrame, models: dict) -> dict:
+    """False positives on clean ``test`` legit operations by month and by category for each model at its τ.
+
+    Diagnostic only, computed after the last round: no hardening decision (rounds, early stop, τ, final model)
+    depends on it; τ stays the one chosen on val."""
+    from .model.pipeline import features
+    m = (period(df) == "test").to_numpy()
+    t = df.loc[m]
+    legit = (t["is_fraud"] == 0).to_numpy()
+    keys = {"month": t["ts"].dt.strftime("%Y-%m").to_numpy(), "category": t["category"].astype(str).to_numpy()}
+    out: dict = {"by_month": {}, "by_category": {}, "total": {}}
+    for name, model in models.items():
+        F = features(df, model.encoder)[m]
+        fp = (np.asarray(model.predict_proba(F)) >= model.tau) & legit
+        out["total"][name] = {"fp": int(fp.sum()), "n_legit": int(legit.sum()),
+                              "fpr": float(fp.sum() / max(1, legit.sum())), "tau": float(model.tau)}
+        for kname, k in keys.items():
+            tab = out[f"by_{kname}"]
+            for v in sorted(set(k)):
+                sel = (k == v) & legit
+                tab.setdefault(v, {})[name] = {"fp": int(fp[sel].sum()), "n_legit": int(sel.sum()),
+                                               "fpr": float(fp[sel].sum() / max(1, sel.sum()))}
+    return out
 
 
 # --- report --------------------------------------------------------------------------------------------------
@@ -495,16 +541,23 @@ def report_markdown(data: dict) -> str:
         "(mean over the seeds and worst one-sided upper bound), clean val recall/FPR at τ (τ at 1 % FPR on clean "
         "val), wall time (generation + training + mini-audit).",
         "",
+        "Adversarial rows by generation round (equal row quotas, ruling R22): "
+        + "; ".join(f"round {r['round']}: {r['n_rows_by_generation_round']}" for r in data["rounds"] if r["round"])
+        + ".",
+        "",
+        *_fp_markdown(d.get("test_fp_diagnostic")),
         "## Data",
         "",
         f"- Fit-period episodes split by card (seed {d['fit_split']['seed']}, ruling R20): H "
         f"{d['fit_split']['n_h_cards']} cards (hardening), S {d['fit_split']['n_s_cards']} cards (gate spares, "
         "never used here).",
-        f"- H split by card (seed {d['seed']}): {d['n_recon_episodes']} recon episodes (attacker reconnaissance "
+        f"- H split by card (seed {d["seed"]}): {d["n_recon_episodes"]} recon episodes (attacker reconnaissance "
         f"during generation), {d['n_host_episodes']} host cards with {d['n_slots']} host slots (adversarial "
         "episodes realised at the real episode start ± multiples of window + 30 days, away from real fraud and "
         "ending ≥ 30 days before the val period).",
-        f"- Quota: round({d['share']} × {d['real_fraud_rows_fit']} real fraud rows of fit) = {d['quota']} rows.",
+        f"- Quota: adversarial rows = {d['share_among_fraud']} of all fit fraud rows before balancing (design §11): "
+        f"round({d['real_fraud_rows_fit']} × {d['share_among_fraud']}/(1 − {d['share_among_fraud']})) = {d['quota']} "
+        "rows per round, split equally over the generation rounds so far (ruling R22).",
         f"- Generation: {len(d['units'])} ES units (seeds × max_declines "
         f"{sorted({u['max_declines'] for u in d['units']})}), budget {d['budget_ops']} operations each, "
         f"{d['n_jobs']} processes; training epochs {d['epochs']}.",
@@ -524,6 +577,26 @@ def report_markdown(data: dict) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _fp_markdown(fp: dict | None) -> list[str]:
+    if not fp:
+        return []
+    tot = fp["total"]
+    lines = ["## Test false positives (diagnostic only)", "",
+             "Computed after the last round on clean test legit operations at each model's τ (chosen on val); no "
+             "hardening decision uses it. "
+             + ", ".join(f"{n}: {v['fp']} FP of {v['n_legit']} (FPR {100 * v['fpr']:.2f} %, τ {v['tau']:.6g})"
+                         for n, v in tot.items()) + ".", ""]
+    names = list(tot)
+    for key in ("month", "category"):
+        lines += [f"| {key} | " + " | ".join(f"{n} FP (FPR)" for n in names) + " |",
+                  "|---|" + "---:|" * len(names)]
+        for v, row in fp[f"by_{key}"].items():
+            lines.append(f"| {v} | " + " | ".join(f"{row[n]['fp']} ({100 * row[n]['fpr']:.2f} %)" for n in names)
+                         + " |")
+        lines.append("")
+    return lines
 
 
 def write_report(out_dir, reports, info, meta) -> dict:
