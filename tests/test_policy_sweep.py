@@ -47,6 +47,8 @@ def test_usd_uplift_is_the_paired_bootstrap_on_dollars():
 
 def _cell(fpr, reaction, corridor, U, fb, cf, runs=None):
     return {"key": cell_key(fpr, reaction, corridor), "target_fpr": fpr, "reaction": reaction, "corridor": corridor,
+            "tau": 1 - fpr, "max_declines": 1 if reaction == "md1" else 3,
+            "tau_after_decline": 0.1 if reaction.endswith("+esc") else None, "test_recall": 0.9,
             "U": U, "friction": {"share_blocked_card_windows": fb, "share_confirm_card_days": cf},
             "runs": runs or {"es/1": {"uplift_upper": U}, "es/2": {"uplift_upper": U - 0.02}}}
 
@@ -62,7 +64,8 @@ def toy_grid(offset=0.0, tau_step=-0.05, corr_step=-0.01, md1_step=0.0, esc_step
                 fb = 0.1 * (i + 1) + (0.2 if r == "md1" else 0) + (0.05 if r == "md3+esc" else 0)
                 cf = 0.03 if c == "on" else 0.0
                 cells.append(_cell(f, r, c, U, fb, cf))
-    return {"cells": cells, "own_target_fpr": 0.01, "model_dir": "m", "gate": {"delta": 0.1, "attack_seeds": [1, 2]}}
+    return {"cells": cells, "own_target_fpr": 0.01, "model_dir": "m", "label": "a", "model_json_sha256": "sha",
+            "gate": {"delta": 0.1, "attack_seeds": [1, 2], "attacks": ["es"], "recall_clean_min": 0.5}}
 
 
 def test_t1_toy_grid_known_verdicts():
@@ -102,10 +105,22 @@ def test_t2_pick_and_confirmation():
     plan = ps.confirmation_plan({"a": g}, {"a": res})
     assert plan == [{"label": "a", "model_dir": "m", "target_fpr": picked["target_fpr"], "reaction": picked["reaction"],
                      "corridor": picked["corridor"], "key": picked["key"]}]
-    conf = {"a": {"gate": {"attack_seeds": [4, 5, 6]}, "cells": [dict(picked, U=0.2, runs={"es/4": {"uplift_upper": 0.2}})]}}
+    conf = {"a": {"gate": {"attack_seeds": [4, 5, 6], "attacks": ["es"]}, "model_json_sha256": "sha",
+                  "cells": [dict(picked, U=0.2, runs={"es/4": {"uplift_upper": 0.2}})]}}
     res2 = ps.t2({"a": g}, conf, 0.10)["a"]
     assert res2["t2"] == "not confirmed" and ps.confirmation_plan({"a": g}, {"a": res2}) == []
     assert ps.t2({"a": toy_grid()}, {}, 0.10)["a"]["t2"] == "no green cell"
+    ok = ps.t2({"a": g}, {"a": dict(conf["a"], cells=[dict(picked, runs={"es/4": {"uplift_upper": 0.05}})])}, 0.10)
+    assert ok["a"]["t2"] == "confirmed"
+    # M5: an invalid confirmation is refused, never counted
+    bad = [dict(conf["a"], gate={"attack_seeds": [1, 4], "attacks": ["es"]}),  # seeds overlap the grid's
+           dict(conf["a"], gate={"attack_seeds": [4], "attacks": ["random"]}),  # other attacks
+           dict(conf["a"], model_json_sha256="other"),
+           dict(conf["a"], cells=[dict(picked, tau=0.5, runs={"es/4": {"uplift_upper": 0.05}})]),
+           dict(conf["a"], cells=[dict(picked, corridor="x", runs={"es/4": {"uplift_upper": 0.05}})])]
+    for b in bad:
+        with pytest.raises(ValueError, match="confirmation"):
+            ps.t2({"a": g}, {"a": b}, 0.10)
 
 
 def test_rel_overestimation_toy():
@@ -114,6 +129,9 @@ def test_rel_overestimation_toy():
     assert r["rel"] == pytest.approx(0.5) and r["lower"] == pytest.approx(0.5) and r["upper"] == pytest.approx(0.5)
     r2 = ps.rel_overestimation(np.array([0.4, 0.4, 0.9, 0.8]), v_md)
     assert r2["rel"] == pytest.approx((2.5 / 4 - 0.5) / 0.5) and r2["lower"] <= r2["rel"] <= r2["upper"]
+    assert r2["n_dropped"] == 0
+    r3 = ps.rel_overestimation(np.array([0.5, 0.5, 0.5]), np.array([0.0, 0.0, 0.3]))  # resamples with VER_md = 0
+    assert 0 < r3["n_dropped"] < r3["n_boot"]
 
 
 # ---- friction: cached p equals the live replay ------------------------------------------------------------------
@@ -171,7 +189,7 @@ def sweep(env, tmp_path_factory):
 CELL_KEYS = {"key", "config_hash", "target_fpr", "tau", "reaction", "max_declines", "tau_after_decline", "corridor",
              "runs", "worst_run", "worst_uplift_upper", "mean_uplift", "max_ver_adv", "test_recall", "test_fpr",
              "amounts", "targets", "U", "U_usd", "worst_run_usd", "worst_usd_uplift_upper", "wall_seconds",
-             "ensemble_seconds", "friction"}
+             "ensemble_seconds", "friction", "provenance"}
 
 
 def test_policy_sweep_cell_schema(env, sweep):
@@ -296,3 +314,80 @@ def test_cli_policy_sweep_parser():
     assert str(a.corridor_threat).endswith("realistic-corridor-v1v2.yaml")
     with pytest.raises(SystemExit):
         build_parser().parse_args(["policy-sweep", "--model", "m", "--label", "l", "--no-friction", "--friction-only"])
+
+
+# ---- review fixes: wiring of the cell policy, provenance ---------------------------------------------------------
+
+def test_cell_policy_reaches_the_threat_model(env, tmp_path, monkeypatch):
+    """I2: the ThreatModel handed to run_cell carries the cell's reaction and corridor (not the YAML's policy)."""
+    from fraudaudit import policy_sweep as mod
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    seen = {}
+    real = mod.run_cell
+
+    def spy(df_, mdl, mdir, tm_c, *a, **k):
+        seen[(round(float(mdl.tau), 12), tm_c.max_declines, tm_c.tau_after_decline,
+              None if tm_c.corridor is None else json.dumps(tm_c.corridor.public(), sort_keys=True))] = True
+        return real(df_, mdl, mdir, tm_c, *a, **k)
+
+    monkeypatch.setattr(mod, "run_cell", spy)
+    data = mod.policy_sweep(df, model, d, "m", dataclasses.replace(tm, max_declines=7), ctm, g, fprs=(0.01, 0.05),
+                            reactions=("md1", "md3", "md3+esc"), corridors=("off", "on"), esc_fpr=0.2, r19=True,
+                            seed=1, n_jobs=1, out_dir=tmp_path / "w", friction=False)
+    on = data["corridor_params"]
+    assert on is not None and on["q"] == ctm.corridor.q  # the prepared corridor of --corridor-threat
+    want = set()
+    for c in data["cells"]:
+        md = {"md1": 1, "md2": 2, "md3": 3, "md3+esc": 3, "mdinf": None}[c["reaction"]]
+        t2 = data["tau_esc"] if c["reaction"] == "md3+esc" else None
+        want.add((round(c["tau"], 12), md, t2, json.dumps(on, sort_keys=True) if c["corridor"] == "on" else None))
+    assert set(seen) == want and len(seen) == len(data["cells"]) == 2 * 3 * 2 + 2
+    assert any(k[1] is None for k in seen) and any(k[1] == 2 for k in seen)  # the R19 cells mdinf, md2
+
+
+def test_reuse_refused_for_other_code_or_machine(env, sweep, monkeypatch, tmp_path):
+    """I1: a finished cell / friction entry is never reused by a run of another git SHA, machine or a dirty tree."""
+    import shutil
+
+    from fraudaudit import policy_sweep as mod
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    data, out = sweep
+    assert all(c["provenance"]["git_sha"] for c in data["cells"])
+    assert all(e["provenance"] for e in data["friction"]["false_blocks"].values())
+    real = mod.provenance()
+    for change in ({"git_sha": "other"}, {"host_machine": "another box"}, {"git_dirty": True}):
+        work = tmp_path / str(len(list(tmp_path.iterdir())))
+        shutil.copytree(out / "m", work)
+        monkeypatch.setattr(mod, "provenance", lambda change=change: dict(real, **change))
+        with pytest.raises(ValueError, match="refusing to reuse"):
+            mod.policy_sweep(df, model, d, "m", tm, ctm, g, fprs=(0.01,), reactions=("md1",), corridors=("off",),
+                             seed=1, n_jobs=1, out_dir=work, friction=False)
+        with pytest.raises(ValueError, match="refusing to reuse"):
+            mod.policy_sweep(df, model, d, "m", tm, ctm, g, fprs=(0.01,), reactions=("md1",), corridors=("off",),
+                             seed=1, n_jobs=1, out_dir=work, ensemble=False)
+
+
+def test_other_gate_refused_on_resume(env, sweep, tmp_path):
+    import shutil
+
+    from fraudaudit.policy_sweep import policy_sweep
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    _, out = sweep
+    shutil.copytree(out / "m", tmp_path / "m")
+    with pytest.raises(ValueError, match="gate"):
+        policy_sweep(df, model, d, "m", tm, ctm, dataclasses.replace(g, delta=0.2), fprs=(0.01,), reactions=("md1",),
+                     corridors=("off",), seed=1, n_jobs=1, out_dir=tmp_path / "m", ensemble=False)
+
+
+def test_summary_refuses_mixed_provenance(sweep, tmp_path):
+    data, out = sweep
+    other = json.loads(json.dumps(data))
+    other["label"] = "x"
+    other["cells"][0]["provenance"]["git_sha"] = "different"
+    p2 = tmp_path / "x.json"
+    p2.write_text(json.dumps(other))
+    with pytest.raises(ValueError, match="more than one code version"):
+        ps.summarize([out / "m" / "policy-sweep.json", p2], tmp_path / "s")

@@ -71,6 +71,9 @@ def run_cell(df, model, model_dir, tm, cfg, seed: int, *, n_jobs=None, threat_pa
     runs = run_ensemble(df, model, tm, cfg, seed, n_jobs=n_jobs, model_dir=model_dir, threat_path=threat_path)
     rec = {"runs": {k: {"uplift_mean": r.uplift[0], "uplift_upper": r.uplift[2], "ver_adv_mean": r.ver_adv[0],
                         "ver_clean_mean": r.ver_clean[0], "asr": r.asr} for k, r in runs.items()}}
+    bad = [k for k, v in rec["runs"].items() if not math.isfinite(v["uplift_upper"])]
+    if bad:  # max() over NaN is order-dependent (gate.decide fails such runs as a tool error)
+        raise RuntimeError(f"non-finite uplift upper bound in runs {bad}")
     worst = max(rec["runs"], key=lambda k: rec["runs"][k]["uplift_upper"])
     first = next(iter(runs.values()))
     rec.update(worst_run=worst, worst_uplift_upper=rec["runs"][worst]["uplift_upper"],

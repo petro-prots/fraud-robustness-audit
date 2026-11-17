@@ -82,6 +82,9 @@ def usd_uplift(rec: dict, confidence: float, seed: int, one_sided: bool, n_boot:
         m, _, hi = uplift_ci(np.asarray(r["ver_adv"]) * a, np.asarray(r["ver_clean"]) * a, confidence, n_boot, seed,
                              one_sided=one_sided)
         r["usd_uplift_mean"], r["usd_uplift_upper"] = float(m), float(hi)
+    bad = [k for k, r in rec["runs"].items() if not math.isfinite(r["usd_uplift_upper"])]
+    if bad:
+        raise RuntimeError(f"non-finite dollar uplift upper bound in runs {bad}")
     w = max(rec["runs"], key=lambda k: rec["runs"][k]["usd_uplift_upper"])
     rec["worst_run_usd"], rec["worst_usd_uplift_upper"] = w, rec["runs"][w]["usd_uplift_upper"]
 
@@ -103,6 +106,26 @@ def machine_info() -> dict:
     return {"system": platform.system(), "machine": platform.machine(), "platform": platform.platform(),
             "processor": platform.processor(), "cpu_count": os.cpu_count(),
             "host_machine": os.environ.get("HOST_MACHINE")}
+
+
+def provenance() -> dict:
+    """Code version and machine of one computed cell or friction entry (recorded per entry, ruling R17)."""
+    from .cli import git_info
+    m = machine_info()
+    return {**git_info(), "host_machine": m["host_machine"], "platform": m["platform"], "cpu_count": m["cpu_count"]}
+
+
+PROVENANCE_KEYS = ("git_sha", "git_dirty", "host_machine")
+
+
+def check_reuse(prov: dict | None, cur: dict, what: str) -> None:
+    """ValueError unless a finished entry may be reused by this run: same git SHA, dirty flag and host machine, and not
+    computed from a dirty tree (its code cannot be identified). No silent mixing of code versions or machines."""
+    old = {k: (prov or {}).get(k) for k in PROVENANCE_KEYS}
+    new = {k: cur.get(k) for k in PROVENANCE_KEYS}
+    if old != new or old["git_dirty"] is True:
+        raise ValueError(f"{what} was computed with {old}, this run is {new}: refusing to reuse it (results of "
+                         "different code or machines must not be mixed); use another --out or remove the entry")
 
 
 def load_sweep(path) -> dict | None:
@@ -171,6 +194,7 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                          "use another --out or --label")
     if old is not None and old.get("role", "grid") != role:
         raise ValueError(f"{path} has role {old.get('role')!r}, this run {role!r}")
+    prov = provenance()
 
     own_fpr = model_target_fpr(model_dir)
     if own_fpr is None:
@@ -192,14 +216,18 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
             tm_on = corridor_mod.prepare(dataclasses.replace(tm, corridor=corridor_tm.corridor), df)
 
     from .features.columns import feature_set_name
+    gate = {"attacks": list(cfg.attacks), "attack_seeds": list(cfg.attack_seeds), "target_fpr": cfg.target_fpr,
+            "confidence": cfg.confidence, "one_sided": cfg.one_sided, "spares_period": cfg.spares_period,
+            "delta": cfg.delta, "recall_clean_min": cfg.recall_clean_min, "n_boot": N_BOOT}
+    if old is not None and old.get("gate") != gate:
+        raise ValueError(f"{path} was made with the gate {old.get('gate')}, this run has {gate}: use the same --gate "
+                         "or another --out")
     data = old or {"cells": [], "friction": {"false_blocks": {}, "burden": {}}}
     data.update(label=label, model_dir=str(model_dir), model_json_sha256=model_sha, role=role,
                 feature_set=feature_set_name(model.feature_columns), n_features=len(model.feature_columns),
                 own_target_fpr=own_fpr, own_tau=float(model.tau), esc_fpr=float(esc_fpr), tau_esc=tau_esc,
                 taus={**(old or {}).get("taus", {}), **{f"{f:g}": t for f, t in taus.items()}}, seed=int(seed),
-                gate={"attacks": list(cfg.attacks), "attack_seeds": list(cfg.attack_seeds),
-                      "confidence": cfg.confidence, "one_sided": cfg.one_sided, "spares_period": cfg.spares_period,
-                      "delta": cfg.delta, "recall_clean_min": cfg.recall_clean_min},
+                gate=gate,
                 corridor_params=None if tm_on is None else tm_on.corridor.public())
     cells = {c["key"]: c for c in data["cells"]}
 
@@ -236,6 +264,7 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                   "threat": _threat_without_policy(tm), "gate": data["gate"], "seed": int(seed)}
         h = config_hash(config)
         if key in cells and cells[key].get("config_hash") == h:
+            check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
             say(f"{label} {key}: done, skipped")
             continue
         t1 = time.perf_counter()
@@ -246,14 +275,14 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
         cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
                 "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr, **rec,
                 "U": rec["worst_uplift_upper"], "U_usd": rec["worst_usd_uplift_upper"],
-                "wall_seconds": round(time.perf_counter() - t1, 1)}
+                "wall_seconds": round(time.perf_counter() - t1, 1), "provenance": prov}
         cells[key] = cell
         say(f"{label} {key}: U {100 * cell['U']:.1f} % ({cell['worst_run']}), U$ {cell['U_usd']:.0f} $, mean uplift "
             f"{100 * cell['mean_uplift']:.1f} %, test recall {cell['test_recall']:.4f}, {cell['wall_seconds']} s")
         save()
 
     if friction and cells:
-        _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save)
+        _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save, prov)
     save()
     return data
 
@@ -267,12 +296,18 @@ def _burden_key(tau: float, corridor_public: dict) -> str:
     return json.dumps({"tau": tau, "corridor": corridor_public}, sort_keys=True, default=str)
 
 
-def _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save) -> None:
+def _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save, prov) -> None:
     from .metrics import confirmation_burden, false_block_rate, legit_test_scores
     fb, bu = data["friction"]["false_blocks"], data["friction"]["burden"]
     need_fb = {_fb_key(c["tau"], c["max_declines"], c["tau_after_decline"]): c for c in cells.values()}
     need_bu = {} if tm_on is None else {_burden_key(c["tau"], tm_on.corridor.public()): c
                                         for c in cells.values() if c["corridor"] == "on"}
+    for k in need_fb:
+        if k in fb:
+            check_reuse(fb[k].get("provenance"), prov, f"false-block entry {k}")
+    for k in need_bu:
+        if k in bu:
+            check_reuse(bu[k].get("provenance"), prov, f"burden entry {k}")
     missing_fb = [k for k in need_fb if k not in fb]
     missing_bu = [k for k in need_bu if k not in bu]
     if any(c["corridor"] == "on" for c in cells.values()) and tm_on is None:
@@ -291,7 +326,7 @@ def _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, 
         t1 = time.perf_counter()
         r = false_block_rate(df, model, c["tau"], c["max_declines"], FB_WINDOW_DAYS,
                              tau_after_decline=c["tau_after_decline"], n_jobs=n_jobs, scores=scores)
-        fb[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1))
+        fb[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1), provenance=prov)
         say(f"{data['label']}: false blocks tau {c['tau']:.6g} {c['reaction']}: "
             f"{100 * r.share_blocked_card_windows:.2f} % of card-months, {fb[k]['wall_seconds']} s")
         save()
@@ -299,7 +334,7 @@ def _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, 
         c = need_bu[k]
         t1 = time.perf_counter()
         r = confirmation_burden(df, scores, c["tau"], tm_on.corridor, n_jobs=n_jobs)
-        bu[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1))
+        bu[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1), provenance=prov)
         say(f"{data['label']}: burden tau {c['tau']:.6g}: {100 * r.share_confirm_card_days:.2f} % of card-days, "
             f"{bu[k]['wall_seconds']} s")
         save()

@@ -171,13 +171,34 @@ def t2(sweeps: dict, confirmations: dict, delta: float) -> dict:
         if pick is not None and lab in confirmations:
             cc = next((c for c in confirmations[lab]["cells"] if c["key"] == pick["key"]), None)
             if cc is not None:
+                check_confirmation(s, pick, confirmations[lab], cc)
                 conf = {"key": cc["key"], "U": cc["U"], "green": green(cc, delta),
                         "attack_seeds": confirmations[lab]["gate"]["attack_seeds"]}
-        out[lab] = {"green_cells": [{"key": c["key"], "U": c["U"]} for c in gs],
+        rmin = s["gate"].get("recall_clean_min")
+        out[lab] = {"green_cells": [{"key": c["key"], "U": c["U"], "test_recall": c["test_recall"],
+                                     "recall_ok": None if rmin is None else c["test_recall"] >= rmin} for c in gs],
                     "picked": None if pick is None else pick["key"], "confirmation": conf,
                     "t2": "no green cell" if pick is None else ("pending confirmation" if conf is None else
                                                               ("confirmed" if conf["green"] else "not confirmed"))}
     return out
+
+
+def check_confirmation(grid: dict, cell: dict, conf: dict, conf_cell: dict) -> None:
+    """ValueError unless the confirmation sweep is a valid fresh-seed rerun of the picked cell: same model (model.json
+    SHA-256), same attacks, attack seeds disjoint from the grid's, same τ, reaction and corridor."""
+    g, c = grid["gate"], conf["gate"]
+    errs = []
+    if conf.get("model_json_sha256") != grid.get("model_json_sha256"):
+        errs.append("another model (model.json SHA-256)")
+    if list(c["attacks"]) != list(g["attacks"]):
+        errs.append(f"attacks {c['attacks']} != {g['attacks']}")
+    if set(c["attack_seeds"]) & set(g["attack_seeds"]):
+        errs.append(f"attack seeds {c['attack_seeds']} overlap the grid's {g['attack_seeds']}")
+    for k in ("tau", "max_declines", "tau_after_decline", "corridor", "reaction"):
+        if conf_cell.get(k) != cell.get(k):
+            errs.append(f"{k} {conf_cell.get(k)!r} != {cell.get(k)!r}")
+    if errs:
+        raise ValueError(f"confirmation of {grid['label']} {cell['key']} is not valid: " + "; ".join(errs))
 
 
 def confirmation_plan(sweeps: dict, t2_res: dict) -> list[dict]:
@@ -215,10 +236,12 @@ def rel_overestimation(v_inf: np.ndarray, v_md: np.ndarray, confidence: float = 
     ma, mb = a[idx].mean(axis=1), b[idx].mean(axis=1)
     with np.errstate(divide="ignore", invalid="ignore"):
         rs = (ma - mb) / mb
+    n_dropped = int((~np.isfinite(rs)).sum())  # resamples with mean VER_md = 0: the ratio is undefined
     rs = rs[np.isfinite(rs)]
     alpha = 1 - confidence
     lo, hi = (np.quantile(rs, [alpha / 2, 1 - alpha / 2]) if rs.size else (float("nan"), float("nan")))
-    return {"ver_inf": float(a.mean()), "ver_md": float(b.mean()), "rel": est, "lower": float(lo), "upper": float(hi)}
+    return {"ver_inf": float(a.mean()), "ver_md": float(b.mean()), "rel": est, "lower": float(lo), "upper": float(hi),
+            "n_boot": int(n_boot), "n_dropped": n_dropped}
 
 
 def r19(sweeps: dict, attack: str = "es", seed: int = 42) -> dict:
@@ -246,12 +269,14 @@ def r19_markdown(res: dict, attack: str = "es") -> str:
              "Own τ, no corridor. VER per target averaged over the ES runs (seeds of the gate) for the adversarial "
              "leg; the clean leg replays the real operations. Relative overestimation = (VER_∞ − VER_md) / VER_md, "
              "VER_∞ = never blocked; 95 % paired percentile bootstrap over targets.", "",
-             "| model | leg | max_declines | VER_∞ | VER_md | overestimation [95 % CI] |", "|---|---|---:|---:|---:|---|"]
+             "| model | leg | max_declines | VER_∞ | VER_md | overestimation [95 % CI] | resamples dropped (VER_md = 0) |",
+             "|---|---|---:|---:|---:|---|---:|"]
     for lab, legs in res.items():
         for leg, by in legs.items():
             for md, r in by.items():
                 lines.append(f"| {lab} | {leg.replace('adv_', 'adversarial ')} | {md[2:]} | {_pct(r['ver_inf'])} | "
-                             f"{_pct(r['ver_md'])} | {_pct(r['rel'])} [{_pct(r['lower'])}; {_pct(r['upper'])}] |")
+                             f"{_pct(r['ver_md'])} | {_pct(r['rel'])} [{_pct(r['lower'])}; {_pct(r['upper'])}] | "
+                             f"{r['n_dropped']} of {r['n_boot']} |")
     return "\n".join(lines) + "\n"
 
 
@@ -356,18 +381,34 @@ def load(paths) -> tuple[dict, dict]:
     return grid, conf
 
 
+def provenances(sweeps) -> list[dict]:
+    """Distinct (git SHA, dirty, host machine) of every cell and friction entry of ``sweeps``."""
+    from .policy_sweep import PROVENANCE_KEYS
+    seen = []
+    for s in sweeps:
+        entries = list(s["cells"]) + list(s["friction"]["false_blocks"].values()) + list(s["friction"]["burden"].values())
+        for e in entries:
+            p = {k: (e.get("provenance") or {}).get(k) for k in PROVENANCE_KEYS}
+            if p not in seen:
+                seen.append(p)
+    return seen
+
+
 def summarize(paths, out_dir, resolution: float = RESOLUTION) -> dict:
     grid, conf = load(paths)
     if not grid:
         raise ValueError("no grid sweeps given")
+    prov = provenances([*grid.values(), *conf.values()])
+    if len(prov) != 1 or prov[0]["git_dirty"] is True:
+        raise ValueError(f"the sweeps were computed with more than one code version / machine or from a dirty tree: "
+                         f"{prov}; rerun the affected cells with one clean commit on one machine")
     deltas = {s["gate"]["delta"] for s in grid.values()}
     if len(deltas) != 1 or None in deltas:
         raise ValueError(f"the sweeps disagree on δ or δ is null: {sorted(map(str, deltas))}")
     delta = deltas.pop()
-    machines = {json.dumps((s.get("meta", {}).get("machine") or {}).get("host_machine")) for s in grid.values()}
     res = {"delta": delta, "resolution": resolution, "t1": t1(grid, resolution),
            "policy_vs_model": policy_vs_model(grid, resolution), "t2": t2(grid, conf, delta), "r19": r19(grid),
-           "labels": list(grid), "machines": sorted(machines),
+           "labels": list(grid), "provenance": prov[0],
            "mean_amount": {lab: s.get("mean_amount") for lab, s in grid.items()},
            "delta_usd": {lab: s.get("delta_usd") for lab, s in grid.items()}}
     res["confirmation_plan"] = confirmation_plan(grid, res["t2"])
@@ -393,7 +434,9 @@ def summarize(paths, out_dir, resolution: float = RESOLUTION) -> dict:
 def hypotheses_markdown(res: dict, grid: dict) -> str:
     R = res["resolution"]
     lines = ["# Task 19: pre-registered hypotheses", "",
-             f"δ = {res['delta']:g}; R (resolution) = {100 * R:.1f} pp; machines: {', '.join(res['machines'])}.", "",
+             f"δ = {res['delta']:g}; R (resolution) = {100 * R:.1f} pp. Every cell and friction entry: git "
+             f"`{res['provenance']['git_sha']}` (dirty: {res['provenance']['git_dirty']}), machine "
+             f"{res['provenance']['host_machine']}.", "",
              "## T1: a stricter policy lowers U at the price of friction", "",
              "One-step pairs softer → stricter on one axis, the other axes fixed. Supported: median ΔU < −R and median "
              "Δfriction > 0 (axis friction: false-blocked card-months for tau / escalation / max_declines, "
@@ -411,7 +454,9 @@ def hypotheses_markdown(res: dict, grid: dict) -> str:
     lines += ["", "## T2: some policy passes the gate (confirmed with fresh seeds)", "",
               "| model | green cells (U) | picked (lowest false blocks) | confirmation | T2 |", "|---|---|---|---|---|"]
     for lab, r in res["t2"].items():
-        gc = ", ".join(f"`{g['key']}` ({_pct(g['U'])})" for g in r["green_cells"]) or "none"
+        gc = ", ".join(f"`{g['key']}` ({_pct(g['U'])}, recall {g['test_recall']:.3f}"
+                       + ("" if g["recall_ok"] is not False else " < recall_clean_min") + ")"
+                       for g in r["green_cells"]) or "none"
         cf = "–" if r["confirmation"] is None else (f"seeds {r['confirmation']['attack_seeds']}: U "
                                                     f"{_pct(r['confirmation']['U'])}")
         lines.append(f"| {lab} | {gc} | {r['picked'] or '–'} | {cf} | {r['t2']} |")
