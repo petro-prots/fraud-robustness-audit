@@ -117,6 +117,37 @@ Results:
 
 The summary section "Conventional audit (single-transaction attack) vs episode audit" compares these with the worst episode run, the mean and range of the uplift over all attack × seed runs, and the paired bootstrap of VER_adv − VER_replay. In `audit.json` they are under `baseline` (`primary`, `rules`, `comparison`).
 
+## Spending corridor with a guaranteed loss bound (`fraudaudit.corridor`)
+
+A bank policy on top of the model (soft corridor, Task 22). The `corridor:` section of the threat model
+(`threat-models/realistic-corridor.yaml`; `corridor: null` in `realistic.yaml` = off, the previous behaviour) turns it
+on for every path that decides operations through the shared bank logic (`episode._Bank`): the audit's adversarial and
+clean legs, reconnaissance, the stepwise policy, the single-transaction baseline replay and the legitimate replays.
+Decision order per operation: the model declines → decline (`max_declines`, `tau_after_decline` as before); the model
+approves and the card's AUTO-APPROVED amount in the rolling windows `(t − 24 h, t]` and `(t − 7 d, t]` plus this
+operation stays within the corridor of both windows → auto-approve; otherwise → owner confirmation in the bank app.
+The owner confirms (friction; the operation passes but is not auto-approved); the fraudster has the card details but
+not the owner's second factor (threat-model assumption), so the operation does not pass and, with
+`confirm_fail_counts_as_decline: true`, counts as a decline.
+
+Corridor of card c on day d: `C_W = max(floor_W, Q_W) · m_W(d)`, where `Q_W` is the `q`-quantile of the card's own
+rolling-W spend taken after each of its legitimate operations in `[d − lookback_days, d)` (attacker operations never
+enter the profile) and `m_W` are population multipliers estimated on the fit period – weeks `holiday_weeks` around the
+nearest of Christmas, Thanksgiving and Independence Day (both windows), weekday and day of month (24 h window only);
+each factor is used only when its bootstrap interval excludes 1. Amounts are compared in whole cents.
+
+Guarantee (Proposition): an episode of at most 7 days cannot get more auto-approved than
+`max_{t ∈ [t0, t0 + D)} C_7d(c, t)`, whatever the attack. Every corridor run reports this bound per target
+(`per_target[].corridor_bound`, share of A, and the tighter `corridor_headroom` net of the owner's own spend still in
+the window), its summary in `meta.corridor` and a bound check (`n_bound_violations`, always 0 by construction).
+
+`fraudaudit corridor-sweep --model models --threat threat-models/realistic-corridor.yaml --gate gate.yaml --out
+out/corridor-sweep` evaluates the pre-registered grid q ∈ {0.95, 0.98, 0.99, 0.995, 0.999} × τ at target FPR
+∈ {0.003, 0.01} (τ from clean val, same weights; plus a no-corridor reference per τ): the guaranteed bound, the gate
+ensemble's worst uplift under the corridor and the confirmation burden on the legitimate test stream (share of
+operations and of card-days with a confirmation; `metrics.confirmation_burden`, scores cached once per model). It
+writes `corridor-sweep.json`, `.md` (table, Pareto flags) and `.png` (front).
+
 ## Hardening (`fraudaudit harden`, local)
 
 `fraudaudit harden --data data --model models --threat threat-models/realistic.yaml --gate gate.yaml --out models-harden [--rounds 5] [--n-jobs N]` retrains the model with adversarial episodes in up to 5 rounds (`fraudaudit.harden`, module docstring has every rule). Data isolation: generation uses only the H half of the fit-period episodes (R20), split by card again into reconnaissance cards and host cards; the gate's S spares, the val and the test periods are never generated on or inserted into. Each round: 64 generation units (attack ES and random search × seeds 1–16 × `max_declines` 1 and 3, budget `--budget-ops 20000` each, in a process pool) attack the current model; each unit's best strategy is executed on its host slots (the host card's real episode start ± multiples of 37 days, away from real fraud, ending ≥ 30 days before val), and every executed operation up to blocking becomes a fraud row (`trans_num` `adv-r{round}-…`). adversarial rows = `--share-among-fraud 0.5` of all fit fraud rows before balancing (design §11: as many as the 6250 real ones), split into equal row quotas per generation round so far (ruling R22; disjoint slots, whole episodes) are inserted into the original stream, features are recomputed by the batch path and the whole pipeline is retrained with the `train` procedure and seed (τ at 1 % FPR on clean val). A mini-audit (the gate's ensemble random, es and stepwise × attack seeds 1–3, gate budget; targets = the 135 val episodes, spares = H) measures the val uplift; hardening stops when the worst one-sided upper bound over the 9 runs ≤ δ, and the final model is the last round reached (no pick among rounds). Output: `round-{r}/` model directories (with `adversarial-rows.csv`) and `harden-report.json`/`harden-report.md`. ES and random search generate hardening data (`--gen-attacks es,random`, the default; `stepwise` is refused). The stepwise attack only measures: it takes part in the val mini-audit (and so in the early-stop decision) but never produces a training row; in the final gate on the test period it is the held-out check.

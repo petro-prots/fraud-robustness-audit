@@ -175,3 +175,25 @@ def load_artifacts(model_dir: Path) -> Artifacts:
     iforest = _load_skops(model_dir / IFOREST_FILE)
     return Artifacts(mlp=mlp, scaler=scaler, iforest=iforest, encoder=encoder,
                      tau=float(info["tau"]), meta=info["meta"], manifest=manifest)
+
+
+def derive_with_tau(src_dir: Path, dst_dir: Path, tau: float, meta_update: dict) -> None:
+    """Copy the verified model of ``src_dir`` to ``dst_dir`` with another decision threshold ``tau`` (same weights,
+    another operating point): the artifact files are copied byte for byte, ``model.json`` gets ``tau`` and
+    ``meta`` updated with ``meta_update`` plus ``derived_from`` (the source ``model.json`` SHA-256), and a new
+    manifest is written. The source is verified (``load_artifacts``) first."""
+    import shutil
+    src_dir, dst_dir = Path(src_dir), Path(dst_dir)
+    load_artifacts(src_dir)  # integrity of the source before anything is copied
+    if not (isinstance(tau, (int, float)) and math.isfinite(tau) and 0.0 <= tau <= 1.0):
+        raise ValueError(f"tau must be a finite number in [0, 1], got {tau!r}")
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for name in (MLP_FILE, SCALER_FILE, IFOREST_FILE, ENCODER_FILE):
+        shutil.copyfile(src_dir / name, dst_dir / name)
+    info = _read_json(src_dir / MODEL_FILE)
+    info["tau"] = float(tau)
+    info["meta"] = dict(info["meta"], **meta_update, derived_from={"dir": str(src_dir),
+                                                                   "model_json_sha256": _sha256(src_dir / MODEL_FILE)})
+    (dst_dir / MODEL_FILE).write_text(json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest = {"format": MANIFEST_FORMAT, "sha256": {name: _sha256(dst_dir / name) for name in HASHED_FILES}}
+    (dst_dir / MANIFEST_FILE).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")

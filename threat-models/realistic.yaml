@@ -17,3 +17,4 @@ attack:
     p_merchant: 0.1        # probability of replacing the merchant with a random one
     p_k: 0.2               # probability of k ± 1
 tau_after_decline: null    # card-level threshold after the first decline (< model tau); null = no escalation
+corridor: null             # soft per-card spending corridor (Task 22); null = off. See realistic-corridor.yaml

@@ -41,6 +41,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from .corridor import CorridorConfig
 from .data import Episode
 from .serving.state import CardProfile, CardState, Tx, profile_of
 
@@ -115,15 +116,19 @@ class ThreatModel:
     min_gap_secs: int
     es: ESParams = ESParams()  # attacker search parameters (YAML ``attack.es``), not threat limits
     tau_after_decline: float | None = None  # card-level escalation after the first decline; None = off
+    corridor: CorridorConfig | None = None  # soft spending corridor (YAML ``corridor:``, optional); None = off
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ThreatModel":
         """Strict loader: every scalar field is required, unknown keys are rejected. The optional
         nested ``attack`` mapping holds attack parameters (``attack.es`` – all five ``ESParams``
-        keys); without it the defaults apply."""
+        keys); without it the defaults apply. The optional ``corridor`` mapping is the soft spending corridor
+        (``corridor.CorridorConfig.from_mapping``, every key required); ``corridor: null`` or no key = disabled."""
         raw = yaml.safe_load(Path(path).read_text())
         if not isinstance(raw, dict):
             raise ValueError(f"{path}: expected a mapping")
+        corridor_raw = raw.pop("corridor", None)
+        corridor = None if corridor_raw is None else CorridorConfig.from_mapping(corridor_raw, str(path))
         attack = raw.pop("attack", {})
         if not isinstance(attack, dict):
             raise ValueError(f"{path}: attack must be a mapping")
@@ -131,7 +136,7 @@ class ThreatModel:
         if extra_attack:
             raise ValueError(f"{path}: unknown keys in attack {extra_attack}")
         es = ESParams.from_mapping(attack["es"], str(path)) if "es" in attack else ESParams()
-        names = [f.name for f in dataclasses.fields(cls) if f.name != "es"]
+        names = [f.name for f in dataclasses.fields(cls) if f.name not in ("es", "corridor")]
         extra = sorted(set(raw) - set(names))
         missing = [n for n in names if n not in raw]
         if extra:
@@ -143,7 +148,7 @@ class ThreatModel:
                  max_declines=int(raw["max_declines"]), knowledge=str(raw["knowledge"]),
                  recon_budget_ops=int(raw["recon_budget_ops"]), cards_per_eval=int(raw["cards_per_eval"]),
                  merchant_coord_radius=float(raw["merchant_coord_radius"]),
-                 min_gap_secs=int(raw["min_gap_secs"]), es=es,
+                 min_gap_secs=int(raw["min_gap_secs"]), es=es, corridor=corridor,
                  tau_after_decline=None if raw["tau_after_decline"] is None else float(raw["tau_after_decline"]))
         if tm.tau_after_decline is not None and not 0 < tm.tau_after_decline < 1:
             raise ValueError(f"{path}: tau_after_decline must be null or in (0, 1)")

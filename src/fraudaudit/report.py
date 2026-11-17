@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit import (BaselineResult, false_blocks_line, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
+from .audit import (BaselineResult, corridor_line, false_blocks_line, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
                     to_json)
 from .metrics import uplift_ci
 from .gate import HELD_OUT_ATTACKS, Check, GateConfig, parse_run_key, passed
@@ -269,6 +269,16 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               + (f"uplift paired, one-sided upper {conf} % bound (the gate tests only uplift ≤ δ)"
                  if w.meta.get("one_sided") else "uplift paired, two-sided")
               + "; ASR bound – Clopper–Pearson."]
+
+    if w.meta.get("corridor"):
+        lines += ["", "## Spending corridor (guaranteed loss bound)", "", f"- {corridor_line(w.meta['corridor'])}",
+                  "- Decision order: model decline → decline; model approval within the 24 h and 7-day corridors → "
+                  "auto-approve; otherwise owner confirmation, which the fraudster fails (no second factor). Both "
+                  "the adversarial and the clean leg run under the corridor. The bound (max over the episode window "
+                  "of the 7-day corridor) holds for any attack strategy when the episode lasts at most 7 days.",
+                  "- Bound violations per run: " + ", ".join(
+                      f"{k} {r.meta['corridor']['n_bound_violations']}" for k, r in results.items()
+                      if r.meta.get("corridor")) + "."]
 
     if w.false_blocks:
         lines += ["", "## False blocks of legitimate cards", "", f"- {false_blocks_line(w.false_blocks)}"]

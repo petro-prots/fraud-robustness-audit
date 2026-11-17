@@ -1,0 +1,29 @@
+rho: 0.8
+k_max: 20
+amount_min: 1.00
+amount_max: 1376.04
+window_days: 7
+max_declines: 1
+knowledge: decision        # decision | score (strong – out of scope of this plan)
+recon_budget_ops: 2000     # operations on spare cards
+cards_per_eval: 5          # spare cards per strategy evaluation
+merchant_coord_radius: 1.0 # as in the Sparkov generator: ±1° from home
+min_gap_secs: 60          # minimum gap between operations of an episode, s
+attack:
+  es:                      # (mu+lambda) evolution strategy
+    mu: 5                  # parents in the population
+    lam: 10                # children per generation
+    sigma: 0.15            # mutation std, share of the field's range
+    p_merchant: 0.1        # probability of replacing the merchant with a random one
+    p_k: 0.2               # probability of k ± 1
+tau_after_decline: null    # card-level threshold after the first decline (< model tau); null = no escalation
+corridor:                  # soft per-card spending corridor (Task 22, fraudaudit.corridor); parameters fixed before any result
+  q: 0.99                  # quantile of the card's own rolling-window spend over the lookback
+  lookback_days: 180       # profile: legitimate operations in [day - 180 d, day)
+  floor_24h: 100.0         # minimal 24 h corridor, $ (cards with little history)
+  floor_7d: 300.0          # minimal 7 d corridor, $
+  multipliers: [holiday, weekday, day_of_month]  # population factors, each used only when significant
+  holiday_weeks: [-3, 1]   # week offsets k from the nearest major US holiday
+  n_boot: 1000             # bootstrap resamples of the multiplier intervals
+  confidence: 0.95         # level of the multiplier intervals
+  confirm_fail_counts_as_decline: true  # a fraudster's failed owner confirmation counts for max_declines

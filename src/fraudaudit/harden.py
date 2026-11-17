@@ -415,6 +415,8 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
     ``gen_attacks`` must be in ``GEN_ATTACKS`` (``check_generation_attack``, checked before anything else; the
     held-out ``stepwise`` is refused)."""
     unit_list = units(gen_seeds, gen_max_declines, gen_attacks)
+    if getattr(tm, "corridor", None) is not None:
+        raise ValueError("harden does not support a spending corridor in the threat model (corridor: null)")
     from .model.pipeline import EPOCHS, FraudModel, train_model
     say = log or (lambda m: None)
     jobs = max(1, int(n_jobs if n_jobs is not None else (os.cpu_count() or 1)))

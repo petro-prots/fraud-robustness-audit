@@ -50,6 +50,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import corridor as corridor_mod
 from .attacks.random_search import Attack
 from .data import FIT_SPLIT_SEED, SPARES_PERIODS, fit_split, fit_split_meta, fraud_episodes, period, split_cards
 from .episode import clip_candidate, execute_candidate, run_episode
@@ -108,6 +109,31 @@ def false_blocks_line(fb: dict) -> str:
             "replay; informational, no threshold).")
 
 
+def corridor_meta(tm: ThreatModel, per_target: list[dict]) -> dict:
+    """Parameters, fitted multipliers and the guaranteed-bound summary of a corridor run (``meta["corridor"]``)."""
+    c = tm.corridor
+    return {"params": c.public(), "multipliers": None if c.fitted is None else c.fitted.summary(),
+            "multiplier_estimates": [] if c.fitted is None else list(c.fitted.estimates),
+            "n_targets": len(per_target),
+            "n_bound_violations": int(sum(t["bound_violation"] for t in per_target)),
+            "n_adv_confirms": int(sum(t["n_confirms"] for t in per_target)),
+            "n_clean_confirms": int(sum(t["clean_n_confirms"] for t in per_target)),
+            **corridor_mod.bound_stats(per_target, tm.rho)}
+
+
+def corridor_line(c: dict) -> str:
+    """One summary line of ``meta["corridor"]``."""
+    p = c["params"]
+    return (f"Spending corridor (q {p['q']}, lookback {p['lookback_days']} d, floors {p['floor_24h']:.0f} / "
+            f"{p['floor_7d']:.0f} $, multipliers {', '.join(p['multipliers']) or 'none'}): guaranteed bound on the "
+            f"auto-approved attacker amount mean {c['bound']['mean']:.2f} $ / median {c['bound']['median']:.2f} $ / "
+            f"max {c['bound']['max']:.2f} $ = {_pct(c['bound_share']['mean'])} / {_pct(c['bound_share']['median'])} / "
+            f"{_pct(c['bound_share']['max'])} of A; bound below ρ·A for {_pct(c['share_targets_bound_below_rho_a'])} "
+            f"of targets; {c['n_bound_violations']} violations of the bound; {c['n_adv_confirms']} adversarial and "
+            f"{c['n_clean_confirms']} clean operations sent to owner confirmation (failed: the fraudster lacks the "
+            "second factor).")
+
+
 def episode_txs(df: pd.DataFrame, episode) -> list[Tx]:
     """The real operations of ``episode`` (its ``row`` ids in ``df``) as ``Tx``, in (ts, row) order."""
     ops = df[df["row"].isin(episode.rows)].sort_values(["ts", "row"], kind="stable")
@@ -118,7 +144,7 @@ def episode_txs(df: pd.DataFrame, episode) -> list[Tx]:
 
 
 def clean_ver(serving, targets: list[EpisodeContext], df: pd.DataFrame, max_declines: int | None,
-              rho: float, *, tau_after_decline: float | None = None) -> np.ndarray:
+              rho: float, *, tau_after_decline: float | None = None, corridor=None) -> np.ndarray:
     """VER of the real (non-adversarial) operations of every target episode, replayed through
     ``run_episode`` from the same pre-episode context with the same bank reaction.
 
@@ -127,7 +153,7 @@ def clean_ver(serving, targets: list[EpisodeContext], df: pd.DataFrame, max_decl
     replayed, in this clean run as in the adversarial one. So this is VER of the fraud operations
     alone, not the bank's historical outcome."""
     return np.array([_clean_outcome(serving, ctx, episode_txs(df, ctx.episode), max_declines, rho,
-                               tau_after_decline).ver
+                               tau_after_decline, corridor).ver
                      for ctx in targets], dtype=np.float64)
 
 
@@ -136,10 +162,11 @@ REPLAY = {"context": "history ts < episode.start (episode rows excluded)",
 
 
 def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_declines: int | None, rho: float,
-                   tau_after_decline: float | None = None):
+                   tau_after_decline: float | None = None, corridor=None):
     """The clean leg: the episode's real operations through ``run_episode`` (used by ``clean_ver`` and
-    by ``run_audit``)."""
-    return run_episode(serving, ctx, real_txs, max_declines, rho, tau_after_decline=tau_after_decline)
+    by ``run_audit``), under the same spending corridor as the adversarial leg."""
+    return run_episode(serving, ctx, real_txs, max_declines, rho, tau_after_decline=tau_after_decline,
+                       corridor=corridor)
 
 
 def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm: ThreatModel,
@@ -152,15 +179,23 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
     adv, executed = execute_candidate(serving, ctx, best, tm, merchants,
                                       np.random.default_rng([seed, _STREAM_TARGET, i]))
     n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
-    clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline)
-    return {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
-            "amount": float(ctx.episode.amount),
-            "ver_adv": float(adv.ver), "success": bool(adv.success), "n_ops": int(adv.n_ops),
-            "n_declines": int(adv.n_declines), "blocked": bool(adv.blocked),
-            "n_feasible_ops": int(n_ok),
-            "ver_clean": float(clean.ver), "clean_success": bool(clean.success),
-            "clean_n_ops": int(clean.n_ops), "clean_n_real_ops": len(clean_txs),
-            "clean_blocked": bool(clean.blocked)}
+    clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline, tm.corridor)
+    out = {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
+           "amount": float(ctx.episode.amount),
+           "ver_adv": float(adv.ver), "success": bool(adv.success), "n_ops": int(adv.n_ops),
+           "n_declines": int(adv.n_declines), "blocked": bool(adv.blocked),
+           "n_feasible_ops": int(n_ok),
+           "ver_clean": float(clean.ver), "clean_success": bool(clean.success),
+           "clean_n_ops": int(clean.n_ops), "clean_n_real_ops": len(clean_txs),
+           "clean_blocked": bool(clean.blocked)}
+    if tm.corridor is not None:
+        b = corridor_mod.episode_bound(tm.corridor, ctx.state, ctx.episode.start, tm.window_days)
+        a = float(ctx.episode.amount)
+        out.update(corridor_bound=b["bound_cents"] / 100, corridor_headroom=b["headroom_cents"] / 100,
+                   corridor_bound_share=b["bound_cents"] / 100 / a, corridor_headroom_share=b["headroom_cents"] / 100 / a,
+                   n_confirms=int(adv.n_confirms), clean_n_confirms=int(clean.n_confirms),
+                   bound_violation=bool(round(adv.passed_amount * 100) > b["bound_cents"]))
+    return out
 
 
 _WORKER: dict = {}  # per worker process: set once by _init_worker
@@ -282,6 +317,7 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
     jobs = max(1, int(jobs))
     if jobs > 1 and model_dir is None:
         raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+    tm = corridor_mod.prepare(tm, df)  # fits the corridor multipliers on the fit period (no-op without corridor)
 
     if not isinstance(one_sided, bool):
         raise ValueError(f"one_sided must be a bool, got {one_sided!r}")
@@ -359,6 +395,8 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
         "median_amount": float(np.median([t["amount"] for t in per_target])),
         **(extra_meta or {}),
     }
+    if tm.corridor is not None:
+        meta["corridor"] = corridor_meta(tm, per_target)
     result = AuditResult(
         ver_adv=ver_ci(v_adv, confidence, N_BOOT, seed), ver_clean=ver_ci(v_clean, confidence, N_BOOT, seed),
         uplift=uplift_ci(v_adv, v_clean, confidence, N_BOOT, seed, one_sided=one_sided),
@@ -482,8 +520,9 @@ def single_tx_target(serving, ctx: EpisodeContext, real_txs: list[Tx], tms: Sing
     order = np.argsort(offs, kind="stable")
     times = [start + pd.Timedelta(seconds=int(o)) for o in _spread(offs, tm)]
     replay = [dataclasses.replace(chosen[k]["tx"], ts=t) for t, k in zip(times, order)]
-    rep = run_episode(serving, ctx, replay, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
-    clean = _clean_outcome(serving, ctx, real_txs, tm.max_declines, tm.rho, tm.tau_after_decline)
+    rep = run_episode(serving, ctx, replay, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline,
+                      corridor=tm.corridor)
+    clean = _clean_outcome(serving, ctx, real_txs, tm.max_declines, tm.rho, tm.tau_after_decline, tm.corridor)
     return {"card": int(ctx.episode.card), "start": start.isoformat(), "amount": float(ctx.episode.amount),
             "n_ops": len(real_txs), "n_evaded": sum(c["evaded"] for c in chosen), "queries": int(queries),
             "chosen_amount": float(sum(c["tx"].amt for c in chosen if c["evaded"])),
@@ -533,6 +572,7 @@ def run_single_tx_baseline(df: pd.DataFrame, model, tm_single: SingleTxThreatMod
     jobs = max(1, int(jobs))
     if jobs > 1 and model_dir is None:
         raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+    tm_episode = corridor_mod.prepare(tm_episode, df)  # the replay runs under the episode's corridor, if any
     target_eps, _ = select_episodes(df, tuple(target_periods), spares_period, seed)
     if not target_eps:
         raise ValueError("no target episodes")
@@ -735,6 +775,7 @@ def summary_markdown(data: dict) -> str:
         f"({m['n_executed_adv_ops']} operations).",
         f"- Without an attack the ρ·A threshold was reached in {m['n_clean_success']} of {data['n_targets']} episodes.",
         *([f"- {false_blocks_line(data['false_blocks'])}"] if data.get("false_blocks") else []),
+        *([f"- {corridor_line(m['corridor'])}"] if m.get("corridor") else []),
         "",
         "## Best strategy",
         "",

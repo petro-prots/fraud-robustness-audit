@@ -246,3 +246,160 @@ def false_block_rate(df: pd.DataFrame, model_or_serving, tau: float, max_decline
         n_blocked_cards=n_blocked_cards, n_ops=sum(t[1] for t in cw), n_decided_ops=n_decided, n_declines=n_decl,
         window_days=int(window_days), max_declines=max_declines, tau=float(tau),
         tau_after_decline=tau_after_decline)
+
+
+# --- confirmation burden of the spending corridor on the legitimate stream (Task 22) --------------------------
+
+
+@dataclass(frozen=True)
+class BurdenResult:
+    """Owner-confirmation burden of a spending corridor on the legitimate test-period operations.
+
+    Every legitimate test operation is decided (no blocking, ``max_declines=None``), so ``share_confirm_ops`` =
+    confirmations / legitimate operations; a card-day exists when the card has a legitimate test operation that
+    calendar day, ``share_confirm_card_days`` = card-days with at least one confirmation / card-days."""
+    share_confirm_ops: float
+    share_confirm_card_days: float
+    n_ops: int
+    n_confirms: int
+    n_card_days: int
+    n_confirm_card_days: int
+    n_declines: int
+    decline_rate: float
+    n_cards: int
+    tau: float
+
+
+def _legit_groups(df: pd.DataFrame) -> tuple[list, pd.Timestamp]:
+    """Per card (sorted by card): its operations without test-period fraud, in (ts, row) order, and the test start."""
+    from .data import period
+    from .skew import _REPLAY_COLS
+    per = period(df)
+    is_test = (per == "test").to_numpy()
+    if not is_test.any():
+        raise ValueError("no test-period operations")
+    test_start = pd.Timestamp(df.loc[is_test, "ts"].min())
+    keep = ~(is_test & (df["is_fraud"].to_numpy() == 1))
+    cols = _REPLAY_COLS + ["is_fraud"]
+    sub = df.loc[keep, cols].sort_values(["ts", "row"], kind="stable")
+    cards = sub.loc[sub["ts"] >= test_start, "cc_num"].unique()
+    sub = sub[sub["cc_num"].isin(cards)]
+    return [g.reset_index(drop=True) for _, g in sub.groupby("cc_num", sort=True)], test_start
+
+
+def _test_txs(g: pd.DataFrame, test_start: pd.Timestamp):
+    from .serving.state import CardState, Tx, profile_of
+    prof = profile_of(g, int(g["cc_num"].iloc[0]))
+    state = CardState.from_history(prof, g[g["ts"] < test_start], at=test_start)
+    test = g[g["ts"] >= test_start]
+    txs = [Tx(ts=pd.Timestamp(r.ts), amt=float(r.amt), merchant=str(r.merchant), category=str(r.category),
+              merch_lat=float(r.merch_lat), merch_long=float(r.merch_long)) for r in test.itertuples(index=False)]
+    return state, txs
+
+
+def _card_scores(g, test_start, serving) -> np.ndarray:
+    """p of every legitimate test operation of one card, every operation pushed (no decision affects the state)."""
+    state, txs = _test_txs(g, test_start)
+    out = np.empty(len(txs), dtype=np.float64)
+    for i, tx in enumerate(txs):
+        out[i] = serving.decide(state, tx).p
+        state.push(tx)
+    return out
+
+
+def _sc_job(args):
+    return _card_scores(args[0], args[1], _FB["model"])
+
+
+def legit_test_scores(df: pd.DataFrame, model_or_serving, *, n_jobs: int | None = None,
+                      model_dir=None) -> dict[int, np.ndarray]:
+    """``{card: p of its legitimate test operations in replay order}``: the scores of ``confirmation_burden``'s
+    replay, computed once per model (they do not depend on τ or the corridor, because without blocking every
+    operation enters the state). Parallel per card like ``false_block_rate``; identical for any ``n_jobs``."""
+    import multiprocessing as mp
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .serving.core import Serving
+    groups, test_start = _legit_groups(df)
+    jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs
+    if jobs > 1 and len(groups) > 1:
+        if model_dir is None:
+            raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
+        with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn"),
+                                 initializer=_fb_init, initargs=(str(model_dir), None)) as ex:
+            parts = list(ex.map(_sc_job, [(g, test_start) for g in groups],
+                                chunksize=max(1, len(groups) // (4 * jobs))))
+    else:
+        serving = model_or_serving if hasattr(model_or_serving, "decide") else Serving(model_or_serving)
+        parts = [_card_scores(g, test_start, serving) for g in groups]
+    return {int(g["cc_num"].iloc[0]): p for g, p in zip(groups, parts)}
+
+
+class _SeqServing:
+    """Replays cached scores in call order."""
+
+    def __init__(self, p: np.ndarray) -> None:
+        self.p, self.i = p, 0
+
+    def decide(self, state, tx):
+        from .serving.core import Decision
+        p = float(self.p[self.i])
+        self.i += 1
+        return Decision(p=p, declined=False)
+
+
+def _card_burden(args) -> tuple:
+    """One card: (n_ops, n_confirms, n_declines, n_card_days, n_confirm_card_days)."""
+    from types import SimpleNamespace
+
+    from .episode import _Bank
+    g, test_start, scorer, tau, corridor = args
+    state, txs = _test_txs(g, test_start)
+    srv = _TauServing(scorer if hasattr(scorer, "decide") else _SeqServing(scorer), tau)
+    bank = _Bank(srv, SimpleNamespace(episode=SimpleNamespace(amount=1.0), state=state), None, 1.0, None, corridor,
+                 owner=True)
+    days, cdays = set(), set()
+    for tx in txs:
+        before = bank.n_confirms
+        bank.submit(tx)
+        day = tx.ts.normalize()
+        days.add(day)
+        if bank.n_confirms > before:
+            cdays.add(day)
+    return len(txs), bank.n_confirms, bank.n_declines, len(days), len(cdays)
+
+
+def confirmation_burden(df: pd.DataFrame, scores, tau: float, corridor, *, n_jobs: int | None = None) -> BurdenResult:
+    """Owner-confirmation burden of ``corridor`` (a fitted ``corridor.CorridorConfig``) at threshold ``tau`` on the
+    legitimate test-period operations (``BurdenResult``).
+
+    Replay as ``false_block_rate`` (state from all operations before the test start, test-period fraud excluded,
+    shared ``episode._Bank``) with the owner's semantics: a confirmation passes, is not auto-approved and the
+    owner's operations feed the corridor profile; ``max_declines=None`` (the corridor's own cost, independent
+    of blocking). ``scores``: a model or ``Serving`` (live, ``n_jobs`` must be 1) or the dict of
+    ``legit_test_scores`` (cached; parallel per card, identical for any ``n_jobs``)."""
+    import multiprocessing as mp
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    from .serving.core import Serving
+    corridor.check_ready()
+    groups, test_start = _legit_groups(df)
+    live = not isinstance(scores, dict)
+    if live:
+        scorer = scores if hasattr(scores, "decide") else Serving(scores)
+        args = [(g, test_start, scorer, float(tau), corridor) for g in groups]
+    else:
+        args = [(g, test_start, scores[int(g["cc_num"].iloc[0])], float(tau), corridor) for g in groups]
+    jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs
+    if jobs > 1 and len(groups) > 1 and not live:
+        with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn")) as ex:
+            parts = list(ex.map(_card_burden, args, chunksize=max(1, len(groups) // (4 * jobs))))
+    else:
+        parts = [_card_burden(a) for a in args]
+    n_ops, n_conf, n_decl, n_days, n_cdays = (sum(p[i] for p in parts) for i in range(5))
+    return BurdenResult(share_confirm_ops=n_conf / n_ops if n_ops else 0.0,
+                        share_confirm_card_days=n_cdays / n_days if n_days else 0.0, n_ops=n_ops,
+                        n_confirms=n_conf, n_card_days=n_days, n_confirm_card_days=n_cdays, n_declines=n_decl,
+                        decline_rate=n_decl / n_ops if n_ops else 0.0, n_cards=len(parts), tau=float(tau))

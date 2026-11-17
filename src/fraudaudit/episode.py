@@ -6,7 +6,14 @@ the remaining operations are not executed. ``ver`` is the share of the target su
 
 ``run_episode`` executes a fixed operation list (a realised ``Strategy``); ``run_adaptive_episode``
 executes a closed-loop policy that chooses every next operation after seeing the previous decision.
-Both share the bank side (``_Bank``).
+Both share the bank side (``_Bank``), and so do the legitimate replays of ``metrics`` (false blocks,
+confirmation burden).
+
+With a spending corridor (``corridor.CorridorConfig``, Task 22) the bank decides in this order: model decline →
+decline; model approval within the corridor of both windows → auto-approve; else → owner confirmation, which the
+owner passes (``owner=True``: friction, not auto-approved) and a fraudster fails (the operation does not pass; it
+counts as a decline when ``confirm_fail_counts_as_decline``). ``passed_amount`` of an attacker episode is then the
+auto-approved amount A_auto of the guarantee (``corridor.episode_bound``).
 """
 from __future__ import annotations
 
@@ -31,10 +38,11 @@ class EpisodeOutcome:
     success: bool
     decisions: tuple[bool, ...]  # declined flag of every executed operation, in order
     escalated: bool = False  # the threshold was switched to tau_after_decline after the first decline
+    n_confirms: int = 0  # operations sent to owner confirmation by the corridor
 
 
 def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declines: int | None,
-                rho: float, *, tau_after_decline: float | None = None) -> EpisodeOutcome:
+                rho: float, *, tau_after_decline: float | None = None, corridor=None) -> EpisodeOutcome:
     """Run ``txs`` on a copy of ``ctx.state`` (the context is never changed).
 
     ``max_declines=None`` means the bank never blocks the card; otherwise it must be >= 1.
@@ -46,8 +54,11 @@ def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declin
     before, only the threshold changes). It must lie in (0, 1) and be below the model's ``tau`` when
     ``serving.tau`` is known (``ValueError`` otherwise). ``max_declines`` counts declines under
     whichever threshold was active.
+
+    ``corridor`` (``corridor.CorridorConfig`` or None): the soft spending corridor (module docstring); the operations
+    are the attacker's.
     """
-    bank = _Bank(serving, ctx, max_declines, rho, tau_after_decline)
+    bank = _Bank(serving, ctx, max_declines, rho, tau_after_decline, corridor)
     for tx in txs:
         bank.submit(tx)
         if bank.blocked:
@@ -58,10 +69,12 @@ def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declin
 class _Bank:
     """The bank's side of one episode, shared by ``run_episode`` and ``run_adaptive_episode``: every
     attempt enters the card state, declines are counted (with the ``tau_after_decline`` escalation)
-    and the card is blocked after ``max_declines`` declines."""
+    and the card is blocked after ``max_declines`` declines. With ``corridor`` the decision order of the module
+    docstring applies; ``owner`` says whose operations these are (the owner passes a confirmation, a fraudster
+    does not; the owner's operations also feed the corridor profile)."""
 
     def __init__(self, serving, ctx: EpisodeContext, max_declines: int | None, rho: float,
-                 tau_after_decline: float | None) -> None:
+                 tau_after_decline: float | None, corridor=None, *, owner: bool = False) -> None:
         if not ctx.episode.amount > 0:
             raise ValueError("episode amount must be > 0")
         if max_declines is not None and max_declines < 1:
@@ -72,8 +85,12 @@ class _Bank:
             tau = getattr(serving, "tau", None)
             if tau is not None and not tau_after_decline < tau:
                 raise ValueError(f"tau_after_decline ({tau_after_decline}) must be < model tau ({tau})")
+        if corridor is not None:
+            corridor.check_ready()
         self.serving, self.max_declines, self.rho = serving, max_declines, rho
         self.tau_after_decline = tau_after_decline
+        self.corridor, self.owner = corridor, bool(owner)
+        self.n_confirms = 0
         self.state = ctx.state.copy()
         self.target = float(ctx.episode.amount)
         self.passed = 0.0
@@ -83,7 +100,8 @@ class _Bank:
         self.decisions: list[bool] = []
 
     def submit(self, tx: Tx) -> bool:
-        """Decide ``tx`` and push it into the state; returns the declined flag (all the attacker sees)."""
+        """Decide ``tx`` and push it into the state; returns the «did not pass» flag (all the attacker sees; without
+        a corridor it is the declined flag)."""
         if self.blocked:
             raise RuntimeError("the card is blocked")
         d = self.serving.decide(self.state, tx)
@@ -91,24 +109,35 @@ class _Bank:
         if self.escalated:
             declined = d.p >= self.tau_after_decline
         declined = bool(declined)
-        self.decisions.append(declined)
+        auto = not declined
+        confirm = False
+        if auto and self.corridor is not None:
+            from .corridor import within
+            if not within(self.corridor, self.state, tx.ts, tx.amt):
+                auto, confirm = False, True
+                self.n_confirms += 1
+        passed = auto or (confirm and self.owner)
+        if confirm and not self.owner and self.corridor.confirm_fail_counts_as_decline:
+            declined = True  # the fraudster's failed confirmation counts as a decline
+        self.decisions.append(not passed)
         if declined:
             self.n_declines += 1
-        else:
+        if passed:
             self.passed += float(tx.amt)
-        self.state.push(tx)
+        self.state.push(tx, auto_approved=auto, legit=self.owner)
         if declined and self.tau_after_decline is not None:
             self.escalated = True
         if declined and self.max_declines is not None and self.n_declines >= self.max_declines:
             self.blocked = True
-        return declined
+        return not passed
 
     def outcome(self) -> EpisodeOutcome:
         passed, target = self.passed, self.target
         return EpisodeOutcome(passed_amount=passed, ver=passed / target, n_ops=len(self.decisions),
                               n_declines=self.n_declines, blocked=self.blocked,
                               success=round(passed * 100) >= math.ceil(round(self.rho * target * 100, 6)),
-                              decisions=tuple(self.decisions), escalated=self.escalated)
+                              decisions=tuple(self.decisions), escalated=self.escalated,
+                              n_confirms=self.n_confirms)
 
 
 def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, merchants: MerchantTable,
@@ -122,9 +151,10 @@ def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, 
     no score). The bank side is the same as in ``run_episode`` (shared ``_Bank``): every attempt enters the
     state, ``tm.max_declines`` blocks the card, ``tau_after_decline`` escalates the threshold after the first
     decline, success is ``>= tm.rho·A`` in whole cents. At most ``tm.k_max`` operations are executed. A policy
-    that proposes a fixed list gives exactly ``run_episode`` on that list.
+    that proposes a fixed list gives exactly ``run_episode`` on that list. ``tm.corridor`` is the spending corridor
+    (as in ``run_episode``); the policy is sent the «did not pass» flag.
     """
-    bank = _Bank(serving, ctx, tm.max_declines, tm.rho, tau_after_decline)
+    bank = _Bank(serving, ctx, tm.max_declines, tm.rho, tau_after_decline, getattr(tm, "corridor", None))
     executed: list[Tx] = []
     gen = policy.act(ctx, tm, merchants, rng)
     try:
@@ -167,5 +197,6 @@ def execute_candidate(serving, ctx: EpisodeContext, c, tm: ThreatModel, merchant
     if isinstance(c, StepwisePolicy):
         return run_adaptive_episode(serving, ctx, c, tm, merchants, rng, tau_after_decline=tm.tau_after_decline)
     txs = realize(c, ctx, tm, merchants, rng)
-    o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline)
+    o = run_episode(serving, ctx, txs, tm.max_declines, tm.rho, tau_after_decline=tm.tau_after_decline,
+                    corridor=tm.corridor)
     return o, txs[:o.n_ops]

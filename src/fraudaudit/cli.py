@@ -91,6 +91,23 @@ def build_parser() -> argparse.ArgumentParser:
                       help="comma-separated attacks that generate hardening data (default es,random); the held-out "
                            "stepwise attack is refused")
 
+    cs = sub.add_parser("corridor-sweep", help="Pareto front of the soft spending corridor: guaranteed loss bound vs "
+                                              "owner-confirmation burden over q x tau (no retraining); writes "
+                                              "corridor-sweep.json/.md/.png")
+    cs.add_argument("--data", type=Path, default=Path("data"))
+    cs.add_argument("--model", type=Path, default=Path("models"), help="artifact directory")
+    cs.add_argument("--threat", type=Path, default=Path("threat-models/realistic-corridor.yaml"),
+                    help="threat model with the base corridor section (q is replaced by the grid)")
+    cs.add_argument("--gate", type=Path, default=Path("gate.yaml"), help="attacks, attack seeds, spares (read only)")
+    cs.add_argument("--q", type=_deltas, default=[0.95, 0.98, 0.99, 0.995, 0.999],
+                    help="comma-separated corridor quantiles (default 0.95,0.98,0.99,0.995,0.999)")
+    cs.add_argument("--target-fpr", type=_deltas, default=[0.003, 0.01],
+                    help="comma-separated target FPRs; tau of each from clean val (default 0.003,0.01)")
+    cs.add_argument("--no-reference", action="store_true", help="skip the cells without a corridor")
+    cs.add_argument("--out", type=Path, default=Path("out/corridor-sweep"))
+    cs.add_argument("--seed", type=int, default=42)
+    cs.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -362,6 +379,41 @@ def cmd_harden(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_corridor_sweep(args: argparse.Namespace) -> int:
+    import hashlib
+
+    import yaml
+
+    from fraudaudit.audit import _versions
+    from fraudaudit.corridor_sweep import corridor_sweep, write_outputs
+    from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.threat import ThreatModel
+
+    try:
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        if tm.corridor is None:
+            raise ValueError(f"{args.threat} has no corridor section")
+        df = load_raw(args.data)
+        model = FraudModel.from_artifacts(load_artifacts(args.model))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        print(f"error: corridor-sweep configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    data = corridor_sweep(df, model, args.model, tm, cfg, qs=tuple(args.q), fprs=tuple(args.target_fpr),
+                          seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out, threat_path=args.threat,
+                          reference=not args.no_reference, log=lambda m: print(m, file=sys.stderr, flush=True))
+    data["meta"] = {"seed": int(args.seed), **git_info(), "model": str(args.model),
+                    "model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),
+                    "threat_sha256": hashlib.sha256(args.threat.read_bytes()).hexdigest(),
+                    "gate_file": str(args.gate), "platform": platform.platform(), "versions": _versions()}
+    write_outputs(data, args.out)
+    print((args.out / "corridor-sweep.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
 def _baseline_brief(b: dict | None) -> dict | None:
     """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
     if b is None or "error" in b:
@@ -446,6 +498,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_decide(args)
     if args.command == "harden":
         return cmd_harden(args)
+    if args.command == "corridor-sweep":
+        return cmd_corridor_sweep(args)
     return 0
 
 
