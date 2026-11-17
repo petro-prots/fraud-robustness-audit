@@ -554,3 +554,9 @@ def test_report_mentions_corridor(audit_env, tmp_path):
     write_gate_outputs(tmp_path, g, decide(g, res), res, {"seed": 7})
     md = (tmp_path / "summary.md").read_text()
     assert "## Spending corridor" in md and "random/1 0" in md
+
+
+def test_val_tau_reproduces_training_tau(audit_env):
+    from fraudaudit.corridor_sweep import val_tau
+    df, model, _, _ = audit_env
+    assert val_tau(df, model, 0.01) == pytest.approx(model.tau, rel=1e-6)  # train_model: tau at 1 % FPR on val

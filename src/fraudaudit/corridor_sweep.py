@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import time
 from pathlib import Path
 
@@ -33,14 +34,20 @@ FPR_GRID = (0.003, 0.01)
 
 
 def val_tau(df: pd.DataFrame, model, target_fpr: float) -> float:
-    """τ at ``target_fpr`` on clean val (``threshold_at_fpr``, as in training)."""
+    """τ at ``target_fpr`` on clean val (``threshold_at_fpr``, as in training): features on the WHOLE stream (the
+    windowed aggregates need the history before val), scores of the val rows."""
     from .data import period
     from .metrics import threshold_at_fpr
     from .model.pipeline import features
     m = (period(df) == "val").to_numpy()
-    sub = df.loc[m]
-    p = np.asarray(model.predict_proba(features(sub, model.encoder)), dtype=np.float64)
-    return float(threshold_at_fpr(sub["is_fraud"].to_numpy(dtype=np.int64), p, target_fpr))
+    p = np.asarray(model.predict_proba(features(df, model.encoder)[m]), dtype=np.float64)
+    return float(threshold_at_fpr(df.loc[m, "is_fraud"].to_numpy(dtype=np.int64), p, target_fpr))
+
+
+def _model_target_fpr(model_dir):
+    meta = json.loads((Path(model_dir) / "model.json").read_text(encoding="utf-8")).get("meta", {})
+    v = meta.get("target_fpr")
+    return None if v is None else float(v)
 
 
 def pareto(points: list[tuple]) -> list[bool]:
@@ -73,9 +80,14 @@ def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, s
     scores = legit_test_scores(df, model, n_jobs=n_jobs, model_dir=model_dir)
     say(f"legit test scores: {sum(len(v) for v in scores.values())} ops, {time.perf_counter() - t0:.0f} s")
     cells = []
+    model_fpr = _model_target_fpr(model_dir)
     for fpr in fprs:
         tau = val_tau(df, model, fpr)
-        if abs(tau - float(model.tau)) <= 1e-12 * max(1.0, abs(tau)):
+        if model_fpr is not None and abs(fpr - model_fpr) < 1e-12 and not math.isclose(tau, float(model.tau),
+                                                                                        rel_tol=1e-6):
+            raise ValueError(f"tau recomputed at the model's own target_fpr {fpr} is {tau}, model.json has "
+                             f"{model.tau}: the val scores differ from training")
+        if math.isclose(tau, float(model.tau), rel_tol=1e-6):
             mdir, mdl = Path(model_dir), model
         else:
             mdir = out / "models" / f"fpr-{fpr:g}"
