@@ -86,43 +86,79 @@ def profile_of(df: pd.DataFrame, cc_num: int) -> CardProfile:
                        state=str(r["state"]))
 
 
+class _SpendBuffer:
+    """Shared growable storage of ``SpendHistory`` objects: ``n`` slots are used; a history owns the slots before its
+    own length and only the history whose length equals ``n`` may write the next slot (append-only, never
+    overwritten)."""
+    __slots__ = ("t", "a", "cs", "n")
+
+    def __init__(self, t: np.ndarray, a: np.ndarray, cs: np.ndarray, capacity: int) -> None:
+        n = t.size
+        self.t = np.empty(capacity, dtype=np.int64)
+        self.a = np.empty(capacity, dtype=np.float64)
+        self.cs = np.empty(capacity + 1, dtype=np.float64)
+        self.t[:n], self.a[:n], self.cs[:n + 1] = t, a, cs
+        self.n = n
+
+
 class SpendHistory:
     """The card's passed operations (time-ordered ns ``t``, amounts ``a``): the input of the corridor profile.
 
-    Persistent: ``append`` returns a new object, so copies of a ``CardState`` can share one history.
+    Persistent: ``append`` returns a new object, so copies of a ``CardState`` can share one history. The storage is
+    an amortised append-only buffer shared by the histories that extend one another (``_SpendBuffer``): appending to
+    the newest history writes one slot, appending to an older one (a branch) copies its prefix first, so ``append``
+    is O(1) amortised and no history ever sees another's later operations.
     ``window_quantile(day, L, W, q, lag)`` is the q-quantile (``np.quantile``, linear) of the rolling-W sums
     ``V_j = sum{a_i : t_j - W < t_i <= t_j}`` of every operation j with ``day - L <= t_j < day - lag``. ``V_j`` sums
     over time, not stream order: operations with the same timestamp as j all count (duplicates of one second give
     equal values), and so may operations up to ``t_j`` outside the lookback. With ``lag >= 0`` every input is
     before ``day - lag``, so a value for a day never changes once ``day - lag`` has passed; 0.0 without such
-    operations. Values are cached per (day, L, W, q, lag)."""
+    operations. Values are cached per (day, L, W, q, lag); an append at ``t`` keeps every cached value with
+    ``t >= day - lag`` (the new operation is not among its inputs, and the sums of its inputs end before it)."""
 
-    __slots__ = ("t", "a", "_cs", "_cache")
+    __slots__ = ("_buf", "_n", "_cache")
 
     def __init__(self, t: np.ndarray, a: np.ndarray) -> None:
-        self.t = np.asarray(t, dtype=np.int64)
-        self.a = np.asarray(a, dtype=np.float64)
-        if self.t.shape != self.a.shape or (self.t.size > 1 and (np.diff(self.t) < 0).any()):
+        t = np.asarray(t, dtype=np.int64)
+        a = np.asarray(a, dtype=np.float64)
+        if t.shape != a.shape or t.ndim != 1 or (t.size > 1 and (np.diff(t) < 0).any()):
             raise ValueError("SpendHistory needs time-ordered t and a of the same length")
-        self._cs = np.concatenate([[0.0], np.cumsum(self.a)])
+        self._buf = _SpendBuffer(t, a, np.concatenate([[0.0], np.cumsum(a)]), max(16, t.size))
+        self._n = int(t.size)
         self._cache: dict = {}
+
+    @property
+    def t(self) -> np.ndarray:
+        return self._buf.t[:self._n]
+
+    @property
+    def a(self) -> np.ndarray:
+        return self._buf.a[:self._n]
+
+    @property
+    def _cs(self) -> np.ndarray:
+        return self._buf.cs[:self._n + 1]
 
     @classmethod
     def empty(cls) -> "SpendHistory":
         return cls(np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64))
 
     def __len__(self) -> int:
-        return int(self.t.size)
+        return self._n
 
     def append(self, t_ns: int, amt: float) -> "SpendHistory":
-        if self.t.size and t_ns < self.t[-1]:
+        n, buf = self._n, self._buf
+        if n and t_ns < buf.t[n - 1]:
             raise ValueError("SpendHistory.append: time only moves forward")
+        if buf.n != n or n == buf.t.size:  # a branch of an older history, or full: copy the prefix
+            buf = _SpendBuffer(buf.t[:n], buf.a[:n], buf.cs[:n + 1], max(16, 2 * (n + 1)))
+        buf.t[n] = np.int64(t_ns)
+        buf.a[n] = float(amt)
+        buf.cs[n + 1] = buf.cs[n] + float(amt)
+        buf.n = n + 1
         h = SpendHistory.__new__(SpendHistory)
-        h.t = np.append(self.t, np.int64(t_ns))
-        h.a = np.append(self.a, float(amt))
-        h._cs = np.append(self._cs, self._cs[-1] + float(amt))
-        day = t_ns - t_ns % _DAY_NS
-        h._cache = {k: v for k, v in self._cache.items() if k[0] == day}  # values for days <= t_ns stay valid
+        h._buf, h._n = buf, n + 1
+        h._cache = {k: v for k, v in self._cache.items() if t_ns >= k[0] - k[4]}
         return h
 
     def window_quantile(self, day_ns: int, lookback_ns: int, w_ns: int, q: float, lag_ns: int) -> float:
@@ -137,8 +173,9 @@ class SpendHistory:
             if hi <= lo:
                 v = 0.0
             else:
+                cs = self._cs
                 tj = t[lo:hi]
-                vals = self._cs[np.searchsorted(t, tj, "right")] - self._cs[np.searchsorted(t, tj - w_ns, "right")]
+                vals = cs[np.searchsorted(t, tj, "right")] - cs[np.searchsorted(t, tj - w_ns, "right")]
                 v = float(np.quantile(vals, q))
             self._cache[key] = v
         return v

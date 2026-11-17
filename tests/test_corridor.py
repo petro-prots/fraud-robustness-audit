@@ -117,6 +117,43 @@ def test_spend_history_append_is_persistent():
     assert h1.window_quantile(day, 180 * w, w, 1.0, 0) == pytest.approx(70.0)
 
 
+def test_spend_history_amortised_append_parity():
+    """The amortised (shared-buffer) append and the carried-over quantile cache give exactly what a history built
+    from scratch gives, also when several branches append to one parent (persistence)."""
+    rng = np.random.default_rng(5)
+    w24 = 86_400 * 10**9
+    base_t = pd.Timestamp("2020-01-01").value
+    t = np.sort(rng.integers(0, 60 * 86_400, 200)) * 10**9 + base_t
+    t[5] = t[4]  # a same-second pair
+    a = np.round(rng.uniform(1, 500, t.size), 2)
+    parent = SpendHistory(t[:50], a[:50])
+    for i in range(50, 100):  # grown by appends: the shared buffer has spare slots, so branches must not share them
+        parent = parent.append(int(t[i]), float(a[i]))
+    assert parent._buf.t.size > 100
+    branches = []
+    for b in range(4):  # four branches from one parent, interleaved appends and queries
+        h, rows = parent, list(zip(t[:100].tolist(), a[:100].tolist()))
+        tt = int(t[99])
+        for _ in range(60):
+            tt += int(rng.integers(0, 3 * 86_400)) * 10**9 * int(rng.uniform() < 0.8)
+            amt = float(np.round(rng.uniform(1, 900), 2))
+            h = h.append(tt, amt)
+            rows.append((tt, amt))
+            branches.append((h, list(rows)))  # every intermediate history is checked again at the end
+            for lag in (0, 7 * w24):
+                for back in (0, 1, 3, 8, 9):
+                    day = tt - tt % w24 + w24 - back * w24
+                    for wl in (w24, 7 * w24):
+                        got = h.window_quantile(day, 180 * w24, wl, 0.9, lag)
+                        ref = SpendHistory(np.array([r[0] for r in rows], dtype=np.int64),
+                                           np.array([r[1] for r in rows])).window_quantile(day, 180 * w24, wl, 0.9,
+                                                                                           lag)
+                        assert got == ref
+    assert len(parent) == 100 and parent.t.tolist() == t[:100].tolist() and parent.a.tolist() == a[:100].tolist()
+    for h, rows in branches:
+        assert h.t.tolist() == [r[0] for r in rows] and h.a.tolist() == [r[1] for r in rows]
+
+
 def test_limit_cents_floor_quantile_multiplier():
     st = CardState(PROF)
     c = cfg(q=1.0)
