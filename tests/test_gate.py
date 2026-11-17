@@ -708,3 +708,42 @@ def test_cli_calibrate_parser_defaults():
     assert str(a.out) == "out/calibration" and a.deltas == [0.02, 0.05, 0.10, 0.15, 0.20] and a.seed == 42
     with pytest.raises(SystemExit):
         build_parser().parse_args(["calibrate", "--deltas", "0.1,x"])
+
+
+# ---- positive control: the replay attack (Task 19, R30) -------------------------------------------------------
+
+def test_replay_attack_gives_zero_uplift_and_passes(df, model, tm, model_dir):
+    from fraudaudit.gate import run_ensemble
+    g = cfg(attacks=["replay"], attack_seeds=[1, 2], delta=0.10, recall_clean_min=0.0, spares_period="fit")
+    res = run_ensemble(df, model, tm, g, 7, n_jobs=1, model_dir=model_dir)
+    for r in res.values():
+        assert r.uplift == (0.0, 0.0, 0.0) and r.recon_ops == 0 and r.feasible_share == 1.0
+        assert all(t["ver_adv"] == t["ver_clean"] and t["replay"] for t in r.per_target)
+        assert any(t["ver_clean"] > 0 for t in r.per_target)  # the control is not trivially zero VER
+    checks = by_name(decide(g, res))
+    assert checks["ver_uplift"].passed and checks["ver_uplift"].value == 0.0
+    assert all(c.passed for c in checks.values())
+
+
+def test_replay_parallel_identical(df, model, tm, model_dir):
+    from fraudaudit.gate import run_ensemble
+    g = cfg(attacks=["replay"], attack_seeds=[1], spares_period="fit")
+    a = run_ensemble(df, model, tm, g, 7, n_jobs=1, model_dir=model_dir)["replay/1"]
+    b = run_ensemble(df, model, tm, g, 7, n_jobs=2, model_dir=model_dir)["replay/1"]
+    assert a.per_target == b.per_target and a.uplift == b.uplift
+
+
+def test_cli_positive_control_green(cli_env):
+    code, out, summary = cli_env(dict(GATE_LOOSE, attacks=["replay"], delta=0.10), "--no-baseline")
+    assert code == 0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["passed"] is True and list(data["runs"]) == ["replay/1"]
+    assert "Positive control" in (out / "summary.md").read_text(encoding="utf-8")
+
+
+def test_committed_positive_control_and_seed_gates():
+    base = GateConfig.from_yaml(GATE_PATH)
+    pc = GateConfig.from_yaml(ROOT / "gate-positive-control.yaml")
+    s456 = GateConfig.from_yaml(ROOT / "gate-seeds-456.yaml")
+    assert pc == dataclasses.replace(base, attacks=["replay"])
+    assert s456 == dataclasses.replace(base, attack_seeds=[4, 5, 6])

@@ -34,7 +34,7 @@ import yaml
 
 from .data import SPARES_PERIODS
 
-ATTACKS = ("random", "es", "stepwise")
+ATTACKS = ("random", "es", "stepwise", "replay")  # replay: the positive control (R30), uplift 0 by construction
 HELD_OUT_ATTACKS = ("stepwise",)  # never generates hardening data (``harden.check_generation_attack`` rejects them)
 GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence", "one_sided",
              "spares_period")
@@ -143,7 +143,10 @@ def parse_run_key(key: str) -> tuple[str, int]:
 def make_attack(name: str, tm):
     from .attacks.evolution import EvolutionStrategy
     from .attacks.random_search import RandomSearch
+    from .attacks.replay import ReplayAttack
     from .attacks.stepwise import StepwiseAttack
+    if name == "replay":
+        return ReplayAttack()
     if name == "random":
         return RandomSearch()
     if name == "es":

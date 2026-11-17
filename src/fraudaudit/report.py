@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .audit import (BaselineResult, corridor_line, false_blocks_line, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
+from .audit import (REPLAY_TEXT, BaselineResult, corridor_line, false_blocks_line, _num, _pct, baseline_to_json, candidate_dict, policy_markdown, spares_text,
                     to_json)
 from .metrics import uplift_ci
 from .gate import HELD_OUT_ATTACKS, Check, GateConfig, parse_run_key, passed
@@ -306,7 +306,9 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
 
     b = candidate_dict(w.best, merchants)
     lines += ["", f"## Strategy of the worst run (`{worst_key}`)", ""]
-    if b.get("type") == "stepwise_policy":
+    if b.get("type") == "replay":
+        lines += [REPLAY_TEXT]
+    elif b.get("type") == "stepwise_policy":
         lines += policy_markdown(b)
     else:
         lines += [f"Operations k = {b['k']}, total ≈ {_pct(b['u'])} of A; plan in order of planned time (day counted "

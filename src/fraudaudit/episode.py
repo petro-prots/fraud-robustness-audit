@@ -204,7 +204,11 @@ def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, 
 
 
 def clip_candidate(c, tm: ThreatModel, merchants: MerchantTable):
-    """``c`` with every field in range (``Strategy.clip`` / ``StepwisePolicy.clip``)."""
+    """``c`` with every field in range (``Strategy.clip`` / ``StepwisePolicy.clip``); the replay candidate of the
+    positive control has no fields."""
+    from .attacks.replay import ReplayCandidate
+    if isinstance(c, ReplayCandidate):
+        return c
     if isinstance(c, StepwisePolicy):
         return c.clip(tm, merchants.n_categories)
     return c.clip(tm, len(merchants))

@@ -197,10 +197,19 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
 
     Dispatch on the candidate type (``execute_candidate``): a fixed ``Strategy`` is realised and run by
     ``run_episode``, a ``StepwisePolicy`` runs closed-loop (``run_adaptive_episode``). ``executed`` are the
-    operations the bank actually saw; each is checked against the threat model."""
-    adv, executed = execute_candidate(serving, ctx, best, tm, merchants,
-                                      np.random.default_rng([seed, _STREAM_TARGET, i]))
-    n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
+    operations the bank actually saw; each is checked against the threat model. The replay candidate of the positive
+    control (``attacks.replay``) executes the episode's real operations exactly as the clean leg; they are the observed
+    data, not attacker-generated, so they count as feasible (``replay: true``)."""
+    from .attacks.replay import ReplayCandidate
+    replay = isinstance(best, ReplayCandidate)
+    if replay:
+        adv = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline, tm.corridor)
+        executed = clean_txs[:adv.n_ops]
+        n_ok = len(executed)
+    else:
+        adv, executed = execute_candidate(serving, ctx, best, tm, merchants,
+                                          np.random.default_rng([seed, _STREAM_TARGET, i]))
+        n_ok = sum(feasible_ops(executed, ctx, tm, merchants))
     clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline, tm.corridor)
     out = {"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
            "amount": float(ctx.episode.amount),
@@ -210,6 +219,8 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
            "ver_clean": float(clean.ver), "clean_success": bool(clean.success),
            "clean_n_ops": int(clean.n_ops), "clean_n_real_ops": len(clean_txs),
            "clean_blocked": bool(clean.blocked)}
+    if replay:
+        out["replay"] = True
     if tm.corridor is not None:
         start = ctx.episode.start
         b = corridor_mod.episode_bound(tm.corridor, ctx.state, start, tm.window_days)
@@ -699,8 +710,17 @@ def policy_dict(p: StepwisePolicy, merchants: MerchantTable | None = None) -> di
 
 
 def candidate_dict(c, merchants: MerchantTable | None = None) -> dict:
-    """``policy_dict`` for a ``StepwisePolicy``, ``strategy_dict`` for a ``Strategy``."""
+    """``policy_dict`` for a ``StepwisePolicy``, ``strategy_dict`` for a ``Strategy``, ``{"type": "replay"}`` for the
+    positive control."""
+    from .attacks.replay import ReplayCandidate
+    if isinstance(c, ReplayCandidate):
+        return c.as_dict()
     return policy_dict(c, merchants) if isinstance(c, StepwisePolicy) else strategy_dict(c, merchants)
+
+
+REPLAY_TEXT = ("Positive control (`replay`): every target's real fraud episode is re-executed unchanged, so "
+               "VER_adv equals VER_clean per target and the uplift is 0 by construction; the replayed operations are "
+               "the observed data and count as feasible. A red gate here means the decision chain is broken.")
 
 
 def policy_markdown(b: dict) -> list[str]:
@@ -815,7 +835,9 @@ def summary_markdown(data: dict) -> str:
         "## Best strategy",
         "",
     ]
-    if b.get("type") == "stepwise_policy":
+    if b.get("type") == "replay":
+        lines += [REPLAY_TEXT, ""]
+    elif b.get("type") == "stepwise_policy":
         lines += policy_markdown(b) + [""]
     else:
         lines += [
