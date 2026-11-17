@@ -2,7 +2,9 @@
 
 The 27 base features come from a numpy path for a single operation that reproduces
 ``BaseEncoder.transform`` value for value (pinned by ``tests/test_serving.py``); building a
-one-row DataFrame per operation would dominate the time of ``decide``.
+one-row DataFrame per operation would dominate the time of ``decide``. A model trained on a registered feature
+subset (``columns.FEATURE_SETS``, e.g. the 34-feature M2 baseline) gets the same 38 features and selects its own
+columns inside ``FraudModel.predict_proba``.
 """
 from __future__ import annotations
 

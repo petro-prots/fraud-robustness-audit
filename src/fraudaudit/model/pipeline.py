@@ -36,7 +36,7 @@ from sklearn.utils import resample
 from ..data import period
 from ..features.aggregates import batch_aggregates
 from ..features.base import BaseEncoder
-from ..features.columns import BASE_COLUMNS, FEATURE_COLUMNS
+from ..features.columns import BASE_COLUMNS, FEATURE_COLUMNS, column_index
 from ..metrics import threshold_at_fpr
 from .artifacts import Artifacts, save_artifacts
 
@@ -74,29 +74,40 @@ def iforest_flag(iforest: IsolationForest, Xs: np.ndarray) -> np.ndarray:
 
 
 class FraudModel:
-    """scaler -> IsolationForest flag -> MLP; ``predict_proba`` takes the 38 FEATURE_COLUMNS."""
+    """scaler -> IsolationForest flag -> MLP; ``predict_proba`` takes the 38 FEATURE_COLUMNS.
+
+    ``feature_columns`` (a registered feature set, ``columns.FEATURE_SETS``; default all 38): a model trained on a
+    smaller set (the 34-feature M2 baseline) still takes the 38 FEATURE_COLUMNS – batch and serving paths compute
+    features as always – and selects its own columns by index before the scaler."""
 
     def __init__(self, *, mlp: keras.Model, scaler: StandardScaler, iforest: IsolationForest,
-                 encoder: BaseEncoder, tau: float) -> None:
+                 encoder: BaseEncoder, tau: float, feature_columns=FEATURE_COLUMNS) -> None:
         self.mlp = mlp
         self.scaler = scaler
         self.iforest = iforest
         self.encoder = encoder
         self.tau = float(tau)
+        self.feature_columns = tuple(feature_columns)
+        idx = column_index(self.feature_columns)  # ValueError for an unregistered set
+        self._idx = None if self.feature_columns == FEATURE_COLUMNS else np.asarray(idx, dtype=np.int64)
+        n_inputs = len(self.feature_columns) + 1
         # BatchNorm in inference mode; fixed signature, so one trace serves batches and single rows.
         self._forward = tf.function(
             lambda x: self.mlp(x, training=False),
-            input_signature=[tf.TensorSpec(shape=(None, N_INPUTS), dtype=tf.float32)],
+            input_signature=[tf.TensorSpec(shape=(None, n_inputs), dtype=tf.float32)],
         )
 
     @classmethod
     def from_artifacts(cls, a: Artifacts) -> "FraudModel":
-        return cls(mlp=a.mlp, scaler=a.scaler, iforest=a.iforest, encoder=a.encoder, tau=a.tau)
+        return cls(mlp=a.mlp, scaler=a.scaler, iforest=a.iforest, encoder=a.encoder, tau=a.tau,
+                   feature_columns=a.feature_columns)
 
     def mlp_inputs(self, F: np.ndarray) -> np.ndarray:
         F = np.asarray(F, dtype=np.float32)
         if F.ndim != 2 or F.shape[1] != len(FEATURE_COLUMNS):
             raise ValueError(f"expected shape (n, {len(FEATURE_COLUMNS)}), got {F.shape}")
+        if self._idx is not None:
+            F = F[:, self._idx]
         Xs = self.scaler.transform(F)
         return np.hstack([Xs, iforest_flag(self.iforest, Xs)]).astype(np.float32)
 
@@ -106,7 +117,7 @@ class FraudModel:
 
     def save(self, out_dir: Path, meta: dict) -> None:
         save_artifacts(out_dir, mlp=self.mlp, scaler=self.scaler, iforest=self.iforest,
-                       encoder=self.encoder, tau=self.tau, meta=meta)
+                       encoder=self.encoder, tau=self.tau, meta=meta, feature_columns=self.feature_columns)
 
 
 @dataclass

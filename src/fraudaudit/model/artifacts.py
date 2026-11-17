@@ -29,7 +29,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 from ..features.base import BaseEncoder
-from ..features.columns import FEATURE_COLUMNS
+from ..features.columns import FEATURE_COLUMNS, feature_set_name
 
 MLP_FILE = "mlp.keras"
 SCALER_FILE = "scaler.skops"
@@ -61,6 +61,7 @@ class Artifacts:
     tau: float
     meta: dict
     manifest: dict
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS  # a registered feature set (``columns.FEATURE_SETS``)
 
 
 def _sha256(path: Path) -> str:
@@ -85,7 +86,9 @@ def _versions() -> dict:
 
 
 def save_artifacts(out_dir: Path, *, mlp: keras.Model, scaler: StandardScaler,
-                   iforest: IsolationForest, encoder: BaseEncoder, tau: float, meta: dict) -> None:
+                   iforest: IsolationForest, encoder: BaseEncoder, tau: float, meta: dict,
+                   feature_columns=FEATURE_COLUMNS) -> None:
+    feature_set_name(feature_columns)  # only a registered feature set can be saved
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     mlp.save(out_dir / MLP_FILE)
@@ -95,7 +98,7 @@ def save_artifacts(out_dir: Path, *, mlp: keras.Model, scaler: StandardScaler,
         json.dumps(encoder.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     model_info = {
         "tau": float(tau),
-        "feature_columns": list(FEATURE_COLUMNS),
+        "feature_columns": list(feature_columns),
         "versions": _versions(),
         "meta": meta,
     }
@@ -135,8 +138,13 @@ def _check_model_info(info: dict) -> None:
     if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau) \
             or not 0.0 <= tau <= 1.0:
         raise ArtifactIntegrityError(f"tau must be a finite number in [0, 1], got {tau!r}")
-    if info.get("feature_columns") != list(FEATURE_COLUMNS):
-        raise ArtifactIntegrityError("feature_columns differ from FEATURE_COLUMNS")
+    cols = info.get("feature_columns")
+    if not isinstance(cols, list) or not all(isinstance(c, str) for c in cols):
+        raise ArtifactIntegrityError("feature_columns differ from FEATURE_COLUMNS and from every registered set")
+    try:
+        feature_set_name(cols)
+    except ValueError as e:
+        raise ArtifactIntegrityError(f"feature_columns differ from FEATURE_COLUMNS: {e}") from None
     if not isinstance(info.get("meta"), dict):
         raise ArtifactIntegrityError("meta must be an object")
     if not isinstance(info.get("versions"), dict):
@@ -174,7 +182,8 @@ def load_artifacts(model_dir: Path) -> Artifacts:
     scaler = _load_skops(model_dir / SCALER_FILE)
     iforest = _load_skops(model_dir / IFOREST_FILE)
     return Artifacts(mlp=mlp, scaler=scaler, iforest=iforest, encoder=encoder,
-                     tau=float(info["tau"]), meta=info["meta"], manifest=manifest)
+                     tau=float(info["tau"]), meta=info["meta"], manifest=manifest,
+                     feature_columns=tuple(info["feature_columns"]))
 
 
 def derive_with_tau(src_dir: Path, dst_dir: Path, tau: float, meta_update: dict) -> None:

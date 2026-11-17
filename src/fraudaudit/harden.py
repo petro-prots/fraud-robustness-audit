@@ -417,6 +417,10 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
     unit_list = units(gen_seeds, gen_max_declines, gen_attacks)
     if getattr(tm, "corridor", None) is not None:
         raise ValueError("harden does not support a spending corridor in the threat model (corridor: null)")
+    from .features.columns import FEATURE_COLUMNS
+    if tuple(getattr(model, "feature_columns", FEATURE_COLUMNS)) != FEATURE_COLUMNS:
+        raise ValueError("harden retrains on the current feature set (38 FEATURE_COLUMNS); the input model uses "
+                         f"another one ({len(model.feature_columns)} columns): its rounds would not be comparable")
     from .model.pipeline import EPOCHS, FraudModel, train_model
     say = log or (lambda m: None)
     jobs = max(1, int(n_jobs if n_jobs is not None else (os.cpu_count() or 1)))

@@ -31,3 +31,28 @@ AGG_COLUMNS: tuple[str, ...] = (
 )
 
 FEATURE_COLUMNS: tuple[str, ...] = BASE_COLUMNS + AGG_COLUMNS
+
+# Registered feature sets (name -> ordered columns). Every set is an ordered subset of FEATURE_COLUMNS: features
+# are always computed as FEATURE_COLUMNS (batch and serving alike) and a model trained on a smaller set selects its
+# columns by index (``FraudModel``). A model whose ``feature_columns`` are not exactly one of these is refused.
+FEATURE_SETS: dict[str, tuple[str, ...]] = {
+    "bachelor+hour-calendar": BASE_COLUMNS + AGG_COLUMNS[:7],  # 34: the M2 baseline (models-no-behav, Task 20)
+    "bachelor+hour-calendar+behav": FEATURE_COLUMNS,           # 38: the current model (Task 23)
+}
+
+
+def feature_set_name(columns) -> str:
+    """Name of the registered feature set whose columns equal ``columns`` exactly (order included); ValueError
+    otherwise (unknown, reordered, duplicated or missing columns)."""
+    cols = tuple(columns)
+    for name, fs in FEATURE_SETS.items():
+        if cols == fs:
+            return name
+    raise ValueError(f"feature_columns ({len(cols)}) are not a registered feature set {sorted(FEATURE_SETS)}")
+
+
+def column_index(columns) -> tuple[int, ...]:
+    """Indices of a registered feature set's columns in FEATURE_COLUMNS (ValueError for an unregistered one)."""
+    feature_set_name(columns)
+    pos = {c: i for i, c in enumerate(FEATURE_COLUMNS)}
+    return tuple(pos[c] for c in columns)
