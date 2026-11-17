@@ -202,14 +202,18 @@ def plot(data: dict, path: Path) -> None:
             y = [100 * (c["bound"]["bound_share"]["mean"] if key == "bound" else c["worst_uplift_upper"]) for c in cs]
             ax.plot(x, y, color=colors[k % 2], lw=2, marker=markers[k % 2], ms=8,
                     label=f"target FPR {fpr:g} (τ {cs[0]['tau']:.3g})")
-            for c, xi, yi in zip(cs, x, y):
-                on = c["pareto_3d"] if key == "uplift" else c["pareto_2d"]
-                ax.annotate(f"q {c['q']:g}" + (" *" if on else ""), (xi, yi), textcoords="offset points",
-                            xytext=(5, 5), fontsize=8, color="#444444")
+            if key == "uplift" or any(c["pareto_2d"] for c in cs):  # bound is τ-free: label the front series only
+                for c, xi, yi in zip(cs, x, y):
+                    on = c["pareto_3d"] if key == "uplift" else c["pareto_2d"]
+                    ax.annotate(f"q {c['q']:g}" + (" *" if on else ""), (xi, yi), textcoords="offset points",
+                                xytext=(6, 4 if key == "bound" else (6 if k == 1 else -12)), fontsize=8,
+                                color="#444444")
+    x0 = axes[1].get_xlim()[0]
     for c in data["cells"]:
         if c["q"] is None:
-            axes[1].axhline(100 * c["worst_uplift_upper"], color="#888888", lw=1, ls="--")
-            axes[1].annotate(f"no corridor, FPR {c['target_fpr']:g}", (0, 100 * c["worst_uplift_upper"]),
+            y = 100 * c["worst_uplift_upper"]
+            axes[1].axhline(y, color="#888888", lw=1, ls="--")
+            axes[1].annotate(f"no corridor, target FPR {c['target_fpr']:g}: {y:.1f} %", (x0, y),
                              textcoords="offset points", xytext=(4, 3), fontsize=8, color="#666666")
     axes[0].set_ylabel("guaranteed bound, mean share of A (%)")
     axes[1].set_ylabel("worst empirical uplift, one-sided upper (%)")
