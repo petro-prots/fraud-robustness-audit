@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import math
 import time
 from pathlib import Path
 
@@ -30,6 +29,8 @@ import numpy as np
 import pandas as pd
 
 from . import corridor as corridor_mod
+from .sweep_cells import (check_own_tau, model_at_tau, model_target_fpr, run_cell, tau_at,  # noqa: F401
+                          val_scores, val_tau)
 
 Q_GRID = (0.98, 0.99, 0.995)
 FPR_GRID = (0.01,)
@@ -55,23 +56,6 @@ def parse_variant(name: str) -> dict:
     return d
 
 
-def val_tau(df: pd.DataFrame, model, target_fpr: float) -> float:
-    """τ at ``target_fpr`` on clean val (``threshold_at_fpr``, as in training): features on the WHOLE stream (the
-    windowed aggregates need the history before val), scores of the val rows."""
-    from .data import period
-    from .metrics import threshold_at_fpr
-    from .model.pipeline import features
-    m = (period(df) == "val").to_numpy()
-    p = np.asarray(model.predict_proba(features(df, model.encoder)[m]), dtype=np.float64)
-    return float(threshold_at_fpr(df.loc[m, "is_fraud"].to_numpy(dtype=np.int64), p, target_fpr))
-
-
-def _model_target_fpr(model_dir):
-    meta = json.loads((Path(model_dir) / "model.json").read_text(encoding="utf-8")).get("meta", {})
-    v = meta.get("target_fpr")
-    return None if v is None else float(v)
-
-
 def pareto(points: list[tuple]) -> list[bool]:
     """Non-dominated flags (every objective minimised)."""
     out = []
@@ -85,10 +69,7 @@ def pareto(points: list[tuple]) -> list[bool]:
 def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, variants=VARIANTS, seed: int = 42,
                    n_jobs: int | None = None, out_dir, threat_path=None, log=None, reference: bool = True) -> dict:
     from .audit import select_episodes
-    from .gate import run_ensemble
     from .metrics import confirmation_burden, legit_test_scores
-    from .model.artifacts import derive_with_tau, load_artifacts
-    from .model.pipeline import FraudModel
     from .threat import contexts_for
     say = log or (lambda m: None)
     specs = [(v, parse_variant(v)) for v in variants]  # fail fast on a bad variant name
@@ -103,25 +84,20 @@ def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, v
     scores = legit_test_scores(df, model, n_jobs=n_jobs, model_dir=model_dir)
     say(f"legit test scores: {sum(len(v) for v in scores.values())} ops, {time.perf_counter() - t0:.0f} s")
     cells = []
-    model_fpr = _model_target_fpr(model_dir)
+    model_fpr = model_target_fpr(model_dir)
     if model_fpr is None:
         raise ValueError(f"{model_dir}/model.json has no meta.target_fpr: the check that tau at the model's own "
                          "target FPR reproduces the trained tau cannot run")
     if not any(abs(f - model_fpr) < 1e-12 for f in fprs):
         raise ValueError(f"the model's own target_fpr {model_fpr} is not in the FPR grid {list(fprs)}: the check that "
                          "tau at it reproduces the trained tau cannot run")
+    y_val, p_val = val_scores(df, model)
     for fpr in fprs:
-        tau = val_tau(df, model, fpr)
-        if abs(fpr - model_fpr) < 1e-12 and not math.isclose(tau, float(model.tau), rel_tol=1e-6):
-            raise ValueError(f"tau recomputed at the model's own target_fpr {fpr} is {tau}, model.json has "
-                             f"{model.tau}: the val scores differ from training")
-        if math.isclose(tau, float(model.tau), rel_tol=1e-6):
-            mdir, mdl = Path(model_dir), model
-        else:
-            mdir = out / "models" / f"fpr-{fpr:g}"
-            derive_with_tau(model_dir, mdir, tau, {"target_fpr": float(fpr),
-                                                   "note": "corridor-sweep: same weights, tau at target_fpr on val"})
-            mdl = FraudModel.from_artifacts(load_artifacts(mdir))
+        tau = tau_at(y_val, p_val, fpr)
+        if abs(fpr - model_fpr) < 1e-12:
+            check_own_tau(model_dir, model, tau, fpr)
+        mdir, mdl = model_at_tau(model_dir, model, tau, fpr, out / "models" / f"fpr-{fpr:g}",
+                                 "corridor-sweep: same weights, tau at target_fpr on val")
         say(f"target_fpr {fpr}: tau {tau:.6g} (model dir {mdir})")
         todo = ([(None, None, None)] if reference else []) + [(vn, vd, q) for vn, vd in specs for q in qs]
         for vname, vfields, q in todo:
@@ -131,18 +107,10 @@ def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, v
                 c = corridor_mod.prepare(dataclasses.replace(tm, corridor=c), df).corridor  # floor per q, split
             tm_c = dataclasses.replace(tm, corridor=c)
             t1 = time.perf_counter()
-            runs = run_ensemble(df, mdl, tm_c, cfg, seed, n_jobs=n_jobs, model_dir=mdir, threat_path=threat_path)
+            rec, runs = run_cell(df, mdl, mdir, tm_c, cfg, seed, n_jobs=n_jobs, threat_path=threat_path)
             cell = {"target_fpr": float(fpr), "tau": tau, "q": None if q is None else float(q),
                     "variant": None if q is None else vname,
-                    "variant_label": None if c is None else c.variant(),
-                    "runs": {k: {"uplift_mean": r.uplift[0], "uplift_upper": r.uplift[2], "ver_adv_mean": r.ver_adv[0],
-                                 "ver_clean_mean": r.ver_clean[0], "asr": r.asr} for k, r in runs.items()}}
-            worst = max(cell["runs"], key=lambda k: cell["runs"][k]["uplift_upper"])
-            first = next(iter(runs.values()))
-            cell.update(worst_run=worst, worst_uplift_upper=cell["runs"][worst]["uplift_upper"],
-                        mean_uplift=float(np.mean([v["uplift_mean"] for v in cell["runs"].values()])),
-                        max_ver_adv=float(max(t["ver_adv"] for r in runs.values() for t in r.per_target)),
-                        test_recall=first.clean_quality["test"]["recall"], test_fpr=first.clean_quality["test"]["fpr"])
+                    "variant_label": None if c is None else c.variant(), **rec}
             if c is not None:
                 b = [corridor_mod.episode_bound(c, ctx.state, ctx.episode.start, tm.window_days) for ctx in targets]
                 pt = [{"amount": float(ctx.episode.amount), "corridor_bound": x["bound_cents"] / 100,
