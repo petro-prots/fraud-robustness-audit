@@ -192,6 +192,9 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     failed = [c for c in checks if not c.passed]
 
     lines = [f"# {'✅ ' + VERDICT_OK if ok else '❌ ' + VERDICT_FAIL} – episode-attack robustness gate", ""]
+    if (meta.get("gate") or {}).get("positive_control"):
+        lines += ["**Positive control (`replay`), not a gate verdict on the model:** it only checks the decision chain "
+                  "(paired bootstrap of the uplift → worst run → verdict) on an uplift that is 0 by construction.", ""]
     if ok:
         lines.append("All gate checks passed.")
     else:

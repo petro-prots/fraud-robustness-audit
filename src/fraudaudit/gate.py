@@ -38,6 +38,8 @@ ATTACKS = ("random", "es", "stepwise", "replay")  # replay: the positive control
 HELD_OUT_ATTACKS = ("stepwise",)  # never generates hardening data (``harden.check_generation_attack`` rejects them)
 GATE_KEYS = ("target_fpr", "recall_clean_min", "delta", "attacks", "attack_seeds", "confidence", "one_sided",
              "spares_period")
+OPTIONAL_GATE_KEYS = ("positive_control",)  # true only in gate-positive-control.yaml: the run is a control, no verdict
+POSITIVE_CONTROL_ATTACKS = ("replay",)
 
 REC_VER_UPLIFT = ("Model owner: the model is vulnerable to the episode attack – retrain it with adversarial examples "
                   "(`fraudaudit harden`) and rerun the audit; do not weaken the attack or δ.")
@@ -64,6 +66,7 @@ class GateConfig:
     confidence: float
     one_sided: bool
     spares_period: str
+    positive_control: bool = False  # attacks == [replay]: checks the decision chain, never a gate verdict on a model
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> "GateConfig":
@@ -75,7 +78,7 @@ class GateConfig:
         """Strict: every key of ``GATE_KEYS`` required, unknown keys rejected, every value checked."""
         if not isinstance(raw, dict):
             raise ValueError(f"{where}: expected a mapping")
-        extra = sorted(set(raw) - set(GATE_KEYS))
+        extra = sorted(set(raw) - set(GATE_KEYS) - set(OPTIONAL_GATE_KEYS))
         missing = [k for k in GATE_KEYS if k not in raw]
         if extra:
             raise ValueError(f"{where}: unknown keys {extra}")
@@ -96,6 +99,9 @@ class GateConfig:
                                                            for s in seeds) or len(set(seeds)) != len(seeds):
             raise ValueError(f"{where}: attack_seeds must be a non-empty list of distinct integers >= 0, "
                              f"got {seeds!r}")
+        pc = raw.get("positive_control", False)
+        if not isinstance(pc, bool):
+            raise ValueError(f"{where}: positive_control must be true or false, got {pc!r}")
         if not isinstance(raw["one_sided"], bool):
             raise ValueError(f"{where}: one_sided must be true or false, got {raw['one_sided']!r}")
         if raw["spares_period"] not in SPARES_PERIODS:
@@ -104,7 +110,7 @@ class GateConfig:
         c = cls(target_fpr=num("target_fpr"), recall_clean_min=num("recall_clean_min"),
                 delta=None if raw["delta"] is None else num("delta"), attacks=list(attacks),
                 attack_seeds=[int(s) for s in seeds], confidence=num("confidence"),
-                one_sided=raw["one_sided"], spares_period=str(raw["spares_period"]))
+                one_sided=raw["one_sided"], spares_period=str(raw["spares_period"]), positive_control=pc)
         if not 0 < c.target_fpr < 1:
             raise ValueError(f"{where}: target_fpr must be in (0, 1)")
         if not 0 <= c.recall_clean_min <= 1:
@@ -113,7 +119,22 @@ class GateConfig:
             raise ValueError(f"{where}: delta must be >= 0 or null")
         if not 0 < c.confidence < 1:
             raise ValueError(f"{where}: confidence must be in (0, 1)")
+        c.check_positive_control(where)
         return c
+
+    def __post_init__(self) -> None:
+        self.check_positive_control("gate")
+
+    def check_positive_control(self, where: str) -> None:
+        """The replay attack gives uplift 0 for any model, so it may only appear in a gate explicitly marked
+        ``positive_control: true``, alone; such a gate lists only control attacks."""
+        ctrl = [a for a in self.attacks if a in POSITIVE_CONTROL_ATTACKS]
+        if ctrl and not self.positive_control:
+            raise ValueError(f"{where}: attack(s) {ctrl} are positive controls (uplift 0 for any model); they are "
+                             "allowed only in a gate marked positive_control: true")
+        if self.positive_control and (not ctrl or len(ctrl) != len(self.attacks)):
+            raise ValueError(f"{where}: a positive_control gate lists only {list(POSITIVE_CONTROL_ATTACKS)}, got "
+                             f"{self.attacks}")
 
     def run_keys(self) -> list[str]:
         """Every run of the ensemble, attacks outer, seeds inner."""

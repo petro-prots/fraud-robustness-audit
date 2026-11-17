@@ -10,7 +10,7 @@ from conftest import make_sparkov_like
 from fraudaudit import audit as audit_mod
 from fraudaudit.attacks.random_search import RandomSearch
 from fraudaudit.audit import run_audit
-from fraudaudit.gate import Check, GateConfig, decide, run_key
+from fraudaudit.gate import Check, GateConfig, decide, passed, run_key
 from fraudaudit.model.artifacts import load_artifacts
 from fraudaudit.model.pipeline import FraudModel
 from fraudaudit.report import summary_markdown, write_gate_outputs
@@ -714,7 +714,8 @@ def test_cli_calibrate_parser_defaults():
 
 def test_replay_attack_gives_zero_uplift_and_passes(df, model, tm, model_dir):
     from fraudaudit.gate import run_ensemble
-    g = cfg(attacks=["replay"], attack_seeds=[1, 2], delta=0.10, recall_clean_min=0.0, spares_period="fit")
+    g = cfg(attacks=["replay"], attack_seeds=[1, 2], delta=0.10, recall_clean_min=0.0, spares_period="fit",
+            positive_control=True)
     res = run_ensemble(df, model, tm, g, 7, n_jobs=1, model_dir=model_dir)
     for r in res.values():
         assert r.uplift == (0.0, 0.0, 0.0) and r.recon_ops == 0 and r.feasible_share == 1.0
@@ -727,23 +728,55 @@ def test_replay_attack_gives_zero_uplift_and_passes(df, model, tm, model_dir):
 
 def test_replay_parallel_identical(df, model, tm, model_dir):
     from fraudaudit.gate import run_ensemble
-    g = cfg(attacks=["replay"], attack_seeds=[1], spares_period="fit")
+    g = cfg(attacks=["replay"], attack_seeds=[1], spares_period="fit", positive_control=True)
     a = run_ensemble(df, model, tm, g, 7, n_jobs=1, model_dir=model_dir)["replay/1"]
     b = run_ensemble(df, model, tm, g, 7, n_jobs=2, model_dir=model_dir)["replay/1"]
     assert a.per_target == b.per_target and a.uplift == b.uplift
 
 
 def test_cli_positive_control_green(cli_env):
-    code, out, summary = cli_env(dict(GATE_LOOSE, attacks=["replay"], delta=0.10), "--no-baseline")
+    code, out, summary = cli_env(dict(GATE_LOOSE, attacks=["replay"], delta=0.10, positive_control=True),
+                                 "--no-baseline")
     assert code == 0
     data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
     assert data["passed"] is True and list(data["runs"]) == ["replay/1"]
-    assert "Positive control" in (out / "summary.md").read_text(encoding="utf-8")
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "Positive control" in md and "not a gate verdict" in md
 
 
 def test_committed_positive_control_and_seed_gates():
     base = GateConfig.from_yaml(GATE_PATH)
     pc = GateConfig.from_yaml(ROOT / "gate-positive-control.yaml")
     s456 = GateConfig.from_yaml(ROOT / "gate-seeds-456.yaml")
-    assert pc == dataclasses.replace(base, attacks=["replay"])
+    assert pc == dataclasses.replace(base, attacks=["replay"], positive_control=True)
+    assert "replay" not in base.attacks and not base.positive_control
+    assert "replay" not in GATE_PATH.read_text() and "positive_control" not in GATE_PATH.read_text()
     assert s456 == dataclasses.replace(base, attack_seeds=[4, 5, 6])
+
+
+@pytest.mark.parametrize("attacks,pc", [(["replay"], False), (["random", "replay"], True), (["random", "replay"], False),
+                                        (["random"], True)])
+def test_replay_only_in_a_marked_positive_control_gate(attacks, pc):
+    raw = yaml.safe_load(GATE_PATH.read_text())
+    raw["attacks"] = attacks
+    if pc:
+        raw["positive_control"] = True
+    with pytest.raises(ValueError, match="positive"):
+        GateConfig.from_mapping(raw)
+    with pytest.raises(ValueError, match="positive"):
+        cfg(attacks=attacks, positive_control=pc)
+
+
+def test_positive_control_discriminates_ver_vs_uplift_mutant(df, model, tm, model_dir):
+    """M3 (review): on a toy case with VER_clean above δ, a gate that compared the VER_adv upper bound instead of the
+    uplift upper bound would turn the replay control RED; the real gate passes. On the real data VER_clean is ≈ 0.9 %,
+    so there the control cannot catch this mutant (README: scope of the positive control)."""
+    from fraudaudit.gate import run_ensemble
+    g = cfg(attacks=["replay"], attack_seeds=[1], delta=0.001, recall_clean_min=0.0, spares_period="fit",
+            positive_control=True)  # a small δ: the toy case needs VER_clean > δ
+    res = run_ensemble(df, model, tm, g, 7, n_jobs=1, model_dir=model_dir)
+    r = res["replay/1"]
+    assert r.ver_clean[0] > g.delta  # the toy case: normal fraud already above δ
+    assert passed(decide(g, res))
+    mutant = {k: dataclasses.replace(v, uplift=v.ver_adv) for k, v in res.items()}  # «VER_adv upper ≤ δ»
+    assert not by_name(decide(g, mutant))["ver_uplift"].passed

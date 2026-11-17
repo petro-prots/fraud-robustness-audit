@@ -720,7 +720,10 @@ def candidate_dict(c, merchants: MerchantTable | None = None) -> dict:
 
 REPLAY_TEXT = ("Positive control (`replay`): every target's real fraud episode is re-executed unchanged, so "
                "VER_adv equals VER_clean per target and the uplift is 0 by construction; the replayed operations are "
-               "the observed data and count as feasible. A red gate here means the decision chain is broken.")
+               "the observed data and count as feasible. A red gate here means the decision chain (uplift bootstrap, "
+               "worst run, verdict) is broken; a green one does not test the attack execution path, the feasibility "
+               "check or – when VER_clean is below δ, as on the real data – a gate comparing VER_adv instead of the "
+               "uplift.")
 
 
 def policy_markdown(b: dict) -> list[str]:

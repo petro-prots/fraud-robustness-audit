@@ -2,6 +2,7 @@ target_fpr: 0.01          # per-operation FPR at which the model's τ was chosen
 recall_clean_min: 0.5     # recall on clean test operations at τ
 delta: 0.10   # approved by the author 2026-11-15 after calibration (resolution 4.1 pp on 218 episodes); fixed before hardening
 attacks: [replay]   # positive control (R30): real episodes replayed unchanged, uplift 0 by construction; must be GREEN
+positive_control: true   # marks this file as a control: replay is refused in any other gate
 attack_seeds: [1, 2, 3]   # every attack with every seed on the same targets and spares
 confidence: 0.95          # level of all intervals
 one_sided: true           # uplift: one-sided upper bound (only uplift ≤ δ is tested); VER intervals stay two-sided
