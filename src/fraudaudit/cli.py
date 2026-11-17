@@ -112,6 +112,19 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("--seed", type=int, default=42)
     cs.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
 
+    ph = sub.add_parser("corridor-posthoc", help="V2 cells: post-hoc bound M'(c) with the owner's real operations "
+                                                "replayed around each target episode (review I1); optional merge "
+                                                "with a corridor-sweep.json into the post-hoc Pareto front")
+    ph.add_argument("--data", type=Path, default=Path("data"))
+    ph.add_argument("--model", type=Path, default=Path("models"), help="artifact directory (its own tau)")
+    ph.add_argument("--threat", type=Path, default=Path("threat-models/realistic-corridor.yaml"))
+    ph.add_argument("--gate", type=Path, default=Path("gate.yaml"), help="spares period (target selection)")
+    ph.add_argument("--q", type=_deltas, default=[0.98, 0.99, 0.995])
+    ph.add_argument("--variants", type=_names, default=["v2", "v1:2+v2"])
+    ph.add_argument("--sweep", type=Path, default=None, help="corridor-sweep.json to merge")
+    ph.add_argument("--out", type=Path, default=Path("out/corridor-posthoc"))
+    ph.add_argument("--seed", type=int, default=42)
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -419,6 +432,49 @@ def cmd_corridor_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_corridor_posthoc(args: argparse.Namespace) -> int:
+    import hashlib
+
+    import yaml
+
+    from fraudaudit.audit import _versions
+    from fraudaudit.corridor_sweep import merge_posthoc, owner_posthoc_sweep, posthoc_markdown
+    from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.threat import ThreatModel
+
+    try:
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        if tm.corridor is None:
+            raise ValueError(f"{args.threat} has no corridor section")
+        sweep = None if args.sweep is None else json.loads(args.sweep.read_text(encoding="utf-8"))
+        df = load_raw(args.data)
+        model = FraudModel.from_artifacts(load_artifacts(args.model))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        print(f"error: corridor-posthoc configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    data = owner_posthoc_sweep(df, model, tm, cfg, qs=tuple(args.q), variants=tuple(args.variants), seed=args.seed,
+                               log=lambda m: print(m, file=sys.stderr, flush=True))
+    data["meta"] = {"seed": int(args.seed), **git_info(), "model": str(args.model),
+                    "model_sha256": _model_sha256(args.model), "threat_file": str(args.threat),
+                    "threat_sha256": hashlib.sha256(args.threat.read_bytes()).hexdigest(),
+                    "sweep_file": None if args.sweep is None else str(args.sweep),
+                    "platform": platform.platform(), "versions": _versions()}
+    merged = None if sweep is None else merge_posthoc(sweep, data)
+    if merged is not None:
+        data["merged_cells"] = merged["cells"]
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "corridor-posthoc.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
+                                                    encoding="utf-8")
+    md = posthoc_markdown(data, merged)
+    (args.out / "corridor-posthoc.md").write_text(md, encoding="utf-8")
+    print(md, flush=True)
+    return 0
+
+
 def _baseline_brief(b: dict | None) -> dict | None:
     """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
     if b is None or "error" in b:
@@ -505,6 +561,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_harden(args)
     if args.command == "corridor-sweep":
         return cmd_corridor_sweep(args)
+    if args.command == "corridor-posthoc":
+        return cmd_corridor_posthoc(args)
     return 0
 
 

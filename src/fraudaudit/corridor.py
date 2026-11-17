@@ -554,27 +554,33 @@ def limits_cents(cfg: CorridorConfig, state: CardState, ts) -> tuple[int, int]:
     return limit_cents(cfg, state.spend, t, "24h"), limit_cents(cfg, state.spend, t, "7d")
 
 
-def effective_limits_cents(cfg: CorridorConfig, state: CardState, ts) -> tuple[int, int]:
-    """The corridors the rule compares with: the base ones, plus with V2 (``confirmed_extends``) the owner-confirmed
-    cents in ``(t − W, t]`` of each window (``C'_W``)."""
+def effective_limits_cents(cfg: CorridorConfig, state: CardState, ts, base: tuple[int, int] | None = None
+                           ) -> tuple[int, int]:
+    """The corridors the rule compares with (the single source, used by ``check``): the base ones (``base`` if given,
+    else ``limits_cents``), plus with V2 (``confirmed_extends``) the owner-confirmed cents in ``(t − W, t]`` of each
+    window (``C'_W``)."""
     t = pd.Timestamp(ts).value
-    c24, c7 = limits_cents(cfg, state, t)
+    c24, c7 = limits_cents(cfg, state, t) if base is None else base
     if cfg.confirmed_extends:
         c24 += state.confirmed_sum_cents(t, WINDOWS_NS["24h"])
         c7 += state.confirmed_sum_cents(t, WINDOWS_NS["7d"])
     return c24, c7
 
 
+def decision_limits(cfg: CorridorConfig, state: CardState, ts) -> tuple[int, int, int, int]:
+    """``(C_24h, C_7d, C'_24h, C'_7d)`` at ts: the base corridors (recorded by the bank, attack-independent) and the
+    ones ``check`` compares with."""
+    t = pd.Timestamp(ts).value
+    base = limits_cents(cfg, state, t)
+    return (*base, *effective_limits_cents(cfg, state, t, base))
+
+
 def check(cfg: CorridorConfig, state: CardState, ts, amt: float) -> tuple[bool, int, int]:
     """Rule 2 with the base corridors used: ``(S_W(t⁻) + a <= C'_W(t) for both windows, C_24h, C_7d)`` (whole
-    cents; ``C'_W = C_W`` without V2)."""
+    cents; ``C'_W = C_W`` without V2; limits from ``decision_limits``)."""
     t = pd.Timestamp(ts).value
     a = int(round(float(amt) * 100))
-    c24, c7 = limits_cents(cfg, state, t)
-    e24, e7 = c24, c7
-    if cfg.confirmed_extends:
-        e24 += state.confirmed_sum_cents(t, WINDOWS_NS["24h"])
-        e7 += state.confirmed_sum_cents(t, WINDOWS_NS["7d"])
+    c24, c7, e24, e7 = decision_limits(cfg, state, t)
     ok = (state.auto_sum_cents(t, WINDOWS_NS["24h"]) + a <= e24
           and state.auto_sum_cents(t, WINDOWS_NS["7d"]) + a <= e7)
     return ok, c24, c7

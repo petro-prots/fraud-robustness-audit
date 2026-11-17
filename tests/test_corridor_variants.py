@@ -401,6 +401,24 @@ def test_v2_owner_confirmation_extends_the_corridor():
     assert bank.state.confirmed_sum_cents((T0 + DAY + pd.Timedelta(minutes=1)).value, 7 * DAY_NS) == 15_000
 
 
+def test_v2_confirmation_lifts_24h_limit_only_inside_24h():
+    """A confirmation older than 24 h lifts only the 7-day limit; one inside the last 24 h lifts the 24 h limit too
+    (checked through ``check``, the rule the bank uses)."""
+    c = cfg(confirmed_extends=True, floor_24h=100.0, floor_7d=10_000.0)  # the 24 h window binds
+    old = CardState(PROF)
+    old.push(tx(T0 - DAY - pd.Timedelta(minutes=1), 500.0), auto_approved=False, passed=True, confirmed=True)
+    assert cor.check(c, old, T0, 100.0)[0] and not cor.check(c, old, T0, 100.01)[0]  # C'_24h = 100 $: no lift
+    assert cor.decision_limits(c, old, T0)[2:] == (10_000, 1_050_000)
+    new = CardState(PROF)
+    new.push(tx(T0 - DAY + pd.Timedelta(minutes=1), 500.0), auto_approved=False, passed=True, confirmed=True)
+    assert cor.check(c, new, T0, 600.0)[0] and not cor.check(c, new, T0, 600.01)[0]  # C'_24h = 100 + 500 $
+    assert cor.decision_limits(c, new, T0)[2:] == (60_000, 1_050_000)
+    # exactly 24 h old: (t − 24 h, t] excludes it
+    edge = CardState(PROF)
+    edge.push(tx(T0 - DAY, 500.0), auto_approved=False, passed=True, confirmed=True)
+    assert not cor.check(c, edge, T0, 100.01)[0]
+
+
 def test_v2_never_extends_on_attacker_operations():
     """Attacker operations (auto-approved, model-declined, failed confirmations) never extend the corridor."""
     c = cfg(confirmed_extends=True, confirm_fail_counts_as_decline=False)
@@ -452,8 +470,14 @@ def test_property_v2_bound_with_interleaved_owner(variant):
         c = (v1(kappa=float(rng.choice([1.0, 2.0, 3.0])), split=_random_split(rng), **kw) if variant == "v1+v2"
              else cfg(floor_24h=float(rng.uniform(1, 200)), **kw))
         t0 = pd.Timestamp(ctx.episode.start)
-        b = cor.episode_bound(c, ctx.state, t0, 7)
-        bank = _Bank(StubServing(), ctx_with(ctx.state, start=t0), None, 0.8, None, c)
+        pre = ctx.state.copy()
+        if trial % 2 == 0:  # an owner confirmation shortly before the episode (inside both windows at t0)
+            tp = t0 - pd.Timedelta(hours=int(rng.integers(1, 23)))
+            if pre.now is None or tp.value >= pre.now:
+                pre.push(tx(tp, float(np.round(rng.uniform(50, 800), 2))), auto_approved=False, passed=True,
+                         confirmed=True)
+        b = cor.episode_bound(c, pre, t0, 7)
+        bank = _Bank(StubServing(), ctx_with(pre, start=t0), None, 0.8, None, c)
         offs = np.sort(rng.integers(0, 7 * 86_400, 80))
         attacker_auto = []
         for o in offs:
@@ -466,7 +490,7 @@ def test_property_v2_bound_with_interleaved_owner(variant):
                 attacker_auto.append(bank.auto_ops[-1])
         o = bank.outcome()
         cor.check_used_corridor(b, o.corridor_c7, used24=o.corridor_c24)
-        p = cor.posthoc_bound(b, ctx.state.confirmed_ops() + o.confirmed_ops, t0, 7)
+        p = cor.posthoc_bound(b, pre.confirmed_ops() + o.confirmed_ops, t0, 7)
         cum = cor.auto_by_block(tuple(attacker_auto), t0.value, 7)
         violations += cum[-1] > p["bound_cents"] or any(g > lim for g, lim in zip(cum, p["b_h_cents"]))
         violations += cum[-1] > p["headroom_cents"]
@@ -526,6 +550,16 @@ def test_parity_batch_vs_serving_variants():
                 s7 = st.auto_sum_cents(t.value, 7 * DAY_NS)
                 c24, c7 = cor.effective_limits_cents(c, st, t)
                 assert (s24, s7, c24, c7) == (batch["s24"][i], batch["s7"][i], batch["c24"][i], batch["c7"][i])
+                # what the rule (``check``, used by ``_Bank``) compares with and decides, for this amount and for the
+                # amount that exactly fills the tighter window
+                lim = cor.decision_limits(c, st, t)
+                assert (lim[2], lim[3]) == (batch["c24"][i], batch["c7"][i])
+                a = int(round(r.amt * 100))
+                fill = min(batch["c24"][i] - s24, batch["c7"][i] - s7)
+                for amt_c in (a, fill, fill + 1):
+                    if amt_c > 0:
+                        assert cor.check(c, st, t, amt_c / 100)[0] == (s24 + amt_c <= batch["c24"][i]
+                                                                      and s7 + amt_c <= batch["c7"][i])
                 st.push(tx(t, r.amt), auto_approved=bool(auto[i]), passed=bool(passed[i]),
                         confirmed=bool(confirmed[i]))
                 n_checked += 1
@@ -572,3 +606,69 @@ def test_audit_v1_v2_population_floor_n_jobs_identity(audit_env):
         assert t["corridor_bound"] == t["corridor_bound_pre"]  # no owner confirmation in the replay
     from fraudaudit.audit import corridor_line
     assert "weekly split" in corridor_line(m)
+
+
+# ---- review I1: owner-replay post-hoc bound M'(c) of V2 ------------------------------------------------------------
+
+def test_owner_posthoc_bounds_replay(audit_env):
+    """M'(c): the owner's real legitimate operations of [t0 − 7 d, t0 + 7 d) replayed with owner confirmations; the
+    post-hoc bound is >= the pre-episode bound, equal without confirmations, and above it when the owner confirms."""
+    from fraudaudit.corridor_sweep import owner_posthoc_bounds, owner_window_scores
+    from fraudaudit.data import fraud_episodes
+    from fraudaudit.threat import contexts_for
+    df, model, _, _ = audit_env
+    ctxs = contexts_for(df, fraud_episodes(df, {"fit", "val", "test"}))
+    data = owner_window_scores(df, model, ctxs, 7)
+    assert len(data) == len(ctxs) and all(len(d["p"]) == len(d["txs"]) for d in data)
+    for d, ctx in zip(data, ctxs):  # owner stream: legit, inside the two weeks, no episode row
+        t0 = pd.Timestamp(ctx.episode.start)
+        assert all(t0 - 7 * DAY <= x.ts < t0 + 7 * DAY for x in d["txs"])
+    loose = owner_posthoc_bounds(ctxs, data, cfg(floor_24h=1e7, floor_7d=1e7, confirmed_extends=True), model.tau, 7)
+    assert all(r["bound_post"] == r["bound_pre"] and r["n_owner_confirms"] == 0 for r in loose)
+    tight = owner_posthoc_bounds(ctxs, data, cfg(q=0.5, floor_24h=1.0, floor_7d=1.0, lookback_days=60,
+                                                 confirmed_extends=True), model.tau, 7)
+    assert all(r["bound_post"] >= r["bound_pre"] for r in tight)
+    assert sum(r["bound_post"] > r["bound_pre"] for r in tight) >= 3
+    for r, ctx in zip(tight, ctxs):
+        b = cor.episode_bound(cfg(q=0.5, floor_24h=1.0, floor_7d=1.0, lookback_days=60, confirmed_extends=True),
+                              ctx.state, ctx.episode.start, 7)
+        assert r["bound_pre"] == b["bound_cents"] / 100
+    with pytest.raises(ValueError, match="confirmed_extends"):
+        owner_posthoc_bounds(ctxs, data, cfg(), model.tau, 7)
+
+
+def test_merge_posthoc_rebuilds_pareto():
+    from fraudaudit.corridor_sweep import merge_posthoc
+    cell = lambda v, lab, q, p90, burden, up: {"q": q, "variant": v, "variant_label": lab, "target_fpr": 0.01,
+                                                "bound": {"bound": {"q90": p90}}, "worst_uplift_upper": up,
+                                                "burden": {"share_confirm_card_days": burden}}
+    sweep = {"cells": [{"q": None, "variant": None, "target_fpr": 0.01, "bound": None},
+                       cell("base", "base", 0.99, 7000.0, 0.02, 0.4), cell("v2", "V2", 0.99, 7000.0, 0.017, 0.4)]}
+    post = {"cells": [{"variant": "v2", "q": 0.99, "m_post": {"q90": 7600.0, "median": 3500.0, "mean": 4400.0},
+                       "share_post_below_rho_a": 0.5}]}
+    m = merge_posthoc(sweep, post)
+    g = [c for c in m["cells"] if c["q"] is not None]
+    assert g[1]["m_p90_front"] == 7600.0 and g[0]["m_p90_front"] == 7000.0
+    assert [c["pareto_2d_posthoc"] for c in g] == [True, True]  # V2 no longer dominates base
+    sweep["cells"][2]["bound"]["bound"]["q90"] = 7000.0
+    assert sweep["cells"][2]["bound"]["bound"]["q90"] == 7000.0  # the input is not changed
+
+
+def test_owner_posthoc_sweep_and_cli(audit_env):
+    from fraudaudit.cli import build_parser
+    from fraudaudit.corridor_sweep import owner_posthoc_sweep, posthoc_markdown
+    from fraudaudit.gate import GateConfig
+    df, model, _, tm = audit_env
+    tm = dataclasses.replace(tm, corridor=cfg(q=0.5, floor_24h=1.0, floor_7d=1.0, lookback_days=60))
+    g = GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.1, attacks=["random"], attack_seeds=[1],
+                   confidence=0.95, one_sided=True, spares_period="test")
+    with pytest.raises(ValueError, match="V2"):
+        owner_posthoc_sweep(df, model, tm, g, qs=(0.5,), variants=("base",))
+    d = owner_posthoc_sweep(df, model, tm, g, qs=(0.5, 0.9), variants=("v2", "v1:2+v2"))
+    assert [(c["variant"], c["q"]) for c in d["cells"]] == [("v2", 0.5), ("v2", 0.9), ("v1:2+v2", 0.5),
+                                                           ("v1:2+v2", 0.9)]
+    for c in d["cells"]:
+        assert c["m_post"]["mean"] >= c["m_pre"]["mean"] and len(c["per_target"]) == d["n_targets"]
+    assert "M' P90" in posthoc_markdown(d)
+    a = build_parser().parse_args(["corridor-posthoc", "--sweep", "s.json"])
+    assert a.q == [0.98, 0.99, 0.995] and a.variants == ["v2", "v1:2+v2"] and str(a.sweep) == "s.json"

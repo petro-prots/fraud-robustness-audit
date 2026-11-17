@@ -144,8 +144,9 @@ at most 7 days depends only on operations before the episode: it is computed in 
 Floor (ruling R28): `floor: {mode: population_percentile, percentile: 10}` – `floor_W` = the 10th percentile, over the
 cards established at the fit end (≥ `lookback_days` of legitimate history before 2020-03-21), of each card's own
 `Q_W(q)` on the fit period (refitted for every q). It applies ONLY to cards whose history before day d is shorter than
-`lookback_days` (first passed operation after `d − L`); established cards use their own quantile. On Sparkov every card
-is established, so the floor never acts there (each run reports `n_floor_touched`). The fixed floors of Task 22
+`lookback_days` (first passed operation after `d − L`); established cards use their own quantile. Every card with
+fit-period history is established by the test period, but 16 of the 218 test targets are cards whose first operation is
+the fraud episode itself (0 days of history): the floor sets their corridor (each run reports `n_floor_touched`). The fixed floors of Task 22
 (`floor_24h` / `floor_7d`, or `floor: {mode: fixed}`) remain available and apply to every card.
 
 Variants (ruling R27): `daily: {mode: weekly_split, kappa: κ}` (V1) replaces the own 24 h quantile with
@@ -172,6 +173,15 @@ auxiliary), B(h) and the empirical per-block amounts for V1 cells, the gate ense
 and the confirmation burden on the legitimate test stream (share of operations and of card-days with a confirmation;
 `metrics.confirmation_burden`, scores cached once per model). Pareto front (R29): P90 of M(c) in $ vs card-day burden
 (3-D: plus the worst uplift). It writes `corridor-sweep.json`, `.md` and `.png`.
+
+The gate replay loads the history before an episode as auto-approved and does not replay the owner's operations inside
+the episode window, so there the V2 post-hoc bound always equals the pre-episode bound. `fraudaudit corridor-posthoc
+--sweep out/corridor-sweep/corridor-sweep.json --out out/corridor-posthoc` measures it with the owner instead: for every
+test target the card's real legitimate operations of `[t0 − 7 d, t0 + 7 d)` are replayed through the bank at the
+model's own τ (the owner confirms when asked; no attacker operations), and M'(c) = `max_t C'_7d` over the episode window
+from the resulting owner confirmations (P90 / median / mean $, share < ρA) for the V2 cells; with `--sweep` the Pareto
+front is rebuilt with M'(c) P90 for those cells. Under attack the attacker's auto-approved spend can push more owner
+operations into confirmation, so the owner-only M'(c) is not an upper bound of the post-hoc bound under attack.
 
 ## Hardening (`fraudaudit harden`, local)
 

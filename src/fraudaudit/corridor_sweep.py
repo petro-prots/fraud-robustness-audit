@@ -329,6 +329,173 @@ def plot(data: dict, path: Path) -> None:
     plt.close(fig)
 
 
+# --- review I1: the owner-replay post-hoc bound M'(c) of V2 cells ------------------------------------------------
+
+
+def owner_window_scores(df: pd.DataFrame, model_or_serving, contexts, window_days: int) -> list[dict]:
+    """Per target context: the owner's stream – the card's legitimate operations (``is_fraud == 0``; the label only
+    selects the stream, as in the burden replay) in ``[t0 − 7 d, t0 + D)`` without the episode rows – the state at
+    ``t0 − 7 d`` (``from_history``, history counted as auto-approved) and the model's p of every operation (every
+    operation is pushed, so p does not depend on the corridor; computed once per model)."""
+    from .serving.core import Serving
+    from .serving.state import CardState, Tx
+    serving = model_or_serving if hasattr(model_or_serving, "decide") else Serving(model_or_serving)
+    W = pd.Timedelta(days=7)
+    groups = dict(tuple(df[df["cc_num"].isin({c.episode.card for c in contexts})].groupby("cc_num", sort=False)))
+    out = []
+    for ctx in contexts:
+        e = ctx.episode
+        g = groups[e.card]
+        g = g[~g["row"].isin(e.rows)]
+        t0 = pd.Timestamp(e.start)
+        lo, hi = t0 - W, t0 + pd.Timedelta(days=int(window_days))
+        own = g[(g["ts"] >= lo) & (g["ts"] < hi) & (g["is_fraud"] == 0)].sort_values(["ts", "row"], kind="stable")
+        state = CardState.from_history(ctx.profile, g[g["ts"] < lo], at=lo)
+        txs = [Tx(ts=pd.Timestamp(r.ts), amt=float(r.amt), merchant=str(r.merchant), category=str(r.category),
+                  merch_lat=float(r.merch_lat), merch_long=float(r.merch_long)) for r in own.itertuples(index=False)]
+        st = state.copy()
+        p = np.empty(len(txs), dtype=np.float64)
+        for i, x in enumerate(txs):
+            p[i] = serving.decide(st, x).p
+            st.push(x)
+        out.append({"state": state, "txs": txs, "p": p})
+    return out
+
+
+def owner_posthoc_bounds(contexts, data: list[dict], corridor, tau: float, window_days: int) -> list[dict]:
+    """M'(c) per target for a V2 corridor (``confirmed_extends``): the owner's stream of ``owner_window_scores``
+    replayed through the bank (``owner=True``: the owner confirms when asked; no blocking; threshold ``tau``), then
+    ``posthoc_bound`` of the audit's pre-episode bound with the owner's confirmations. Owner only: no attacker
+    operation is in this replay (with an attack, the attacker's auto-approved spend can push more owner operations
+    into confirmation, so this is not an upper bound on the post-hoc bound under attack)."""
+    from types import SimpleNamespace
+
+    from .episode import _Bank
+    from .metrics import _SeqServing, _TauServing
+    if not corridor.confirmed_extends:
+        raise ValueError("owner_posthoc_bounds needs a V2 corridor (confirmed_extends: true)")
+    out = []
+    for ctx, d in zip(contexts, data):
+        b = corridor_mod.episode_bound(corridor, ctx.state, ctx.episode.start, window_days)
+        bank = _Bank(_TauServing(_SeqServing(d["p"]), tau), SimpleNamespace(episode=SimpleNamespace(amount=1.0),
+                                                                           state=d["state"]),
+                     None, 1.0, None, corridor, owner=True)
+        for x in d["txs"]:
+            bank.submit(x)
+        conf = d["state"].confirmed_ops() + tuple(bank.confirmed_ops)
+        p = corridor_mod.posthoc_bound(b, conf, ctx.episode.start, window_days)
+        t0 = pd.Timestamp(ctx.episode.start).value
+        out.append({"card": int(ctx.episode.card), "start": pd.Timestamp(ctx.episode.start).isoformat(),
+                    "amount": float(ctx.episode.amount), "bound_pre": b["bound_cents"] / 100,
+                    "bound_post": p["bound_cents"] / 100, "b_h_post": [x / 100 for x in p["b_h_cents"]],
+                    "n_owner_ops": len(d["txs"]), "n_owner_ops_in_window": sum(x.ts.value >= t0 for x in d["txs"]),
+                    "owner_in_window_amount": float(sum(x.amt for x in d["txs"] if x.ts.value >= t0)),
+                    "n_owner_confirms": len(bank.confirmed_ops),
+                    "owner_confirmed_amount": sum(c for _, c in bank.confirmed_ops) / 100})
+    return out
+
+
+def _stats(x) -> dict:
+    x = np.asarray(x, dtype=np.float64)
+    return {"q90": float(np.quantile(x, 0.9)), "median": float(np.median(x)), "mean": float(x.mean()),
+            "max": float(x.max())}
+
+
+def owner_posthoc_sweep(df, model, tm, cfg, *, qs=Q_GRID, variants=("v2", "v1:2+v2"), seed: int = 42,
+                        log=None) -> dict:
+    """``owner_posthoc_bounds`` over the V2 cells of the grid (same targets as ``corridor_sweep``; the model at its
+    own τ). Per cell: M(c) pre-episode and M'(c) post-hoc (P90 / median / mean / max $, share < ρA), owner
+    confirmations, targets with M' > M."""
+    from .audit import select_episodes
+    from .threat import contexts_for
+    say = log or (lambda m: None)
+    specs = [(v, parse_variant(v)) for v in variants]
+    if not all(f["confirmed_extends"] for _, f in specs):
+        raise ValueError("corridor-posthoc measures V2 cells only (variants with +v2 or v2)")
+    targets = contexts_for(df, select_episodes(df, ("test",), cfg.spares_period, seed)[0])
+    t1 = time.perf_counter()
+    data = owner_window_scores(df, model, targets, tm.window_days)
+    say(f"owner streams of {len(targets)} targets: {sum(len(d['txs']) for d in data)} ops, "
+        f"{time.perf_counter() - t1:.0f} s")
+    cells = []
+    for vname, vfields in specs:
+        for q in qs:
+            c = dataclasses.replace(tm.corridor, q=float(q), **vfields)
+            c = corridor_mod.prepare(dataclasses.replace(tm, corridor=c), df).corridor
+            per = owner_posthoc_bounds(targets, data, c, float(model.tau), tm.window_days)
+            pre = np.array([r["bound_pre"] for r in per])
+            post = np.array([r["bound_post"] for r in per])
+            a = np.array([r["amount"] for r in per])
+            cell = {"variant": vname, "variant_label": c.variant(), "q": float(q), "tau": float(model.tau),
+                    "m_pre": _stats(pre), "m_post": _stats(post),
+                    "share_pre_below_rho_a": float(np.mean(pre < tm.rho * a)),
+                    "share_post_below_rho_a": float(np.mean(post < tm.rho * a)),
+                    "n_targets_lifted": int((post > pre).sum()),
+                    "lift": _stats(post - pre),
+                    "n_owner_confirms": int(sum(r["n_owner_confirms"] for r in per)),
+                    "n_targets_with_owner_ops_in_window": int(sum(r["n_owner_ops_in_window"] > 0 for r in per)),
+                    "owner_in_window_amount": _stats([r["owner_in_window_amount"] for r in per]),
+                    "per_target": per}
+            cells.append(cell)
+            say(f"{c.variant()} q {q:g}: M P90 {cell['m_pre']['q90']:.0f} → M' {cell['m_post']['q90']:.0f} $, "
+                f"median {cell['m_pre']['median']:.0f} → {cell['m_post']['median']:.0f} $, lifted "
+                f"{cell['n_targets_lifted']} targets, {cell['n_owner_confirms']} owner confirmations")
+    return {"cells": cells, "n_targets": len(targets), "seed": int(seed), "variants": list(variants),
+            "q_grid": list(qs), "corridor_base": tm.corridor.public()}
+
+
+def merge_posthoc(sweep: dict, post: dict) -> dict:
+    """A copy of the sweep cells where every V2 cell measured by ``owner_posthoc_sweep`` uses M'(c) P90 for the 2-D
+    and 3-D fronts (``m_p90_front``; other cells keep M(c) P90), with the fronts recomputed per τ
+    (``pareto_2d_posthoc``, ``pareto_3d_posthoc``)."""
+    import copy
+    pm = {(c["variant"], c["q"]): c for c in post["cells"]}
+    cells = copy.deepcopy(sweep["cells"])
+    for c in cells:
+        if c["q"] is None:
+            continue
+        m = pm.get((c["variant"], c["q"]))
+        c["m_p90_front"] = m["m_post"]["q90"] if m else c["bound"]["bound"]["q90"]
+        if m:
+            c["m_post"], c["share_post_below_rho_a"] = m["m_post"], m["share_post_below_rho_a"]
+    for fpr in sorted({c["target_fpr"] for c in cells if c["q"] is not None}):
+        g = [c for c in cells if c["q"] is not None and abs(c["target_fpr"] - fpr) < 1e-12]
+        p2 = pareto([(c["m_p90_front"], c["burden"]["share_confirm_card_days"]) for c in g])
+        p3 = pareto([(c["m_p90_front"], c["worst_uplift_upper"], c["burden"]["share_confirm_card_days"]) for c in g])
+        for c, a, b in zip(g, p2, p3):
+            c["pareto_2d_posthoc"], c["pareto_3d_posthoc"] = bool(a), bool(b)
+    return {"cells": cells}
+
+
+def posthoc_markdown(post: dict, merged: dict | None = None) -> str:
+    lines = ["# V2 post-hoc bound with the owner's real operations (review I1)", "",
+             f"{post['n_targets']} test targets; owner stream = the card's legitimate operations in [t0 − 7 d, t0 + 7 d) "
+             "(episode rows excluded) replayed with owner confirmations at the model's own τ, no attacker operations. "
+             "M = pre-episode bound, M' = post-hoc max_t C'_7d over the episode window. $ values.", "",
+             "| variant | q | M P90 / median / mean | M' P90 / median / mean | M < ρA | M' < ρA | targets lifted | "
+             "lift median / max | owner confirmations | targets with owner ops in window |",
+             "|---|---:|---|---|---:|---:|---:|---|---:|---:|"]
+    for c in post["cells"]:
+        a, b = c["m_pre"], c["m_post"]
+        lines.append(f"| {c['variant_label']} | {c['q']:g} | {a['q90']:.0f} / {a['median']:.0f} / {a['mean']:.0f} | "
+                     f"{b['q90']:.0f} / {b['median']:.0f} / {b['mean']:.0f} | {_pct(c['share_pre_below_rho_a'])} | "
+                     f"{_pct(c['share_post_below_rho_a'])} | {c['n_targets_lifted']} | {c['lift']['median']:.0f} / "
+                     f"{c['lift']['max']:.0f} | {c['n_owner_confirms']} | {c['n_targets_with_owner_ops_in_window']} |")
+    if merged:
+        lines += ["", "## Pareto with M'(c) for the V2 cells (FPR fronts per τ)", "",
+                  "| variant | q | P90 $ used | confirm card-days | worst uplift | 2-D (sweep → post-hoc) | "
+                  "3-D (sweep → post-hoc) |", "|---|---:|---:|---:|---:|---|---|"]
+        yn = lambda x: "yes" if x else "no"  # noqa: E731
+        for c in merged["cells"]:
+            if c["q"] is None:
+                continue
+            lines.append(f"| {c['variant_label']} | {c['q']:g} | {c['m_p90_front']:.0f} | "
+                         f"{_pct(c['burden']['share_confirm_card_days'])} | {_pct(c['worst_uplift_upper'])} | "
+                         f"{yn(c['pareto_2d'])} → {yn(c['pareto_2d_posthoc'])} | "
+                         f"{yn(c['pareto_3d'])} → {yn(c['pareto_3d_posthoc'])} |")
+    return "\n".join(lines) + "\n"
+
+
 def write_outputs(data: dict, out_dir) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

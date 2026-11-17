@@ -89,7 +89,8 @@ def profile_of(df: pd.DataFrame, cc_num: int) -> CardProfile:
 class _SpendBuffer:
     """Shared growable storage of ``SpendHistory`` objects: ``n`` slots are used; a history owns the slots before its
     own length and only the history whose length equals ``n`` may write the next slot (append-only, never
-    overwritten)."""
+    overwritten). Not thread-safe: two threads appending to histories that share one buffer could both claim the
+    next slot. The package parallelises with processes only (each worker has its own copies), so this never happens."""
     __slots__ = ("t", "a", "cs", "n")
 
     def __init__(self, t: np.ndarray, a: np.ndarray, cs: np.ndarray, capacity: int) -> None:
