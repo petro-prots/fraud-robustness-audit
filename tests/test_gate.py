@@ -115,6 +115,14 @@ def test_gate_yaml_strict(tmp_path, change):
         GateConfig.from_yaml(p)
 
 
+def test_gate_stepwise_456_yaml_differs_from_gate_yaml_only_in_attacks_and_seeds():
+    """The tracked fresh-seed file (stepwise seeds 4-6) is gate.yaml with another ensemble, nothing else."""
+    extra = GateConfig.from_yaml(ROOT / "gate-stepwise-456.yaml")
+    base = GateConfig.from_yaml(GATE_PATH)
+    assert extra.attacks == ["stepwise"] and extra.attack_seeds == [4, 5, 6]
+    assert dataclasses.replace(extra, attacks=base.attacks, attack_seeds=base.attack_seeds) == base
+
+
 def test_gate_yaml_delta_null_allowed(tmp_path):
     raw = yaml.safe_load(GATE_PATH.read_text())
     raw["delta"] = None
