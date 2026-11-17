@@ -117,6 +117,10 @@ def corridor_meta(tm: ThreatModel, per_target: list[dict]) -> dict:
             "n_targets": len(per_target),
             "n_bound_violations": int(sum(t["bound_violation"] for t in per_target)),
             "n_headroom_violations": int(sum(t["headroom_violation"] for t in per_target)),
+            "n_block_violations": int(sum(t.get("block_violation", False) for t in per_target)),
+            "variant": c.variant(),
+            "floor_fit": None if c.floor_fit is None else dataclasses.asdict(c.floor_fit),
+            "weekly_split": None if c.split is None else dataclasses.asdict(c.split),
             "n_adv_confirms": int(sum(t["n_confirms"] for t in per_target)),
             "n_clean_confirms": int(sum(t["clean_n_confirms"] for t in per_target)),
             **corridor_mod.bound_stats(per_target, tm.rho)}
@@ -125,8 +129,24 @@ def corridor_meta(tm: ThreatModel, per_target: list[dict]) -> dict:
 def corridor_line(c: dict) -> str:
     """One summary line of ``meta["corridor"]``."""
     p = c["params"]
-    return (f"Spending corridor (q {p['q']}, lookback {p['lookback_days']} d, floors {p['floor_24h']:.0f} / "
-            f"{p['floor_7d']:.0f} $, multipliers {', '.join(p['multipliers']) or 'none'}): guaranteed bound on the "
+    fl = p.get("floor") or {"mode": "fixed"}
+    if fl["mode"] == "fixed":
+        floors = f"floors {p['floor_24h']:.0f} / {p['floor_7d']:.0f} $"
+    else:
+        ff = c.get("floor_fit") or {}
+        floors = (f"population floor P{fl['percentile']:g} for new cards only "
+                  f"({ff.get('floor_24h', float('nan')):.0f} / {ff.get('floor_7d', float('nan')):.0f} $, touched "
+                  f"{c.get('n_floor_touched', 0)} targets)")
+    dl = p.get("daily") or {"mode": "quantile"}
+    daily = "" if dl["mode"] == "quantile" else f", daily = weekly split × κ {dl['kappa']:g}"
+    v2 = ", confirmed operations extend the corridor (post-hoc bound)" if p.get("confirmed_extends") else ""
+    bh = ""
+    if c.get("b_h"):
+        bh = (f"; B(h) median $ h = 1..{len(c['b_h']['median'])}: "
+              + " / ".join(f"{x:.0f}" for x in c["b_h"]["median"])
+              + f", {c.get('n_block_violations', 0)} block violations")
+    return (f"Spending corridor (q {p['q']}, lookback {p['lookback_days']} d, {floors}{daily}{v2}, multipliers "
+            f"{', '.join(p['multipliers']) or 'none'}){bh}: guaranteed bound on the "
             f"auto-approved attacker amount mean {c['bound']['mean']:.2f} $ / median {c['bound']['median']:.2f} $ / "
             f"max {c['bound']['max']:.2f} $ = {_pct(c['bound_share']['mean'])} / {_pct(c['bound_share']['median'])} / "
             f"{_pct(c['bound_share']['max'])} of A; bound below ρ·A for {_pct(c['share_targets_bound_below_rho_a'])} "
@@ -191,15 +211,25 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
            "clean_n_ops": int(clean.n_ops), "clean_n_real_ops": len(clean_txs),
            "clean_blocked": bool(clean.blocked)}
     if tm.corridor is not None:
-        b = corridor_mod.episode_bound(tm.corridor, ctx.state, ctx.episode.start, tm.window_days)
-        corridor_mod.check_used_corridor(b, adv.corridor_c7)  # the bank used the pre-episode corridor
-        corridor_mod.check_used_corridor(b, clean.corridor_c7, inside_only=True)
+        start = ctx.episode.start
+        b = corridor_mod.episode_bound(tm.corridor, ctx.state, start, tm.window_days)
+        # the bank used the pre-episode base corridors (7-day and 24 h)
+        corridor_mod.check_used_corridor(b, adv.corridor_c7, used24=adv.corridor_c24)
+        corridor_mod.check_used_corridor(b, clean.corridor_c7, used24=clean.corridor_c24, inside_only=True)
+        # V2: the post-hoc bound from the owner's confirmations (before and during the episode); else = b
+        p = (corridor_mod.posthoc_bound(b, ctx.state.confirmed_ops() + adv.confirmed_ops, start, tm.window_days)
+             if tm.corridor.confirmed_extends else b)
         a = float(ctx.episode.amount)
         got = round(adv.passed_amount * 100)
-        out.update(corridor_bound=b["bound_cents"] / 100, corridor_headroom=b["headroom_cents"] / 100,
-                   corridor_bound_share=b["bound_cents"] / 100 / a, corridor_headroom_share=b["headroom_cents"] / 100 / a,
+        cum = corridor_mod.auto_by_block(adv.auto_ops, start, tm.window_days)
+        out.update(corridor_bound=p["bound_cents"] / 100, corridor_bound_pre=b["bound_cents"] / 100,
+                   corridor_headroom=p["headroom_cents"] / 100,
+                   corridor_bound_share=p["bound_cents"] / 100 / a, corridor_headroom_share=p["headroom_cents"] / 100 / a,
                    n_confirms=int(adv.n_confirms), clean_n_confirms=int(clean.n_confirms),
-                   bound_violation=bool(got > b["bound_cents"]), headroom_violation=bool(got > b["headroom_cents"]))
+                   bound_violation=bool(got > p["bound_cents"]), headroom_violation=bool(got > p["headroom_cents"]),
+                   b_h=[x / 100 for x in p["b_h_cents"]], auto_by_block=cum,
+                   block_violation=bool(any(g > lim for g, lim in zip(cum, p["b_h_cents"]))),
+                   floor_touched=bool(b["floor_touched"]))
     return out
 
 

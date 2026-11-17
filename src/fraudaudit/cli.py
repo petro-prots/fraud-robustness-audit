@@ -99,10 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
     cs.add_argument("--threat", type=Path, default=Path("threat-models/realistic-corridor.yaml"),
                     help="threat model with the base corridor section (q is replaced by the grid)")
     cs.add_argument("--gate", type=Path, default=Path("gate.yaml"), help="attacks, attack seeds, spares (read only)")
-    cs.add_argument("--q", type=_deltas, default=[0.95, 0.98, 0.99, 0.995, 0.999],
-                    help="comma-separated corridor quantiles (default 0.95,0.98,0.99,0.995,0.999)")
-    cs.add_argument("--target-fpr", type=_deltas, default=[0.003, 0.01],
-                    help="comma-separated target FPRs; tau of each from clean val (default 0.003,0.01)")
+    cs.add_argument("--q", type=_deltas, default=[0.98, 0.99, 0.995],
+                    help="comma-separated corridor quantiles (default 0.98,0.99,0.995)")
+    cs.add_argument("--target-fpr", type=_deltas, default=[0.01],
+                    help="comma-separated target FPRs, must include the model's own; tau of each from clean val "
+                         "(default 0.01)")
+    cs.add_argument("--variants", type=_names, default=["base", "v1:1.5", "v1:2", "v1:3", "v2", "v1:2+v2"],
+                    help="comma-separated corridor variants: base, v1:KAPPA, v2, v1:KAPPA+v2 "
+                         "(default base,v1:1.5,v1:2,v1:3,v2,v1:2+v2)")
     cs.add_argument("--no-reference", action="store_true", help="skip the cells without a corridor")
     cs.add_argument("--out", type=Path, default=Path("out/corridor-sweep"))
     cs.add_argument("--seed", type=int, default=42)
@@ -403,6 +407,7 @@ def cmd_corridor_sweep(args: argparse.Namespace) -> int:
         print(f"error: corridor-sweep configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
     data = corridor_sweep(df, model, args.model, tm, cfg, qs=tuple(args.q), fprs=tuple(args.target_fpr),
+                          variants=tuple(args.variants),
                           seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out, threat_path=args.threat,
                           reference=not args.no_reference, log=lambda m: print(m, file=sys.stderr, flush=True))
     data["meta"] = {"seed": int(args.seed), **git_info(), "model": str(args.model),

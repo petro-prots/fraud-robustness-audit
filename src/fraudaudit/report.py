@@ -277,11 +277,15 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
                   "the adversarial and the clean leg run under the corridor. The bound (max over the episode window "
                   "of the 7-day corridor) holds for any attack strategy when the episode lasts at most 7 days; the "
                   "corridor profile is lagged by 7 days and built from passed operations without fraud labels, so the "
-                  "bound is computed before the episode and no attacker operation changes it.",
+                  "bound is computed before the episode and no attacker operation changes it. B(h) bounds the "
+                  "amount after h days (Proposition 2); with confirmed_extends (V2) the bounds are post-hoc, from "
+                  "the owner's confirmations only.",
                   "- Bound violations per run: " + ", ".join(
                       f"{k} {r.meta['corridor']['n_bound_violations']}" for k, r in results.items()
                       if r.meta.get("corridor")) + "; headroom-bound violations per run: " + ", ".join(
                       f"{k} {r.meta['corridor'].get('n_headroom_violations', 0)}" for k, r in results.items()
+                      if r.meta.get("corridor")) + "; B(h) block violations per run: " + ", ".join(
+                      f"{k} {r.meta['corridor'].get('n_block_violations', 0)}" for k, r in results.items()
                       if r.meta.get("corridor")) + "."]
 
     if w.false_blocks:

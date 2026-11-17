@@ -19,9 +19,8 @@ attack:
 tau_after_decline: null    # card-level threshold after the first decline (< model tau); null = no escalation
 corridor:                  # soft per-card spending corridor (Task 22, fraudaudit.corridor); parameters fixed before any result
   q: 0.99                  # quantile of the card's own rolling-window spend over the lookback
-  lookback_days: 180       # profile: legitimate operations in [day - 180 d, day)
-  floor_24h: 100.0         # minimal 24 h corridor, $ (cards with little history)
-  floor_7d: 300.0          # minimal 7 d corridor, $
+  lookback_days: 180       # profile: passed operations in [day - 180 d, day - 7 d); also «established» = >= 180 d of history
+  floor: {mode: population_percentile, percentile: 10}  # R28: P10 of established cards' own corridors (fit period), new cards only
   multipliers: [holiday, weekday, day_of_month]  # population factors, each used only when significant
   holiday_weeks: [-3, 1]   # week offsets k from the nearest major US holiday
   n_boot: 1000             # bootstrap resamples of the multiplier intervals

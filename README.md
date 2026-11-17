@@ -141,18 +141,37 @@ multiplier summary). Amounts are compared in whole cents. Because of the lag, th
 at most 7 days depends only on operations before the episode: it is computed in advance, and no attacker operation
 (passed or not) changes it. A corridor threat model with `window_days` > 7 is rejected at load.
 
-Guarantee (Proposition): an episode of at most 7 days cannot get more auto-approved than
-`max_{t ∈ [t0, t0 + D)} C_7d(c, t)`, whatever the attack. Every corridor run reports this bound per target
-(`per_target[].corridor_bound`, share of A, and the tighter `corridor_headroom` net of the owner's own spend still in
-the window), its summary in `meta.corridor`, bound checks (`n_bound_violations`, `n_headroom_violations`, always 0 by
-construction), and a run-time check that every corridor the bank used during the episode equals the pre-episode value.
+Floor (ruling R28): `floor: {mode: population_percentile, percentile: 10}` – `floor_W` = the 10th percentile, over the
+cards established at the fit end (≥ `lookback_days` of legitimate history before 2020-03-21), of each card's own
+`Q_W(q)` on the fit period (refitted for every q). It applies ONLY to cards whose history before day d is shorter than
+`lookback_days` (first passed operation after `d − L`); established cards use their own quantile. On Sparkov every card
+is established, so the floor never acts there (each run reports `n_floor_touched`). The fixed floors of Task 22
+(`floor_24h` / `floor_7d`, or `floor: {mode: fixed}`) remain available and apply to every card.
+
+Variants (ruling R27): `daily: {mode: weekly_split, kappa: κ}` (V1) replaces the own 24 h quantile with
+`C_24h = κ · s(weekday) · C_7d`, s(j) = the population share of weekly legitimate spend on weekday j (fit period, Σ s = 1);
+`daily: {mode: quantile}` (the default) keeps the Task 22 behaviour. `confirmed_extends: true` (V2) adds the
+owner-confirmed amounts in `(t − W, t]` to each window's corridor (`C'_W`); only the owner's confirmations count (the
+attacker's always fail). `threat-models/realistic-corridor-v1v2.yaml` = q 0.99, V1 (κ = 2) + V2.
+
+Guarantee (Proposition 1): an episode of at most 7 days cannot get more auto-approved than
+`max_{t ∈ [t0, t0 + D)} C_7d(c, t)`, whatever the attack. Proposition 2: within the first h 24-hour blocks it cannot get
+more than `B(h) = min(max C_7d, Σ_{i ≤ h} max_{t ∈ B_i} C_24h)`. With V2 both bounds use `C'`, are computed after the
+episode from the owner's actual confirmations (post-hoc, attack-independent). Every corridor run reports per target
+`corridor_bound` (M(c) in $, post-hoc with V2; `corridor_bound_pre` = the pre-episode bound), `b_h` ($, h = 1..D),
+`auto_by_block` (the cumulative auto-approved cents per block), the tighter `corridor_headroom` and `floor_touched`;
+`meta.corridor` has the summaries and the violation counts (`n_bound_violations`, `n_headroom_violations`,
+`n_block_violations`, always 0 by construction); a run-time check asserts that every 7-day and 24 h corridor the bank
+used during the episode equals the pre-episode value.
 
 `fraudaudit corridor-sweep --model models --threat threat-models/realistic-corridor.yaml --gate gate.yaml --out
-out/corridor-sweep` evaluates the pre-registered grid q ∈ {0.95, 0.98, 0.99, 0.995, 0.999} × τ at target FPR
-∈ {0.003, 0.01} (τ from clean val, same weights; plus a no-corridor reference per τ): the guaranteed bound, the gate
-ensemble's worst uplift under the corridor and the confirmation burden on the legitimate test stream (share of
-operations and of card-days with a confirmation; `metrics.confirmation_burden`, scores cached once per model). It
-writes `corridor-sweep.json`, `.md` (table, Pareto flags) and `.png` (front).
+out/corridor-sweep` evaluates the pre-registered grid (Task 22c) variant ∈ {base, V1 κ 1.5 / 2 / 3, V2, V1(κ 2)+V2}
+× q ∈ {0.98, 0.99, 0.995} × τ at the model's own target FPR 0.01 (`--variants`, `--q`, `--target-fpr`; the FPR grid must
+contain the model's own target FPR; plus a no-corridor reference): M(c) in $ (P90 / median / mean, share < ρA; bound/A
+auxiliary), B(h) and the empirical per-block amounts for V1 cells, the gate ensemble's worst uplift under the corridor
+and the confirmation burden on the legitimate test stream (share of operations and of card-days with a confirmation;
+`metrics.confirmation_burden`, scores cached once per model). Pareto front (R29): P90 of M(c) in $ vs card-day burden
+(3-D: plus the worst uplift). It writes `corridor-sweep.json`, `.md` and `.png`.
 
 ## Hardening (`fraudaudit harden`, local)
 

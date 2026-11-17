@@ -792,23 +792,40 @@ def test_corridor_sweep_end_to_end(tmp_path):
     model.save(tmp_path / "model", meta={"seed": 0, "target_fpr": 0.01})
     model = FraudModel.from_artifacts(load_artifacts(tmp_path / "model"))
     tm = dataclasses.replace(ThreatModel.from_yaml(TM_CORRIDOR_PATH), recon_budget_ops=100)
+    tm = dataclasses.replace(tm, corridor=dataclasses.replace(tm.corridor, lookback_days=60))  # short fixture history
     g = GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.1, attacks=["random"], attack_seeds=[1],
                    confidence=0.95, one_sided=True, spares_period="fit")
     with pytest.raises(ValueError, match="target_fpr"):  # M6: no silent skip of the tau reproduction check
         corridor_sweep(df, model, tmp_path / "nofpr", tm, g, qs=(0.9,), fprs=(0.05,), seed=1, n_jobs=1,
                        out_dir=tmp_path / "out0")
-    data = corridor_sweep(df, model, tmp_path / "model", tm, g, qs=(0.9, 0.99), fprs=(0.05,), seed=1, n_jobs=1,
-                          out_dir=tmp_path / "out")
-    assert [c["q"] for c in data["cells"]] == [None, 0.9, 0.99]
+    with pytest.raises(ValueError, match="not in the FPR grid"):  # 22b review: error when 0.01 is not in the grid
+        corridor_sweep(df, model, tmp_path / "model", tm, g, qs=(0.9,), fprs=(0.05,), seed=1, n_jobs=1,
+                       out_dir=tmp_path / "out1")
+    with pytest.raises(ValueError, match="variant"):
+        corridor_sweep(df, model, tmp_path / "model", tm, g, qs=(0.9,), fprs=(0.01,), variants=("v3",), seed=1,
+                       n_jobs=1, out_dir=tmp_path / "out2")
+    data = corridor_sweep(df, model, tmp_path / "model", tm, g, qs=(0.9, 0.99), fprs=(0.01,),
+                          variants=("base", "v1:2+v2"), seed=1, n_jobs=1, out_dir=tmp_path / "out")
+    assert [(c["variant"], c["q"]) for c in data["cells"]] == [(None, None), ("base", 0.9), ("base", 0.99),
+                                                                ("v1:2+v2", 0.9), ("v1:2+v2", 0.99)]
     grid = data["cells"][1:]
-    assert all(c["n_bound_violations"] == 0 and c["n_headroom_violations"] == 0 and "pareto_3d" in c for c in grid)
+    assert all(c["n_bound_violations"] == 0 and c["n_headroom_violations"] == 0 and c["n_block_violations"] == 0
+               and "pareto_3d" in c for c in grid)
     assert grid[0]["bound"]["bound"]["mean"] <= grid[1]["bound"]["bound"]["mean"]  # a higher q never lowers C
+    assert grid[0]["floor_fit"]["q"] == 0.9 and grid[1]["floor_fit"]["q"] == 0.99  # the floor is refitted per q
+    assert grid[2]["variant_label"] == "V1(κ=2)+V2" and len(grid[2]["bound"]["b_h"]["median"]) == 7
+    assert grid[2]["empirical_blocks"]["n_over"] == 0
     assert all(c["burden"]["n_ops"] > 0 and 0 <= c["burden"]["share_confirm_card_days"] <= 1 for c in grid)
     write_outputs(data, tmp_path / "out")
     assert (tmp_path / "out" / "corridor-sweep.png").stat().st_size > 0
-    assert "| target FPR |" in (tmp_path / "out" / "corridor-sweep.md").read_text()
-    a = build_parser().parse_args(["corridor-sweep", "--q", "0.9,0.99", "--target-fpr", "0.01"])
+    md = (tmp_path / "out" / "corridor-sweep.md").read_text()
+    assert "| target FPR |" in md and "M(c) P90 $" in md and "## B(h)" in md
+    a = build_parser().parse_args(["corridor-sweep", "--q", "0.9,0.99", "--target-fpr", "0.01",
+                                   "--variants", "base,v1:2"])
     assert a.q == [0.9, 0.99] and a.target_fpr == [0.01] and str(a.threat).endswith("realistic-corridor.yaml")
+    assert a.variants == ["base", "v1:2"]
+    d = build_parser().parse_args(["corridor-sweep"])
+    assert d.q == [0.98, 0.99, 0.995] and d.target_fpr == [0.01] and len(d.variants) == 6
 
 
 def test_report_mentions_corridor(audit_env, tmp_path):

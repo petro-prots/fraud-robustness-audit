@@ -155,7 +155,7 @@ class ThreatModel:
         if not (0 < tm.rho <= 1 and tm.k_max >= 1 and 0 < tm.amount_min <= tm.amount_max
                 and tm.window_days >= 1 and tm.merchant_coord_radius >= 0 and tm.min_gap_secs >= 0):
             raise ValueError(f"{path}: inconsistent threat model {tm}")
-        if tm.corridor is not None and tm.window_days * 86_400 > 7 * 86_400:
+        if tm.corridor is not None and tm.window_days > 7:
             raise ValueError(f"{path}: with a corridor window_days must be <= 7 (the guarantee needs the episode "
                              f"to fit into the 7-day corridor window), got {tm.window_days}")
         if tm.knowledge not in ("decision", "score"):

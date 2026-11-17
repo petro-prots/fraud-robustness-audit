@@ -195,6 +195,7 @@ class CardState:
         self._a: list[float] = []
         self._c: list[str] = []
         self._u: list[int] = []  # auto-approved amount in cents (0 if the operation was not auto-approved)
+        self._k: list[int] = []  # owner-confirmed amount in cents (0 unless the owner confirmed it; corridor V2)
         self._now: int | None = None  # ns; None = no time seen yet
         self.spend: SpendHistory = SpendHistory.empty()
 
@@ -218,6 +219,7 @@ class CardState:
         s._a = amt[order].tolist()
         s._c = cat[order].tolist()
         s._u = [_cents(a) for a in s._a]
+        s._k = [0] * len(s._a)
         s._now = at_ns
         lm = t_all < at_ns
         lo = np.argsort(t_all[lm], kind="stable")
@@ -270,28 +272,45 @@ class CardState:
         lo = bisect_right(self._t, t_ns - w_ns, 0, hi)
         return sum(self._u[lo:hi])
 
-    def push(self, tx: Tx, *, auto_approved: bool = True, passed: bool = True) -> None:
+    def confirmed_sum_cents(self, t_ns: int, w_ns: int) -> int:
+        """Owner-confirmed cents of the operations in the state with ``t - W < t_j <= t`` (corridor V2; same window
+        and same-second rule as ``auto_sum_cents``). A read only: no time check."""
+        hi = bisect_right(self._t, t_ns)
+        lo = bisect_right(self._t, t_ns - w_ns, 0, hi)
+        return sum(self._k[lo:hi])
+
+    def confirmed_ops(self) -> tuple:
+        """``((t ns, cents), …)`` of the owner-confirmed operations still in the state (the last 30 days)."""
+        return tuple((t, k) for t, k in zip(self._t, self._k) if k)
+
+    def push(self, tx: Tx, *, auto_approved: bool = True, passed: bool = True, confirmed: bool = False) -> None:
         """Record ``tx`` as history for later operations; drop operations older than 30 days.
 
         ``auto_approved``: the amount counts in the corridor sums (history and callers without a corridor: True).
         ``passed``: the operation went through (auto-approved or confirmed), so it is appended to the corridor
-        profile ``spend``; False for a model decline or a failed confirmation. No label of who sent it is used."""
+        profile ``spend``; False for a model decline or a failed confirmation. No label of who sent it is used.
+        ``confirmed``: the OWNER confirmed it with the second factor (passed, not auto-approved); its amount extends
+        the V2 corridor (``confirmed_sum_cents``). A fraudster's confirmation always fails, so never confirmed."""
+        if confirmed and (auto_approved or not passed):
+            raise ValueError("a confirmed operation passed and was not auto-approved")
         t = pd.Timestamp(tx.ts).value
         self._check_time(t, "push")
         self._t.append(t)
         self._a.append(float(tx.amt))
         self._c.append(str(tx.category))
         self._u.append(_cents(tx.amt) if auto_approved else 0)
+        self._k.append(_cents(tx.amt) if confirmed else 0)
         self._now = t
         if passed:
             self.spend = self.spend.append(t, float(tx.amt))
         drop = bisect_left(self._t, t - _KEEP_NS)  # keep t_j >= now - 30d
         if drop:
-            del self._t[:drop], self._a[:drop], self._c[:drop], self._u[:drop]
+            del self._t[:drop], self._a[:drop], self._c[:drop], self._u[:drop], self._k[:drop]
 
     def copy(self) -> "CardState":
         c = CardState(self.profile)
         c._t, c._a, c._c, c._u = list(self._t), list(self._a), list(self._c), list(self._u)
+        c._k = list(self._k)
         c._now = self._now
         c.spend = self.spend  # persistent: shared
         return c
