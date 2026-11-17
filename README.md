@@ -131,15 +131,21 @@ not the owner's second factor (threat-model assumption), so the operation does n
 `confirm_fail_counts_as_decline: true`, counts as a decline.
 
 Corridor of card c on day d: `C_W = max(floor_W, Q_W) · m_W(d)`, where `Q_W` is the `q`-quantile of the card's own
-rolling-W spend taken after each of its legitimate operations in `[d − lookback_days, d)` (attacker operations never
-enter the profile) and `m_W` are population multipliers estimated on the fit period – weeks `holiday_weeks` around the
-nearest of Christmas, Thanksgiving and Independence Day (both windows), weekday and day of month (24 h window only);
-each factor is used only when its bootstrap interval excludes 1. Amounts are compared in whole cents.
+rolling-W spend taken at each of its operations in `[d − lookback_days, d − 7 d)` – a profile lagged by 7 days and
+built from the operations that PASSED (the real history, auto-approved and owner-confirmed operations; never model
+declines or failed confirmations), without any fraud label (ruling R26) – and `m_W` are population multipliers
+estimated on the fit period – weeks `holiday_weeks` around the nearest of Christmas, Thanksgiving and Independence Day
+(both windows), weekday and day of month (24 h window only); each factor is used only when its bootstrap interval
+excludes 1 (one test per group, no multiple-testing correction; `n_tests` and `expected_false_positives` are in the
+multiplier summary). Amounts are compared in whole cents. Because of the lag, the corridor on any day of an episode of
+at most 7 days depends only on operations before the episode: it is computed in advance, and no attacker operation
+(passed or not) changes it. A corridor threat model with `window_days` > 7 is rejected at load.
 
 Guarantee (Proposition): an episode of at most 7 days cannot get more auto-approved than
 `max_{t ∈ [t0, t0 + D)} C_7d(c, t)`, whatever the attack. Every corridor run reports this bound per target
 (`per_target[].corridor_bound`, share of A, and the tighter `corridor_headroom` net of the owner's own spend still in
-the window), its summary in `meta.corridor` and a bound check (`n_bound_violations`, always 0 by construction).
+the window), its summary in `meta.corridor`, bound checks (`n_bound_violations`, `n_headroom_violations`, always 0 by
+construction), and a run-time check that every corridor the bank used during the episode equals the pre-episode value.
 
 `fraudaudit corridor-sweep --model models --threat threat-models/realistic-corridor.yaml --gate gate.yaml --out
 out/corridor-sweep` evaluates the pre-registered grid q ∈ {0.95, 0.98, 0.99, 0.995, 0.999} × τ at target FPR

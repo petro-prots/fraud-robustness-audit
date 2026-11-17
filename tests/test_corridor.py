@@ -16,7 +16,7 @@ from fraudaudit.corridor import CorridorConfig, Multipliers
 from fraudaudit.data import fraud_episodes
 from fraudaudit.episode import run_adaptive_episode, run_episode
 from fraudaudit.serving.core import Decision
-from fraudaudit.serving.state import CardProfile, CardState, LegitHistory, Tx
+from fraudaudit.serving.state import CardProfile, CardState, SpendHistory, Tx
 from fraudaudit.threat import MerchantTable, Strategy, ThreatModel, contexts_for, realize
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +61,7 @@ def ctx_with(state, amount=1000.0, start=T0):
 def _hist(rows):
     t = np.array([pd.Timestamp(ts).value for ts, _ in rows], dtype=np.int64)
     a = np.array([a for _, a in rows], dtype=np.float64)
-    return LegitHistory(t, a)
+    return SpendHistory(t, a)
 
 
 def test_window_quantile_by_hand():
@@ -71,13 +71,29 @@ def test_window_quantile_by_hand():
     day = (d1 + 5 * DAY).value
     w24 = 86_400 * 10**9
     # rolling 24 h sums right after every op: 10, 30, 60 (30 + both ops of day 1), 5
-    assert h.window_quantile(day, 180 * w24, w24, 0.5) == pytest.approx(np.quantile([10, 30, 60, 5], 0.5))
-    assert h.window_quantile(day, 180 * w24, w24, 1.0) == pytest.approx(60.0)
-    assert h.window_quantile(day, 180 * w24, 7 * w24, 1.0) == pytest.approx(65.0)
-    # only ops strictly before the day count; lookback [day - L, day)
-    assert h.window_quantile((d1 + DAY).value, 180 * w24, w24, 1.0) == pytest.approx(30.0)
-    assert h.window_quantile(day, 2 * w24, w24, 1.0) == pytest.approx(5.0)
-    assert h.window_quantile(d1.value, 180 * w24, w24, 0.99) == 0.0  # no history
+    assert h.window_quantile(day, 180 * w24, w24, 0.5, 0) == pytest.approx(np.quantile([10, 30, 60, 5], 0.5))
+    assert h.window_quantile(day, 180 * w24, w24, 1.0, 0) == pytest.approx(60.0)
+    assert h.window_quantile(day, 180 * w24, 7 * w24, 1.0, 0) == pytest.approx(65.0)
+    # lag 0: only ops strictly before the day count; lookback [day - L, day)
+    assert h.window_quantile((d1 + DAY).value, 180 * w24, w24, 1.0, 0) == pytest.approx(30.0)
+    assert h.window_quantile(day, 2 * w24, w24, 1.0, 0) == pytest.approx(5.0)
+    assert h.window_quantile(d1.value, 180 * w24, w24, 0.99, 0) == 0.0  # no history
+
+
+def test_window_quantile_lag_excludes_recent_ops():
+    """R26: with lag W the profile of day d uses only operations in [d - L, d - W)."""
+    d1 = pd.Timestamp("2020-01-01")
+    w24 = 86_400 * 10**9
+    h = _hist([(d1 + pd.Timedelta(hours=10), 10.0), (d1 + 3 * DAY + pd.Timedelta(hours=9), 500.0)])
+    day = (d1 + 10 * DAY).value  # d - 7 d = Jan 4 00:00: the 500 op (Jan 4 09:00) is inside the lag, excluded
+    assert h.window_quantile(day, 180 * w24, w24, 1.0, 7 * w24) == pytest.approx(10.0)
+    assert h.window_quantile(day, 180 * w24, w24, 1.0, 0) == pytest.approx(500.0)
+    later = (d1 + 11 * DAY).value  # d - 7 d = Jan 5 00:00 > Jan 4 09:00: now it counts
+    assert h.window_quantile(later, 180 * w24, w24, 1.0, 7 * w24) == pytest.approx(500.0)
+    # the window sum of an op in the profile still counts earlier ops (all before d - W anyway)
+    assert h.window_quantile(later, 180 * w24, 7 * w24, 1.0, 7 * w24) == pytest.approx(510.0)
+    # lookback [d - L, d - W): L counted from d
+    assert h.window_quantile(later, 9 * w24, w24, 0.0, 7 * w24) == pytest.approx(500.0)
 
 
 def test_window_value_counts_same_second_ops_and_lookback_edge():
@@ -85,34 +101,34 @@ def test_window_value_counts_same_second_ops_and_lookback_edge():
     h = _hist([(d1, 10.0), (d1, 15.0), (d1 + DAY, 1.0)])  # exactly 24 h later: the first two drop out
     day = (d1.normalize() + 3 * DAY).value
     w24 = 86_400 * 10**9
-    assert h.window_quantile(day, 180 * w24, w24, 1.0) == pytest.approx(25.0)
-    assert h.window_quantile(day, 180 * w24, w24, 0.0) == pytest.approx(1.0)
+    assert h.window_quantile(day, 180 * w24, w24, 1.0, 0) == pytest.approx(25.0)
+    assert h.window_quantile(day, 180 * w24, w24, 0.0, 0) == pytest.approx(1.0)
     # lookback starts at day - L inclusive
-    assert h.window_quantile(day, day - d1.value, w24, 0.0) == pytest.approx(1.0)
+    assert h.window_quantile(day, day - d1.value, w24, 0.0, 0) == pytest.approx(1.0)
 
 
-def test_legit_history_append_is_persistent():
+def test_spend_history_append_is_persistent():
     h0 = _hist([(T0 - 3 * DAY, 50.0)])
     h1 = h0.append((T0).value, 70.0)
     assert len(h0) == 1 and len(h1) == 2
     day = (T0.normalize() + DAY).value
     w = 86_400 * 10**9
-    assert h0.window_quantile(day, 180 * w, w, 1.0) == pytest.approx(50.0)
-    assert h1.window_quantile(day, 180 * w, w, 1.0) == pytest.approx(70.0)
+    assert h0.window_quantile(day, 180 * w, w, 1.0, 0) == pytest.approx(50.0)
+    assert h1.window_quantile(day, 180 * w, w, 1.0, 0) == pytest.approx(70.0)
 
 
 def test_limit_cents_floor_quantile_multiplier():
     st = CardState(PROF)
     c = cfg(q=1.0)
-    assert cor.limit_cents(c, st.legit, T0.value, "24h") == 10_000  # floor
-    assert cor.limit_cents(c, st.legit, T0.value, "7d") == 30_000
-    st.legit = _hist([(T0 - 2 * DAY, 250.55)])
-    assert cor.limit_cents(c, st.legit, T0.value, "24h") == 25_055
+    assert cor.limit_cents(c, st.spend, T0.value, "24h") == 10_000  # floor
+    assert cor.limit_cents(c, st.spend, T0.value, "7d") == 30_000
+    st.spend = _hist([(T0 - 9 * DAY, 250.55), (T0 - 2 * DAY, 900.0)])  # the 900 op is inside the 7-day lag
+    assert cor.limit_cents(c, st.spend, T0.value, "24h") == 25_055
     m = Multipliers(holiday={}, weekday={"0": 1.5}, day_of_month={}, estimates=(), holiday_weeks=(-3, 1))
     c2 = cfg(q=1.0, multipliers=("weekday",), fitted=m)
-    assert cor.limit_cents(c2, st.legit, T0.value, "24h") == math.floor(250.55 * 1.5 * 100 + 1e-6)  # Monday
-    assert cor.limit_cents(c2, st.legit, T0.value, "7d") == 30_000  # weekday factors only on the 24 h window
-    assert cor.limit_cents(c2, st.legit, (T0 + DAY).value, "24h") == 25_055  # Tuesday: no factor
+    assert cor.limit_cents(c2, st.spend, T0.value, "24h") == math.floor(250.55 * 1.5 * 100 + 1e-6)  # Monday
+    assert cor.limit_cents(c2, st.spend, T0.value, "7d") == 30_000  # weekday factors only on the 24 h window
+    assert cor.limit_cents(c2, st.spend, (T0 + DAY).value, "24h") == 25_055  # Tuesday: no factor
 
 
 def test_auto_sum_window_is_half_open_and_counts_auto_only():
@@ -128,11 +144,15 @@ def test_auto_sum_window_is_half_open_and_counts_auto_only():
     assert st.auto_sum_cents((T0 + pd.Timedelta(seconds=5)).value, 86_400 * 10**9) == 800  # copy is independent
 
 
-def test_from_history_legit_profile_excludes_fraud_and_future():
+def test_from_history_profile_is_label_free_and_excludes_future():
     h = pd.DataFrame({"cc_num": 1, "ts": [T0 - 200 * DAY, T0 - 2 * DAY, T0 - DAY, T0],
                       "amt": [5.0, 10.0, 99.0, 7.0], "category": "misc_pos", "is_fraud": [0, 0, 1, 0]})
     st = CardState.from_history(PROF, h, at=T0)
-    assert len(st.legit) == 2  # the 200-day-old legit op is kept for the profile, fraud and ts >= at are not
+    # R26: every operation of the real history before ``at`` passed and enters the profile, whatever its label
+    assert len(st.spend) == 3 and st.spend.a.tolist() == [5.0, 10.0, 99.0]
+    h2 = h.assign(is_fraud=[1, 1, 0, 1])
+    assert CardState.from_history(PROF, h2, at=T0).spend.a.tolist() == st.spend.a.tolist()
+    assert CardState.from_history(PROF, h.drop(columns="is_fraud"), at=T0).spend.a.tolist() == [5.0, 10.0, 99.0]
     assert len(st) == 2  # the model state keeps 30 days, fraud included
     assert st.auto_sum_cents(T0.value - 1, 7 * 86_400 * 10**9) == 10_900  # history counts as auto-approved
 
@@ -235,6 +255,19 @@ def test_yaml_corridor_strict(tmp_path, change):
         ThreatModel.from_yaml(p)
 
 
+def test_yaml_corridor_rejects_episode_longer_than_window(tmp_path):
+    """M3: the guarantee needs D <= W = 7 d, so a corridor threat model with window_days > 7 is rejected at load."""
+    raw = yaml.safe_load(TM_CORRIDOR_PATH.read_text())
+    raw["window_days"] = 8
+    p = tmp_path / "t.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="window_days"):
+        ThreatModel.from_yaml(p)
+    raw["corridor"] = None  # without a corridor longer episodes stay allowed
+    p.write_text(yaml.safe_dump(raw))
+    assert ThreatModel.from_yaml(p).window_days == 8
+
+
 def test_unfitted_multipliers_rejected():
     with pytest.raises(ValueError, match="fitted"):
         run_episode(StubServing(), ctx_with(CardState(PROF)), [tx(T0, 1)], 1, 0.8,
@@ -282,7 +315,24 @@ def test_owner_confirm_succeeds_and_is_not_auto():
     assert b.passed == pytest.approx(150.0) and b.n_confirms == 1 and b.n_declines == 0 and not b.blocked
     assert b.decisions == [False, False, False]
     assert b.state.auto_sum_cents((T0 + pd.Timedelta(minutes=2)).value, 86_400 * 10**9) == 10_000
-    assert len(b.state.legit) == 3  # the owner's operations feed the profile
+    assert len(b.state.spend) == 3  # passed operations (auto-approved or confirmed) feed the profile
+
+
+def test_profile_takes_passed_operations_only():
+    """R26: the profile gets every operation that passed (auto-approved or confirmed) and nothing else, whoever
+    sent it: model declines and failed confirmations never enter it."""
+    from fraudaudit.episode import _Bank
+    # attacker: auto-approved 60 (enters), model decline (not), failed confirmation 50 (not), auto 30 (enters)
+    bank = _Bank(StubServing([0, 0.9, 0, 0]), ctx_with(CardState(PROF)), None, 0.8, None,
+                 cfg(confirm_fail_counts_as_decline=False))
+    for i, a in enumerate([60.0, 5.0, 50.0, 30.0]):
+        bank.submit(tx(T0 + pd.Timedelta(minutes=i), a))
+    assert bank.state.spend.a.tolist() == [60.0, 30.0]
+    # owner: model decline (not), confirmed 50 (enters: it passed)
+    own = _Bank(StubServing([0, 0.9, 0]), ctx_with(CardState(PROF)), None, 0.8, None, cfg(), owner=True)
+    for i, a in enumerate([60.0, 5.0, 50.0]):
+        own.submit(tx(T0 + pd.Timedelta(minutes=i), a))
+    assert own.n_confirms == 1 and own.state.spend.a.tolist() == [60.0, 50.0]
 
 
 def test_seven_day_window_binds_after_24h_resets():
@@ -325,6 +375,76 @@ def test_episode_bound_max_over_days_and_headroom():
     assert b3["headroom_cents"] == 30_000 - 12_000
     with pytest.raises(ValueError, match="D <= W"):
         cor.episode_bound(c, st, T0, 8)
+    days = sorted(b["c7_by_day"])
+    assert days == [(T0.normalize() + k * DAY).value for k in range(8)]  # [T0, T0 + 7 d) touches 8 calendar days
+    assert max(b["c7_by_day"].values()) == b["bound_cents"]
+
+
+def test_episode_bound_needs_the_pre_episode_state():
+    """The bound is computed from the state right before the episode only (no operation at or after t0)."""
+    st = CardState(PROF)
+    st.push(tx(T0 + pd.Timedelta(seconds=1), 5.0))
+    with pytest.raises(ValueError, match="before the episode start"):
+        cor.episode_bound(cfg(), st, T0, 7)
+
+
+def test_check_used_corridor():
+    b = {"c7_by_day": {1: 500, 2: 700}, "bound_cents": 700}
+    cor.check_used_corridor(b, ((1, 500), (2, 700)))
+    cor.check_used_corridor(b, ((1, 500), (3, 900)), inside_only=True)  # days outside the window are skipped
+    with pytest.raises(RuntimeError, match="pre-episode"):
+        cor.check_used_corridor(b, ((1, 501),))
+    with pytest.raises(RuntimeError, match="outside"):
+        cor.check_used_corridor(b, ((3, 900),))
+
+
+def _card_frame(rows):
+    return pd.DataFrame({"cc_num": 1, "ts": [pd.Timestamp(t) for t, _, _ in rows], "amt": [a for _, a, _ in rows],
+                         "category": "misc_pos", "is_fraud": [f for _, _, f in rows],
+                         "row": np.arange(len(rows))})
+
+
+@pytest.mark.parametrize("window_days", [7, 3])
+def test_corridor_label_independent_during_the_episode(window_days):
+    """R26: C_W(c, t) for every t in [t0, t0 + D) is the same whether the attacker's operations are labelled fraud,
+    legit, or absent from the data, and equals the pre-episode bound's per-day values (batch and serving paths)."""
+    rng = np.random.default_rng(11)
+    t0 = pd.Timestamp("2020-03-10 13:17:05")
+    owner = [(t0 - pd.Timedelta(seconds=int(s)), float(np.round(rng.uniform(1, 400), 2)), 0)
+             for s in np.sort(rng.integers(60, 120 * 86_400, 300))[::-1]]
+    offs = np.sort(rng.integers(0, window_days * 86_400, 25))
+    offs[1] = offs[0]  # same-second attacker ops
+    attack = [(t0 + pd.Timedelta(seconds=int(o)), float(np.round(rng.uniform(50, 5000), 2)), 1) for o in offs]
+    variants = {"fraud": owner + attack, "legit": owner + [(t, a, 0) for t, a, _ in attack], "absent": owner}
+    m = _random_multipliers(np.random.default_rng(3))
+    c = cfg(q=0.9, lookback_days=60, floor_24h=20.0, floor_7d=60.0,
+            multipliers=("holiday", "weekday", "day_of_month"), fitted=m)
+    pre = CardState.from_history(PROF, _card_frame(owner), at=t0)
+    b = cor.episode_bound(c, pre, t0, window_days)
+    times = [t0 + pd.Timedelta(minutes=37 * k) for k in range(window_days * 24 * 60 // 37)] + [t for t, _, _ in attack]
+    times += [t0 + window_days * DAY - pd.Timedelta(seconds=1)]
+    for t in sorted(times):
+        assert t0 <= t < t0 + window_days * DAY
+        lims = {name: cor.limits_cents(c, CardState.from_history(PROF, _card_frame(rows), at=t), t)
+                for name, rows in variants.items()}
+        assert lims["fraud"] == lims["legit"] == lims["absent"]
+        assert lims["absent"][1] == b["c7_by_day"][t.normalize().value]
+    # batch path over the whole stream (every operation passed, no labels): same C at the attacker's times
+    allrows = sorted(variants["fraud"], key=lambda r: r[0])
+    tt = np.array([pd.Timestamp(r[0]).value for r in allrows], dtype=np.int64)
+    bs = cor.batch_state(tt, np.array([r[1] for r in allrows]), np.ones(len(allrows), bool),
+                         np.ones(len(allrows), bool), c)
+    for i, r in enumerate(allrows):
+        if r[2] == 1:
+            assert bs["c7"][i] == b["c7_by_day"][pd.Timestamp(r[0]).normalize().value]
+    # serving path: the bank's C during the episode (attacker's auto-approved ops enter the profile) = the bound's
+    from fraudaudit.episode import _Bank
+    bank = _Bank(StubServing(), ctx_with(pre, start=t0), None, 0.8, None, c)
+    for t, a, _ in attack:
+        bank.submit(tx(t, a))
+    assert len(bank.state.spend) > len(pre.spend)  # passed attacker ops did enter the (lagged) profile
+    o = bank.outcome()
+    assert o.corridor_c7 and all(b["c7_by_day"][d] == v for d, v in o.corridor_c7)
 
 
 def _fixture_contexts():
@@ -340,11 +460,12 @@ def _random_multipliers(rng):
                        estimates=(), holiday_weeks=(-3, 1))
 
 
-def test_property_guarantee_random_adversarial_plans():
+@pytest.mark.parametrize("window_days", [7, 3])
+def test_property_guarantee_random_adversarial_plans(window_days):
     """Executable form of the Proposition: for any plan the auto-approved attacker amount is
-    <= max_{t in [t0, t0 + D)} C_7d(c, t) (and <= the tighter headroom bound)."""
+    <= max_{t in [t0, t0 + D)} C_7d(c, t) (and <= the tighter headroom bound); D = 7 and D = 3 < W."""
     df, ctxs, merchants = _fixture_contexts()
-    tm = ThreatModel.from_yaml(TM_PATH)
+    tm = dataclasses.replace(ThreatModel.from_yaml(TM_PATH), window_days=window_days)
     rng = np.random.default_rng(2026)
     violations, positive, confirms = 0, 0, 0
     for trial in range(600):
@@ -378,10 +499,90 @@ def test_property_guarantee_random_adversarial_plans():
         got = round(o.passed_amount * 100)
         if got > b["bound_cents"] or got > b["headroom_cents"]:
             violations += 1
+        # the C the bank actually used is the pre-episode per-day value
+        assert all(b["c7_by_day"][d] == v for d, v in o.corridor_c7)
         positive += got > 0
         confirms += o.n_confirms > 0
     assert violations == 0
     assert positive > 100 and confirms > 100  # not vacuous: plans pass and the corridor binds
+
+
+def _greedy_fill(bank, ts, max_ops: int = 400) -> None:
+    """Black-box greedy attacker at one second: amounts of 2^k cents from 2^21 down to 1 cent, each sent again until
+    it does not pass (a same-second burst that fills the corridor to the cent). ``max_ops`` stops a burst that never
+    hits the corridor (a broken rule) instead of looping forever; a correct rule needs about 2 operations per level."""
+    k, n = 2**21, 0
+    while k >= 1 and not bank.blocked and n < max_ops:
+        while not bank.blocked and n < max_ops:
+            n += 1
+            if bank.submit(Tx(ts, k / 100, "fraud_A", "misc_pos", 40.0, -80.0)):
+                break
+        k //= 2
+
+
+def _burst_times(t0, window_days, rng, full):
+    """t0, both sides of every midnight inside the episode (d − 1 s, d) and t0 + D − 1 s; without ``full`` a random
+    subset of the inner ones."""
+    end = t0 + window_days * DAY
+    inner = []
+    d = t0.normalize() + DAY
+    while d < end:
+        inner += [d - pd.Timedelta(seconds=1), d]
+        d += DAY
+    if not full:
+        inner = [t for t in inner if rng.uniform() < 0.5]
+    return [t0] + inner + [end - pd.Timedelta(seconds=1)]
+
+
+@pytest.mark.parametrize("window_days", [7, 3])
+def test_property_guarantee_greedy_filler(window_days):
+    """The Proposition against the strongest attacker the rule allows: an always-approving model, greedy same-second
+    bursts filling the corridor to the cent at t0, around every midnight and at t0 + D − 1 s, and plans of many
+    small operations with same-second duplicates. 0 violations; with bursts before every midnight and no 24 h
+    limit the greedy attacker gets exactly the headroom, and on some trials exactly the bound; the bank's C during
+    the episode is the pre-episode per-day value, and the bound is the max of the C it used."""
+    from fraudaudit.episode import _Bank
+    _, ctxs, _ = _fixture_contexts()
+    rng = np.random.default_rng(77)
+    violations, attained, tight, positive = 0, 0, 0, 0
+    for trial in range(160):
+        ctx = ctxs[trial % len(ctxs)]
+        no24 = trial % 2 == 0
+        mult = ("holiday", "weekday", "day_of_month") if rng.uniform() < 0.7 else ()
+        c = cfg(q=float(rng.choice([0.5, 0.9, 0.99, 1.0])), floor_24h=1e7 if no24 else float(rng.uniform(1, 300)),
+                floor_7d=float(rng.uniform(1, 800)), lookback_days=int(rng.integers(7, 200)), multipliers=mult,
+                fitted=_random_multipliers(rng) if mult else None,
+                confirm_fail_counts_as_decline=bool(rng.integers(0, 2)))
+        t0 = pd.Timestamp(ctx.episode.start)
+        b = cor.episode_bound(c, ctx.state, t0, window_days)
+        bank = _Bank(StubServing(), ctx_with(ctx.state, start=t0), None, 0.8, None, c)
+        full = trial % 4 < 2
+        if trial % 8 == 7:  # many small operations at random seconds, same-second duplicates
+            n = 300
+            offs = np.sort(rng.integers(0, window_days * 86_400, n))
+            offs[1::3] = offs[0::3][:len(offs[1::3])]
+            offs = np.sort(np.append(offs, window_days * 86_400 - 1))
+            for o in offs:
+                bank.submit(Tx(t0 + pd.Timedelta(seconds=int(o)), float(np.round(rng.uniform(0.5, 40), 2)),
+                               "fraud_A", "misc_pos", 40.0, -80.0))
+            full = False
+        else:
+            for t in _burst_times(t0, window_days, rng, full):
+                _greedy_fill(bank, t)
+        o = bank.outcome()
+        got = round(o.passed_amount * 100)
+        used = dict(o.corridor_c7)
+        assert all(b["c7_by_day"][d] == v for d, v in used.items())
+        if full:
+            assert set(used) == set(b["c7_by_day"]) and max(used.values()) == b["bound_cents"]
+        violations += got > b["bound_cents"] or got > b["headroom_cents"]
+        if full and no24:
+            assert got == b["headroom_cents"]  # the headroom bound is tight
+            tight += 1
+        attained += got == b["bound_cents"] > 0
+        positive += got > 0
+    assert violations == 0
+    assert tight >= 30 and attained >= 5 and positive > 100
 
 
 def test_bound_reached_by_greedy_attacker():
@@ -406,9 +607,9 @@ def test_parity_batch_vs_serving():
     for card, g in df.groupby("cc_num"):
         g = g.sort_values(["ts", "row"], kind="stable")
         auto = rng.uniform(size=len(g)) < 0.7
-        legit = (g["is_fraud"] == 0).to_numpy()
+        passed = auto | (rng.uniform(size=len(g)) < 0.5)  # auto-approved ops passed; others confirmed or not
         batch = cor.batch_state(g["ts"].to_numpy(dtype="datetime64[ns]").view("int64"), g["amt"].to_numpy(),
-                                auto, legit, c)
+                                auto, passed, c)
         st = CardState(PROF)
         for i, r in enumerate(g.itertuples(index=False)):
             t = pd.Timestamp(r.ts)
@@ -416,7 +617,7 @@ def test_parity_batch_vs_serving():
             s7 = st.auto_sum_cents(t.value, 7 * 86_400 * 10**9)
             c24, c7 = cor.limits_cents(c, st, t)
             assert (s24, s7, c24, c7) == (batch["s24"][i], batch["s7"][i], batch["c24"][i], batch["c7"][i])
-            st.push(tx(t, r.amt), auto_approved=bool(auto[i]), legit=bool(legit[i]))
+            st.push(tx(t, r.amt), auto_approved=bool(auto[i]), passed=bool(passed[i]))
             n_checked += 1
     assert n_checked > 300
 
@@ -458,11 +659,38 @@ def test_audit_corridor_meta_and_n_jobs_identity(audit_env):
     b = _audit(audit_env, c, n_jobs=2)
     assert a.per_target == b.per_target and a.uplift == b.uplift
     m = a.meta["corridor"]
-    assert m["n_bound_violations"] == 0 and m["n_targets"] == a.n_targets
+    assert m["n_bound_violations"] == 0 and m["n_headroom_violations"] == 0 and m["n_targets"] == a.n_targets
     for t in a.per_target:
         assert round(t["ver_adv"] * t["amount"] * 100) <= round(t["corridor_bound"] * 100)
+        assert round(t["ver_adv"] * t["amount"] * 100) <= round(t["corridor_headroom"] * 100)
+        assert t["bound_violation"] is False and t["headroom_violation"] is False
         assert t["corridor_bound_share"] == pytest.approx(t["corridor_bound"] / t["amount"])
-    assert set(m["bound_share"]) == {"mean", "median", "max"}
+    assert set(m["bound_share"]) == {"mean", "median", "max", "q25", "q75", "q90"}
+    assert "headroom" in cor_line(m)
+
+
+def cor_line(m):
+    from fraudaudit.audit import corridor_line
+    return corridor_line(m)
+
+
+def test_bound_stats_quantiles():
+    pt = [{"amount": 100.0, "corridor_bound": float(b), "corridor_headroom": float(b) / 2} for b in range(1, 101)]
+    s = cor.bound_stats(pt, 0.8)
+    x = np.arange(1, 101) / 100
+    assert s["bound_share"]["q25"] == pytest.approx(np.quantile(x, 0.25))
+    assert s["bound_share"]["q75"] == pytest.approx(np.quantile(x, 0.75))
+    assert s["bound_share"]["q90"] == pytest.approx(np.quantile(x, 0.9))
+    assert s["bound_share"]["median"] == pytest.approx(np.median(x))
+    assert s["share_targets_bound_below_rho_a"] == pytest.approx(0.79)
+
+
+def test_multiplier_summary_reports_tests_and_expected_false_positives():
+    m = cor.estimate_from_daily(_seasonal_daily(), cfg(multipliers=("holiday", "weekday", "day_of_month")))
+    s = m.summary()
+    assert s["n_tests"] == len(m.estimates) == s["n_estimates"]
+    assert s["confidence"] == 0.95
+    assert s["expected_false_positives"] == pytest.approx(len(m.estimates) * 0.05)
 
 
 # ---- confirmation burden on the legitimate stream (Task 18 replay infrastructure) -------------------------
@@ -523,16 +751,20 @@ def test_corridor_sweep_end_to_end(tmp_path):
     from fraudaudit.model.pipeline import FraudModel, train_model
     df = make_sparkov_like(n_cards=120, days=200, start=pd.Timestamp("2019-11-01"), seed=3)
     model, _ = train_model(df, seed=0, epochs=1)
-    model.save(tmp_path / "model", meta={"seed": 0})
+    model.save(tmp_path / "nofpr", meta={"seed": 0})
+    model.save(tmp_path / "model", meta={"seed": 0, "target_fpr": 0.01})
     model = FraudModel.from_artifacts(load_artifacts(tmp_path / "model"))
     tm = dataclasses.replace(ThreatModel.from_yaml(TM_CORRIDOR_PATH), recon_budget_ops=100)
     g = GateConfig(target_fpr=0.01, recall_clean_min=0.5, delta=0.1, attacks=["random"], attack_seeds=[1],
                    confidence=0.95, one_sided=True, spares_period="fit")
+    with pytest.raises(ValueError, match="target_fpr"):  # M6: no silent skip of the tau reproduction check
+        corridor_sweep(df, model, tmp_path / "nofpr", tm, g, qs=(0.9,), fprs=(0.05,), seed=1, n_jobs=1,
+                       out_dir=tmp_path / "out0")
     data = corridor_sweep(df, model, tmp_path / "model", tm, g, qs=(0.9, 0.99), fprs=(0.05,), seed=1, n_jobs=1,
                           out_dir=tmp_path / "out")
     assert [c["q"] for c in data["cells"]] == [None, 0.9, 0.99]
     grid = data["cells"][1:]
-    assert all(c["n_bound_violations"] == 0 and "pareto_3d" in c for c in grid)
+    assert all(c["n_bound_violations"] == 0 and c["n_headroom_violations"] == 0 and "pareto_3d" in c for c in grid)
     assert grid[0]["bound"]["bound"]["mean"] <= grid[1]["bound"]["bound"]["mean"]  # a higher q never lowers C
     assert all(c["burden"]["n_ops"] > 0 and 0 <= c["burden"]["share_confirm_card_days"] <= 1 for c in grid)
     write_outputs(data, tmp_path / "out")

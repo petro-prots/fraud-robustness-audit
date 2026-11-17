@@ -116,6 +116,7 @@ def corridor_meta(tm: ThreatModel, per_target: list[dict]) -> dict:
             "multiplier_estimates": [] if c.fitted is None else list(c.fitted.estimates),
             "n_targets": len(per_target),
             "n_bound_violations": int(sum(t["bound_violation"] for t in per_target)),
+            "n_headroom_violations": int(sum(t["headroom_violation"] for t in per_target)),
             "n_adv_confirms": int(sum(t["n_confirms"] for t in per_target)),
             "n_clean_confirms": int(sum(t["clean_n_confirms"] for t in per_target)),
             **corridor_mod.bound_stats(per_target, tm.rho)}
@@ -129,7 +130,8 @@ def corridor_line(c: dict) -> str:
             f"auto-approved attacker amount mean {c['bound']['mean']:.2f} $ / median {c['bound']['median']:.2f} $ / "
             f"max {c['bound']['max']:.2f} $ = {_pct(c['bound_share']['mean'])} / {_pct(c['bound_share']['median'])} / "
             f"{_pct(c['bound_share']['max'])} of A; bound below ρ·A for {_pct(c['share_targets_bound_below_rho_a'])} "
-            f"of targets; {c['n_bound_violations']} violations of the bound; {c['n_adv_confirms']} adversarial and "
+            f"of targets; {c['n_bound_violations']} violations of the bound and {c['n_headroom_violations']} of the "
+            f"tighter headroom bound; {c['n_adv_confirms']} adversarial and "
             f"{c['n_clean_confirms']} clean operations sent to owner confirmation (failed: the fraudster lacks the "
             "second factor).")
 
@@ -190,11 +192,14 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
            "clean_blocked": bool(clean.blocked)}
     if tm.corridor is not None:
         b = corridor_mod.episode_bound(tm.corridor, ctx.state, ctx.episode.start, tm.window_days)
+        corridor_mod.check_used_corridor(b, adv.corridor_c7)  # the bank used the pre-episode corridor
+        corridor_mod.check_used_corridor(b, clean.corridor_c7, inside_only=True)
         a = float(ctx.episode.amount)
+        got = round(adv.passed_amount * 100)
         out.update(corridor_bound=b["bound_cents"] / 100, corridor_headroom=b["headroom_cents"] / 100,
                    corridor_bound_share=b["bound_cents"] / 100 / a, corridor_headroom_share=b["headroom_cents"] / 100 / a,
                    n_confirms=int(adv.n_confirms), clean_n_confirms=int(clean.n_confirms),
-                   bound_violation=bool(round(adv.passed_amount * 100) > b["bound_cents"]))
+                   bound_violation=bool(got > b["bound_cents"]), headroom_violation=bool(got > b["headroom_cents"]))
     return out
 
 

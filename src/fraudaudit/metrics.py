@@ -375,8 +375,10 @@ def confirmation_burden(df: pd.DataFrame, scores, tau: float, corridor, *, n_job
     legitimate test-period operations (``BurdenResult``).
 
     Replay as ``false_block_rate`` (state from all operations before the test start, test-period fraud excluded,
-    shared ``episode._Bank``) with the owner's semantics: a confirmation passes, is not auto-approved and the
-    owner's operations feed the corridor profile; ``max_declines=None`` (the corridor's own cost, independent
+    shared ``episode._Bank``) with the owner's semantics: a confirmation passes and is not auto-approved; every
+    operation that passed (auto-approved or confirmed, not a model decline) feeds the lagged corridor profile, the
+    history before the test start enters it whole (no fraud label is used for the profile; the label only selects
+    which test operations form the legitimate stream); ``max_declines=None`` (the corridor's own cost, independent
     of blocking). ``scores``: a model or ``Serving`` (live, ``n_jobs`` must be 1) or the dict of
     ``legit_test_scores`` (cached; parallel per card, identical for any ``n_jobs``)."""
     import multiprocessing as mp

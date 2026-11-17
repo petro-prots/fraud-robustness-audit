@@ -275,9 +275,13 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
                   "- Decision order: model decline → decline; model approval within the 24 h and 7-day corridors → "
                   "auto-approve; otherwise owner confirmation, which the fraudster fails (no second factor). Both "
                   "the adversarial and the clean leg run under the corridor. The bound (max over the episode window "
-                  "of the 7-day corridor) holds for any attack strategy when the episode lasts at most 7 days.",
+                  "of the 7-day corridor) holds for any attack strategy when the episode lasts at most 7 days; the "
+                  "corridor profile is lagged by 7 days and built from passed operations without fraud labels, so the "
+                  "bound is computed before the episode and no attacker operation changes it.",
                   "- Bound violations per run: " + ", ".join(
                       f"{k} {r.meta['corridor']['n_bound_violations']}" for k, r in results.items()
+                      if r.meta.get("corridor")) + "; headroom-bound violations per run: " + ", ".join(
+                      f"{k} {r.meta['corridor'].get('n_headroom_violations', 0)}" for k, r in results.items()
                       if r.meta.get("corridor")) + "."]
 
     if w.false_blocks:

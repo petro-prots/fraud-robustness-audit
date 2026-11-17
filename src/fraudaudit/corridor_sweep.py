@@ -81,10 +81,12 @@ def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, s
     say(f"legit test scores: {sum(len(v) for v in scores.values())} ops, {time.perf_counter() - t0:.0f} s")
     cells = []
     model_fpr = _model_target_fpr(model_dir)
+    if model_fpr is None:
+        raise ValueError(f"{model_dir}/model.json has no meta.target_fpr: the check that tau at the model's own "
+                         "target FPR reproduces the trained tau cannot run")
     for fpr in fprs:
         tau = val_tau(df, model, fpr)
-        if model_fpr is not None and abs(fpr - model_fpr) < 1e-12 and not math.isclose(tau, float(model.tau),
-                                                                                        rel_tol=1e-6):
+        if abs(fpr - model_fpr) < 1e-12 and not math.isclose(tau, float(model.tau), rel_tol=1e-6):
             raise ValueError(f"tau recomputed at the model's own target_fpr {fpr} is {tau}, model.json has "
                              f"{model.tau}: the val scores differ from training")
         if math.isclose(tau, float(model.tau), rel_tol=1e-6):
@@ -115,10 +117,12 @@ def corridor_sweep(df, model, model_dir, tm, cfg, *, qs=Q_GRID, fprs=FPR_GRID, s
                        "corridor_headroom": x["headroom_cents"] / 100} for ctx, x in zip(targets, b)]
                 cell["bound"] = corridor_mod.bound_stats(pt, tm.rho)
                 cell["n_bound_violations"] = int(sum(r.meta["corridor"]["n_bound_violations"] for r in runs.values()))
+                cell["n_headroom_violations"] = int(sum(r.meta["corridor"]["n_headroom_violations"]
+                                                        for r in runs.values()))
                 bu = confirmation_burden(df, scores, tau, c, n_jobs=n_jobs)
                 cell["burden"] = dataclasses.asdict(bu)
             else:
-                cell["bound"], cell["n_bound_violations"] = None, None
+                cell["bound"], cell["n_bound_violations"], cell["n_headroom_violations"] = None, None, None
                 cell["burden"] = {"share_confirm_ops": 0.0, "share_confirm_card_days": 0.0}
             cell["wall_seconds"] = round(time.perf_counter() - t1, 1)
             cells.append(cell)
@@ -157,17 +161,18 @@ def summary_markdown(data: dict) -> str:
              f"Targets: {data['n_targets']} test episodes; attacks {', '.join(data['gate']['attacks'])} × seeds "
              f"{data['gate']['attack_seeds']}; seed {data['seed']}. Base corridor: `{json.dumps(data['corridor_base'])}`.",
              "", "| target FPR | τ | q | bound mean $ | bound median $ | bound max $ | bound/A mean | bound/A median | "
-             "bound/A max | headroom/A mean | bound < ρA | worst uplift (run) | mean uplift | confirm ops | "
-             "confirm card-days | test recall | Pareto 3-D / 2-D |",
-             "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|"]
+             "bound/A q25 / q75 / q90 | bound/A max | headroom/A mean | bound < ρA | worst uplift (run) | mean uplift | "
+             "confirm ops | confirm card-days | test recall | Pareto 3-D / 2-D |",
+             "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|"]
     for c in data["cells"]:
         b = c["bound"]
         if b is None:
-            bcols = ["–"] * 8
+            bcols = ["–"] * 9
         else:
+            bs = b["bound_share"]
             bcols = [f"{b['bound']['mean']:.0f}", f"{b['bound']['median']:.0f}", f"{b['bound']['max']:.0f}",
-                     _pct(b["bound_share"]["mean"]), _pct(b["bound_share"]["median"]), _pct(b["bound_share"]["max"]),
-                     _pct(b["headroom_share"]["mean"]), _pct(b["share_targets_bound_below_rho_a"])]
+                     _pct(bs["mean"]), _pct(bs["median"]), f"{_pct(bs['q25'])} / {_pct(bs['q75'])} / {_pct(bs['q90'])}",
+                     _pct(bs["max"]), _pct(b["headroom_share"]["mean"]), _pct(b["share_targets_bound_below_rho_a"])]
         par = "–" if c["q"] is None else f"{'yes' if c['pareto_3d'] else 'no'} / {'yes' if c['pareto_2d'] else 'no'}"
         lines.append("| " + " | ".join([f"{c['target_fpr']:g}", f"{c['tau']:.4g}",
                                         "none" if c["q"] is None else f"{c['q']:g}", *bcols,
@@ -179,7 +184,9 @@ def summary_markdown(data: dict) -> str:
               "tighter bound net of the owner's own auto-approved spend still in the window. Uplift = one-sided upper "
               "bound of VER_adv − VER_clean, both legs under the corridor. Burden on the legitimate test stream "
               "(owner confirms; no blocking). Bound violations over all runs: "
-              f"{sum(c['n_bound_violations'] or 0 for c in data['cells'])}.", ""]
+              f"{sum(c['n_bound_violations'] or 0 for c in data['cells'])}; headroom-bound violations: "
+              f"{sum(c.get('n_headroom_violations') or 0 for c in data['cells'])}. The corridor profile is lagged by "
+              "7 days and label-free (ruling R26).", ""]
     sig = [e for e in data["multiplier_estimates"] if e["significant"]]
     lines += ["## Significant multipliers (fit period, population)", ""]
     lines += [f"- {e['kind']} {e['group']}: {e['ratio']:.3f} [{e['lower']:.3f}; {e['upper']:.3f}], {e['n_days']} days"

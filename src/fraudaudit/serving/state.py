@@ -10,8 +10,11 @@ category), ``amt_ratio_30d`` from the queried amount and ``mean_amt_30d``.
 Corridor state (Task 22, ``fraudaudit.corridor``): every operation in the state carries its AUTO-APPROVED amount
 in whole cents (``auto_sum_cents``: the sum over ``(t - W, t]``, same-second operations already pushed included –
 the rolling window of the corridor rule, unlike the model's strictly-earlier aggregates); history operations count
-as auto-approved. ``legit`` (``LegitHistory``) holds the owner's legitimate operations (all of them, not only 30 days)
-for the corridor profile; attacker operations never enter it.
+as auto-approved. ``spend`` (``SpendHistory``) holds every operation of the card that PASSED (all of them, not only
+30 days) – the input of the corridor profile (ruling R26): the real history before the state time (it happened, no
+fraud label is consulted) and every later operation that was auto-approved or confirmed by the owner, whoever sent
+it; model declines and failed confirmations never enter it. The corridor reads it with a lag of 7 days, which is
+what makes the corridor of an episode independent of the attacker's operations.
 
 Time only moves forward. ``now`` is the latest of ``at`` (``from_history``) and every pushed
 timestamp; queries and pushes before ``now`` raise ``ValueError``. Because of that, ``push`` may
@@ -83,14 +86,16 @@ def profile_of(df: pd.DataFrame, cc_num: int) -> CardProfile:
                        state=str(r["state"]))
 
 
-class LegitHistory:
-    """The owner's legitimate operations (time-ordered ns ``t``, amounts ``a``): the input of the corridor profile.
+class SpendHistory:
+    """The card's passed operations (time-ordered ns ``t``, amounts ``a``): the input of the corridor profile.
 
     Persistent: ``append`` returns a new object, so copies of a ``CardState`` can share one history.
-    ``window_quantile(day, L, W, q)`` is the q-quantile (``np.quantile``, linear) of the rolling-W sums
-    ``V_j = sum{a_i : t_j - W < t_i <= t_j}`` taken right after every operation j with ``day - L <= t_j < day``
-    (only operations strictly before ``day`` count, so a value for a day never changes once the day has begun);
-    0.0 without such operations. Values are cached per (day, L, W, q)."""
+    ``window_quantile(day, L, W, q, lag)`` is the q-quantile (``np.quantile``, linear) of the rolling-W sums
+    ``V_j = sum{a_i : t_j - W < t_i <= t_j}`` of every operation j with ``day - L <= t_j < day - lag``. ``V_j`` sums
+    over time, not stream order: operations with the same timestamp as j all count (duplicates of one second give
+    equal values), and so may operations up to ``t_j`` outside the lookback. With ``lag >= 0`` every input is
+    before ``day - lag``, so a value for a day never changes once ``day - lag`` has passed; 0.0 without such
+    operations. Values are cached per (day, L, W, q, lag)."""
 
     __slots__ = ("t", "a", "_cs", "_cache")
 
@@ -98,21 +103,21 @@ class LegitHistory:
         self.t = np.asarray(t, dtype=np.int64)
         self.a = np.asarray(a, dtype=np.float64)
         if self.t.shape != self.a.shape or (self.t.size > 1 and (np.diff(self.t) < 0).any()):
-            raise ValueError("LegitHistory needs time-ordered t and a of the same length")
+            raise ValueError("SpendHistory needs time-ordered t and a of the same length")
         self._cs = np.concatenate([[0.0], np.cumsum(self.a)])
         self._cache: dict = {}
 
     @classmethod
-    def empty(cls) -> "LegitHistory":
+    def empty(cls) -> "SpendHistory":
         return cls(np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64))
 
     def __len__(self) -> int:
         return int(self.t.size)
 
-    def append(self, t_ns: int, amt: float) -> "LegitHistory":
+    def append(self, t_ns: int, amt: float) -> "SpendHistory":
         if self.t.size and t_ns < self.t[-1]:
-            raise ValueError("LegitHistory.append: time only moves forward")
-        h = LegitHistory.__new__(LegitHistory)
+            raise ValueError("SpendHistory.append: time only moves forward")
+        h = SpendHistory.__new__(SpendHistory)
         h.t = np.append(self.t, np.int64(t_ns))
         h.a = np.append(self.a, float(amt))
         h._cs = np.append(self._cs, self._cs[-1] + float(amt))
@@ -120,13 +125,15 @@ class LegitHistory:
         h._cache = {k: v for k, v in self._cache.items() if k[0] == day}  # values for days <= t_ns stay valid
         return h
 
-    def window_quantile(self, day_ns: int, lookback_ns: int, w_ns: int, q: float) -> float:
-        key = (int(day_ns), int(lookback_ns), int(w_ns), float(q))
+    def window_quantile(self, day_ns: int, lookback_ns: int, w_ns: int, q: float, lag_ns: int) -> float:
+        if lag_ns < 0:
+            raise ValueError("lag must be >= 0")
+        key = (int(day_ns), int(lookback_ns), int(w_ns), float(q), int(lag_ns))
         v = self._cache.get(key)
         if v is None:
             t = self.t
             lo = int(np.searchsorted(t, day_ns - lookback_ns, "left"))
-            hi = int(np.searchsorted(t, day_ns, "left"))
+            hi = int(np.searchsorted(t, day_ns - lag_ns, "left"))
             if hi <= lo:
                 v = 0.0
             else:
@@ -143,7 +150,7 @@ def _cents(a: float) -> int:
 
 class CardState:
     """Owner profile + operations of the last 30 days as time-ordered parallel lists ``ts_ns``, ``amt``,
-    ``category`` and auto-approved cents; plus the owner's legitimate history ``legit`` (corridor profile)."""
+    ``category`` and auto-approved cents; plus the card's passed operations ``spend`` (corridor profile)."""
 
     def __init__(self, profile: CardProfile) -> None:
         self.profile = profile
@@ -152,13 +159,13 @@ class CardState:
         self._c: list[str] = []
         self._u: list[int] = []  # auto-approved amount in cents (0 if the operation was not auto-approved)
         self._now: int | None = None  # ns; None = no time seen yet
-        self.legit: LegitHistory = LegitHistory.empty()
+        self.spend: SpendHistory = SpendHistory.empty()
 
     @classmethod
     def from_history(cls, profile: CardProfile, history: pd.DataFrame, at: pd.Timestamp) -> "CardState":
         """State right before ``at``: the card's operations with ``at - 30d <= ts < at`` (all counted as
-        auto-approved), and ``legit`` = every legitimate operation with ``ts < at`` (``is_fraud == 0`` when the
-        column exists, else every operation)."""
+        auto-approved), and ``spend`` = every operation with ``ts < at`` (the real history passed; no fraud label
+        is used, an ``is_fraud`` column is ignored)."""
         s = cls(profile)
         at_ns = pd.Timestamp(at).value
         h = history
@@ -176,11 +183,14 @@ class CardState:
         s._u = [_cents(a) for a in s._a]
         s._now = at_ns
         lm = t_all < at_ns
-        if "is_fraud" in h:
-            lm &= h["is_fraud"].to_numpy() == 0
         lo = np.argsort(t_all[lm], kind="stable")
-        s.legit = LegitHistory(t_all[lm][lo], amt_all[lm][lo])
+        s.spend = SpendHistory(t_all[lm][lo], amt_all[lm][lo])
         return s
+
+    @property
+    def now(self) -> int | None:
+        """The state time in ns (``at`` of ``from_history`` or the latest pushed timestamp); None if unset."""
+        return self._now
 
     def __len__(self) -> int:
         return len(self._t)
@@ -216,17 +226,19 @@ class CardState:
         return out
 
     def auto_sum_cents(self, t_ns: int, w_ns: int) -> int:
-        """Auto-approved cents of the operations in the state with ``t - W < t_j <= t`` (corridor window; operations
-        of the same second already pushed count). A read only: no time check."""
+        """Auto-approved cents of the operations in the state with ``t - W < t_j <= t`` (corridor window): every
+        operation already pushed with the same timestamp ``t`` counts – earlier ones of a same-second burst included,
+        the queried operation itself only once pushed. A read only: no time check."""
         hi = bisect_right(self._t, t_ns)
         lo = bisect_right(self._t, t_ns - w_ns, 0, hi)
         return sum(self._u[lo:hi])
 
-    def push(self, tx: Tx, *, auto_approved: bool = True, legit: bool = False) -> None:
+    def push(self, tx: Tx, *, auto_approved: bool = True, passed: bool = True) -> None:
         """Record ``tx`` as history for later operations; drop operations older than 30 days.
 
         ``auto_approved``: the amount counts in the corridor sums (history and callers without a corridor: True).
-        ``legit``: the owner's own operation, appended to the corridor profile ``legit`` (attacker: False)."""
+        ``passed``: the operation went through (auto-approved or confirmed), so it is appended to the corridor
+        profile ``spend``; False for a model decline or a failed confirmation. No label of who sent it is used."""
         t = pd.Timestamp(tx.ts).value
         self._check_time(t, "push")
         self._t.append(t)
@@ -234,8 +246,8 @@ class CardState:
         self._c.append(str(tx.category))
         self._u.append(_cents(tx.amt) if auto_approved else 0)
         self._now = t
-        if legit:
-            self.legit = self.legit.append(t, float(tx.amt))
+        if passed:
+            self.spend = self.spend.append(t, float(tx.amt))
         drop = bisect_left(self._t, t - _KEEP_NS)  # keep t_j >= now - 30d
         if drop:
             del self._t[:drop], self._a[:drop], self._c[:drop], self._u[:drop]
@@ -244,5 +256,5 @@ class CardState:
         c = CardState(self.profile)
         c._t, c._a, c._c, c._u = list(self._t), list(self._a), list(self._c), list(self._u)
         c._now = self._now
-        c.legit = self.legit  # persistent: shared
+        c.spend = self.spend  # persistent: shared
         return c

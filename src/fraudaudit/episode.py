@@ -13,7 +13,10 @@ With a spending corridor (``corridor.CorridorConfig``, Task 22) the bank decides
 decline; model approval within the corridor of both windows → auto-approve; else → owner confirmation, which the
 owner passes (``owner=True``: friction, not auto-approved) and a fraudster fails (the operation does not pass; it
 counts as a decline when ``confirm_fail_counts_as_decline``). ``passed_amount`` of an attacker episode is then the
-auto-approved amount A_auto of the guarantee (``corridor.episode_bound``).
+auto-approved amount A_auto of the guarantee (``corridor.episode_bound``). Every operation that passed (auto-approved
+or confirmed) enters the corridor profile, whoever sent it (ruling R26: no fraud labels); the profile is read with a
+7-day lag, so it cannot change the corridor of an episode of at most 7 days. ``corridor_c7`` records the 7-day
+corridor the bank used on each day (``corridor.check_used_corridor``).
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ import math
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 
 from .policy import StepwisePolicy
 from .serving.core import Serving
@@ -39,6 +43,7 @@ class EpisodeOutcome:
     decisions: tuple[bool, ...]  # declined flag of every executed operation, in order
     escalated: bool = False  # the threshold was switched to tau_after_decline after the first decline
     n_confirms: int = 0  # operations sent to owner confirmation by the corridor
+    corridor_c7: tuple = ()  # ((day ns, C_7d cents), …) the corridor checks used, by day in order
 
 
 def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declines: int | None,
@@ -71,7 +76,7 @@ class _Bank:
     attempt enters the card state, declines are counted (with the ``tau_after_decline`` escalation)
     and the card is blocked after ``max_declines`` declines. With ``corridor`` the decision order of the module
     docstring applies; ``owner`` says whose operations these are (the owner passes a confirmation, a fraudster
-    does not; the owner's operations also feed the corridor profile)."""
+    does not). Every operation that passed feeds the corridor profile (``CardState.push(passed=…)``)."""
 
     def __init__(self, serving, ctx: EpisodeContext, max_declines: int | None, rho: float,
                  tau_after_decline: float | None, corridor=None, *, owner: bool = False) -> None:
@@ -91,6 +96,7 @@ class _Bank:
         self.tau_after_decline = tau_after_decline
         self.corridor, self.owner = corridor, bool(owner)
         self.n_confirms = 0
+        self.c7_used: dict[int, int] = {}
         self.state = ctx.state.copy()
         self.target = float(ctx.episode.amount)
         self.passed = 0.0
@@ -112,8 +118,11 @@ class _Bank:
         auto = not declined
         confirm = False
         if auto and self.corridor is not None:
-            from .corridor import within
-            if not within(self.corridor, self.state, tx.ts, tx.amt):
+            from .corridor import DAY_NS, check
+            ok, _, c7 = check(self.corridor, self.state, tx.ts, tx.amt)
+            t = int(pd.Timestamp(tx.ts).value)
+            self.c7_used[t - t % DAY_NS] = c7  # constant per day: the same value on every check of the day
+            if not ok:
                 auto, confirm = False, True
                 self.n_confirms += 1
         passed = auto or (confirm and self.owner)
@@ -124,7 +133,7 @@ class _Bank:
             self.n_declines += 1
         if passed:
             self.passed += float(tx.amt)
-        self.state.push(tx, auto_approved=auto, legit=self.owner)
+        self.state.push(tx, auto_approved=auto, passed=passed)
         if declined and self.tau_after_decline is not None:
             self.escalated = True
         if declined and self.max_declines is not None and self.n_declines >= self.max_declines:
@@ -137,7 +146,7 @@ class _Bank:
                               n_declines=self.n_declines, blocked=self.blocked,
                               success=round(passed * 100) >= math.ceil(round(self.rho * target * 100, 6)),
                               decisions=tuple(self.decisions), escalated=self.escalated,
-                              n_confirms=self.n_confirms)
+                              n_confirms=self.n_confirms, corridor_c7=tuple(sorted(self.c7_used.items())))
 
 
 def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, merchants: MerchantTable,

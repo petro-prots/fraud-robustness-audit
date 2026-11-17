@@ -15,25 +15,36 @@ cent, so ``S + a <= C`` holds exactly.
 
 Corridor ``C_W(c, t) = max(floor_W, Q_W(c, d)) · m_W(d)``, d = the calendar day of t:
 
-* ``Q_W(c, d)`` – the q-quantile of the card's own rolling-W spend over the lookback: the values
-  ``V_j = sum{a : t_j − W < t <= t_j}`` right after every LEGITIMATE operation j of the card with
-  ``d − lookback <= t_j < d`` (``LegitHistory.window_quantile``; only operations strictly before t, recomputed
-  once per day). The profile is the owner's legitimate spend: every non-fraud operation of the history (the
-  data were never decided by a corridor, so all count) and, in the legitimate replay, every owner operation
-  whatever its decision; attacker operations never enter it, so C does not depend on the attack;
+* ``Q_W(c, d)`` – the q-quantile of the card's own rolling-W spend, LAGGED by 7 days (ruling R26): the values
+  ``V_j = sum{a : t_j − W < t <= t_j}`` of every operation j of the profile with ``d − lookback <= t_j < d − 7 d``
+  (``SpendHistory.window_quantile`` with ``PROFILE_LAG_NS``; the same lag for both windows; recomputed once per
+  day). ``V_j`` sums over time, so operations with the same timestamp as j all count. The profile is every
+  operation of the card that PASSED: the real history before the test or episode (it happened; no fraud label is
+  consulted) and every later operation that was auto-approved or confirmed by the owner, whoever sent it; model
+  declines and failed confirmations never enter it. No fraud label is used anywhere in the profile;
 * ``m_W(d)`` – multipliers of statistically expected cycles, estimated on the fit period from the POPULATION
-  (``estimate_multipliers``): weeks related to a major US holiday (Sparkov is US data) – the week offset
-  ``k = floor((d − h) / 7 days)`` from the nearest of Christmas (Dec 25), Thanksgiving (4th Thursday of November)
-  and Independence Day (Jul 4), ``k ∈ holiday_weeks`` – applied to both windows; weekday and day of month
-  (salary days) – applied to the 24 h window only (a 7-day window always spans every weekday). A factor is the
-  ratio of the mean daily population spend of its days to the mean daily spend of the baseline days (days
-  outside every holiday week); it is used only when its percentile bootstrap interval (days resampled with
-  replacement within the group and within the baseline) excludes 1, otherwise m = 1. Holiday dates come from
-  their rules; the model never gets a calendar date.
+  (``estimate_multipliers``). Per-window scaling: a HOLIDAY factor multiplies BOTH windows (24 h and 7 d) – the
+  week offset ``k = floor((d − h) / 7 days)`` from the nearest of Christmas (Dec 25), Thanksgiving (4th Thursday
+  of November) and Independence Day (Jul 4), ``k ∈ holiday_weeks`` (US holidays: Sparkov is US data); WEEKDAY and
+  DAY-OF-MONTH (salary days) factors multiply the 24 h window only (a 7-day window always spans every weekday and
+  a week of days of month). A factor is the ratio of the mean daily population spend of its days to the mean daily
+  spend of the baseline days (days outside every holiday week; weekday and day-of-month groups use baseline days
+  only); it is used only when its percentile bootstrap interval (days resampled with replacement within the group
+  and within the baseline, an i.i.d. resampling of days that ignores serial correlation) excludes 1, otherwise
+  m = 1. Every group is one test at ``confidence`` without a multiple-testing correction, so with n tests about
+  n · (1 − confidence) factors are expected to be «significant» by chance (``Multipliers.summary``:
+  ``n_tests``, ``expected_false_positives``). Holiday dates come from their rules; the model never gets a
+  calendar date.
 
-Guarantee (Proposition, thesis ch. 2): if the episode lasts D <= W = 7 days, for ANY attack the auto-approved
-attacker amount is ``A_auto <= max_{t ∈ [t0, t0 + D)} C_7d(c, t)`` (``episode_bound``: C is constant per day, so the
-max over the days the window touches). ``headroom_cents`` is a tighter valid bound,
+Attack independence (thesis ch. 2, §1): for t ∈ [t0, t0 + D) with D <= W = 7 d and d <= t the start of t's day,
+``d − 7 d <= t − 7 d < t0 + D − 7 d <= t0``, so ``C_W(c, t)`` depends only on operations before the episode start:
+it can be computed before the episode, no action of the attacker (passed, declined or not confirmed) changes it,
+and the bank needs no fraud labels for the recent operations.
+
+Guarantee (Proposition): if the episode lasts D <= W = 7 days, for ANY attack the auto-approved attacker amount is
+``A_auto <= max_{t ∈ [t0, t0 + D)} C_7d(c, t)`` (``episode_bound``, from the pre-episode state only: C is constant
+per day, so the max over the days the window touches; ``c7_by_day`` are the per-day values, which the bank's
+decisions use – ``check_used_corridor``). ``headroom_cents`` is a tighter valid bound,
 ``max(0, max_t (C_7d(c, t) − S_owner(t)))`` with S_owner the owner's auto-approved operations still in the window
 (no owner operation is replayed during an episode, so S_owner only decreases).
 """
@@ -47,11 +58,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .serving.state import CardState, LegitHistory
+from .serving.state import CardState, SpendHistory
 
 _NS = 1_000_000_000
 DAY_NS = 86_400 * _NS
 WINDOWS_NS = {"24h": DAY_NS, "7d": 7 * DAY_NS}
+PROFILE_LAG_NS = 7 * DAY_NS  # R26: the profile of day d uses operations before d − 7 d only (= the 7-day window W)
 HOLIDAYS = ("christmas", "independence_day", "thanksgiving")
 MULTIPLIER_KINDS = ("holiday", "weekday", "day_of_month")
 MULTIPLIER_SEED = 42  # bootstrap of the multipliers: a constant, independent of the audit seed
@@ -69,6 +81,7 @@ class Multipliers:
     day_of_month: dict
     estimates: tuple
     holiday_weeks: tuple
+    confidence: float = 0.95
 
     def factor(self, day_ns: int, window: str, kinds: tuple) -> float:
         m = 1.0
@@ -85,9 +98,14 @@ class Multipliers:
         return m
 
     def summary(self) -> dict:
+        """Significant factors, the number of tests (one per estimated group, no multiple-testing correction) and the
+        number of «significant» factors expected by chance alone at ``confidence``."""
+        n = len(self.estimates)
         return {"holiday": dict(self.holiday), "weekday": dict(self.weekday),
-                "day_of_month": dict(self.day_of_month), "n_estimates": len(self.estimates),
-                "n_significant": sum(1 for e in self.estimates if e["significant"])}
+                "day_of_month": dict(self.day_of_month), "n_estimates": n, "n_tests": n,
+                "n_significant": sum(1 for e in self.estimates if e["significant"]),
+                "confidence": float(self.confidence),
+                "expected_false_positives": float(n * (1 - self.confidence))}
 
 
 @dataclass(frozen=True)
@@ -251,7 +269,7 @@ def estimate_from_daily(daily: pd.Series, cfg: CorridorConfig) -> Multipliers:
         est.append({"kind": kind, "group": group, "ratio": ratio, "lower": lower, "upper": upper,
                     "significant": sig, "n_days": int(g.size)})
     return Multipliers(holiday=out["holiday"], weekday=out["weekday"], day_of_month=out["day_of_month"],
-                       estimates=tuple(est), holiday_weeks=tuple(cfg.holiday_weeks))
+                       estimates=tuple(est), holiday_weeks=tuple(cfg.holiday_weeks), confidence=float(cfg.confidence))
 
 
 def _group_id(kind: str, group: str) -> int:
@@ -289,10 +307,10 @@ def prepare(tm, df: pd.DataFrame):
 
 # --- corridor and decision -------------------------------------------------------------------------------------
 
-def limit_cents(cfg: CorridorConfig, legit: LegitHistory, day_ns: int, window: str) -> int:
-    """``C_W`` in whole cents (rounded down) for the calendar day of ``day_ns``."""
+def limit_cents(cfg: CorridorConfig, spend: SpendHistory, day_ns: int, window: str) -> int:
+    """``C_W`` in whole cents (rounded down) for the calendar day of ``day_ns`` (lagged profile, module docstring)."""
     day = int(day_ns) - int(day_ns) % DAY_NS
-    q = legit.window_quantile(day, cfg.lookback_days * DAY_NS, WINDOWS_NS[window], cfg.q)
+    q = spend.window_quantile(day, cfg.lookback_days * DAY_NS, WINDOWS_NS[window], cfg.q, PROFILE_LAG_NS)
     base = max(cfg.floor_24h if window == "24h" else cfg.floor_7d, q)
     m = cfg.fitted.factor(day, window, cfg.multipliers) if cfg.multipliers else 1.0
     return int(math.floor(base * m * 100 + 1e-6))
@@ -300,47 +318,77 @@ def limit_cents(cfg: CorridorConfig, legit: LegitHistory, day_ns: int, window: s
 
 def limits_cents(cfg: CorridorConfig, state: CardState, ts) -> tuple[int, int]:
     t = pd.Timestamp(ts).value
-    return limit_cents(cfg, state.legit, t, "24h"), limit_cents(cfg, state.legit, t, "7d")
+    return limit_cents(cfg, state.spend, t, "24h"), limit_cents(cfg, state.spend, t, "7d")
+
+
+def check(cfg: CorridorConfig, state: CardState, ts, amt: float) -> tuple[bool, int, int]:
+    """Rule 2 with the corridors used: ``(S_W(t⁻) + a <= C_W(t) for both windows, C_24h, C_7d)`` (whole cents)."""
+    t = pd.Timestamp(ts).value
+    a = int(round(float(amt) * 100))
+    c24, c7 = limits_cents(cfg, state, t)
+    ok = (state.auto_sum_cents(t, WINDOWS_NS["24h"]) + a <= c24
+          and state.auto_sum_cents(t, WINDOWS_NS["7d"]) + a <= c7)
+    return ok, c24, c7
 
 
 def within(cfg: CorridorConfig, state: CardState, ts, amt: float) -> bool:
     """Rule 2: ``S_W(t⁻) + a <= C_W(t)`` for both windows (whole cents)."""
-    t = pd.Timestamp(ts).value
-    a = int(round(float(amt) * 100))
-    for w in ("24h", "7d"):
-        if state.auto_sum_cents(t, WINDOWS_NS[w]) + a > limit_cents(cfg, state.legit, t, w):
-            return False
-    return True
+    return check(cfg, state, ts, amt)[0]
 
 
 def episode_bound(cfg: CorridorConfig, state: CardState, start, window_days: int) -> dict:
-    """The guaranteed bound of an episode starting at ``start`` on a card in ``state`` (state right before start):
-    ``bound_cents = max_{t ∈ [start, start + D)} C_7d`` and the tighter ``headroom_cents`` (module docstring).
-    ``ValueError`` if D > W (the Proposition needs D <= W)."""
+    """The guaranteed bound of an episode starting at ``start``, from the state right before it (``ValueError`` if the
+    state has seen anything at or after ``start``): ``bound_cents = max_{t ∈ [start, start + D)} C_7d``, the per-day
+    values ``c7_by_day`` ({day ns: cents} for every calendar day the window touches) and the tighter
+    ``headroom_cents`` (module docstring). ``ValueError`` if D > W (the Proposition needs D <= W)."""
     D = int(window_days) * DAY_NS
     W = WINDOWS_NS["7d"]
     if D > W:
         raise ValueError(f"the guarantee needs D <= W: episode {window_days} days, window 7 days")
     t0 = pd.Timestamp(start).value
+    if state.now is not None and state.now > t0:
+        raise ValueError(f"the bound needs the state right before the episode start {pd.Timestamp(t0)}; "
+                         f"the state is at {pd.Timestamp(state.now)}")
+    if len(state.spend) and int(state.spend.t[-1]) >= t0:
+        raise ValueError("the bound needs the state right before the episode start: the profile has operations at "
+                         "or after it")
     end = t0 + D
-    bound, head = 0, 0
+    head = 0
+    by_day = {}
     d = t0 - t0 % DAY_NS
     while d < end:
-        c = limit_cents(cfg, state.legit, d, "7d")
+        c = limit_cents(cfg, state.spend, d, "7d")
         seg_end = min(d + DAY_NS, end)
         s_min = state.auto_sum_cents(seg_end - 1, W)  # owner ops still in (t − W, t] as t → seg_end⁻
-        bound = max(bound, c)
+        by_day[int(d)] = int(c)
         head = max(head, c - s_min)
         d += DAY_NS
-    return {"bound_cents": int(bound), "headroom_cents": int(max(0, head))}
+    return {"bound_cents": int(max(by_day.values())), "headroom_cents": int(max(0, head)), "c7_by_day": by_day}
 
 
-def batch_state(t_ns: np.ndarray, amt: np.ndarray, auto: np.ndarray, legit: np.ndarray,
+def check_used_corridor(bound: dict, used, *, inside_only: bool = False) -> None:
+    """``RuntimeError`` unless every 7-day corridor the bank used during an episode (``used``: (day ns, cents) pairs,
+    ``EpisodeOutcome.corridor_c7``) equals the pre-episode per-day value of ``episode_bound``. A used day outside the
+    episode window is an error too, unless ``inside_only`` (the clean leg replays real operations, which may run past
+    the window; the guarantee covers the window only)."""
+    by_day = bound["c7_by_day"]
+    for day, c in used:
+        if day not in by_day:
+            if inside_only:
+                continue
+            raise RuntimeError(f"corridor used on day {pd.Timestamp(day).date()} outside the episode window")
+        if by_day[day] != c:
+            raise RuntimeError(f"corridor on day {pd.Timestamp(day).date()} was {c} cents, the pre-episode value is "
+                               f"{by_day[day]}")
+
+
+def batch_state(t_ns: np.ndarray, amt: np.ndarray, auto: np.ndarray, passed: np.ndarray,
                 cfg: CorridorConfig) -> dict:
     """Batch path of the corridor state for one card's time-ordered stream with KNOWN decisions: per operation i,
-    ``s24``/``s7`` = auto-approved cents of the earlier operations (in stream order) in ``(t_i − W, t_i]`` and
-    ``c24``/``c7`` = the corridor from the legitimate operations before i. Must equal the serving path
-    (``CardState.auto_sum_cents`` + ``limits_cents`` with ``push(…, auto_approved, legit)``)."""
+    ``s24``/``s7`` = auto-approved cents of the operations before i IN STREAM ORDER with time in ``(t_i − W, t_i]``
+    (earlier operations of the same second count, later ones of that second do not) and ``c24``/``c7`` = the
+    corridor of t_i's day from the passed operations (lagged profile). Must equal the serving path
+    (``CardState.auto_sum_cents`` + ``limits_cents`` with ``push(…, auto_approved, passed)``)."""
     t = np.asarray(t_ns, dtype=np.int64)
     cents = np.rint(np.asarray(amt, dtype=np.float64) * 100).astype(np.int64) * np.asarray(auto, dtype=bool)
     cum = np.concatenate([[0], np.cumsum(cents)])
@@ -350,15 +398,15 @@ def batch_state(t_ns: np.ndarray, amt: np.ndarray, auto: np.ndarray, legit: np.n
     for name, w in (("s24", WINDOWS_NS["24h"]), ("s7", WINDOWS_NS["7d"])):
         lo = np.minimum(np.searchsorted(t, t - w, "right"), idx)
         out[name] = (cum[idx] - cum[lo]).tolist()
-    lm = np.asarray(legit, dtype=bool)
-    lt, la = t[lm], np.asarray(amt, dtype=np.float64)[lm]
+    pm = np.asarray(passed, dtype=bool)
+    pt, pa = t[pm], np.asarray(amt, dtype=np.float64)[pm]
     c24, c7 = [], []
     cache = {}
     for i in range(n):
         day = int(t[i] - t[i] % DAY_NS)
         if day not in cache:
-            k = int(np.searchsorted(lt, day, "left"))  # legitimate ops strictly before the day
-            h = LegitHistory(lt[:k], la[:k])
+            k = int(np.searchsorted(pt, day - PROFILE_LAG_NS, "left"))  # passed ops before d − lag
+            h = SpendHistory(pt[:k], pa[:k])
             cache[day] = (limit_cents(cfg, h, day, "24h"), limit_cents(cfg, h, day, "7d"))
         c24.append(cache[day][0])
         c7.append(cache[day][1])
@@ -373,6 +421,8 @@ def bound_stats(per_target: list[dict], rho: float) -> dict:
     a = np.array([t["amount"] for t in per_target], dtype=np.float64)
 
     def s(x):
-        return {"mean": float(x.mean()), "median": float(np.median(x)), "max": float(x.max())}
+        q25, q75, q90 = np.quantile(x, [0.25, 0.75, 0.9])
+        return {"mean": float(x.mean()), "median": float(np.median(x)), "max": float(x.max()),
+                "q25": float(q25), "q75": float(q75), "q90": float(q90)}
     return {"bound": s(b), "bound_share": s(b / a), "headroom": s(h), "headroom_share": s(h / a),
             "share_targets_bound_below_rho_a": float(np.mean(b < rho * a))}
