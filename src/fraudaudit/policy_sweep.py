@@ -1,0 +1,363 @@
+"""``fraudaudit policy-sweep``: the bank-policy grid of Task 19 (rulings R18, R19, R30) – the same pre-registered
+policies on several models, measured by the gate's statistic and by the friction they cause.
+
+Grid per model (one cell = one combination; the gate's ensemble – attacks × attack seeds of ``gate.yaml`` – on all
+test targets with the fit-period spares):
+
+* τ from clean val at a target FPR (``threshold_at_fpr``; default 0.005, 0.01 = the model's own, 0.02); the τ at the
+  model's own target FPR must reproduce ``model.json`` (checked for every model, whatever the grid);
+* bank reaction ``md1`` (``max_declines: 1``), ``md3`` (``max_declines: 3``, no escalation), ``md3+esc``
+  (``max_declines: 3``, ``tau_after_decline`` = τ at val FPR ``esc_fpr`` = 0.05 of the same model, which must be below
+  every τ of the grid); ``md2`` and ``mdinf`` (never blocked) are the extra cells of the R19 experiment;
+* corridor ``off`` / ``on`` (the corridor section of ``--corridor-threat``, the gate's current corridor).
+
+Per cell: U = worst (over the runs) one-sided upper bound of the paired uplift VER_adv − VER_clean (the gate's
+statistic) with the mean uplift and the per-run table; U$ = the same statistic on dollars per target,
+(VER_adv,i − VER_clean,i) · A_i, same paired bootstrap (not U × mean A); clean test recall / FPR at the cell's τ;
+per run the per-target VERs (for R19 and the seed spread). Friction on the legitimate test stream (a separate stage,
+from the p of every legitimate test operation cached once per model): false blocks (``metrics.false_block_rate``,
+30-day card windows) for (τ, reaction) and the owner-confirmation burden (``metrics.confirmation_burden``) for
+corridor-on cells (0 when off).
+
+Resumable: the JSON is rewritten (atomically) after every cell and every friction entry; a rerun skips a cell whose
+config hash (model, τ, reaction, corridor, threat model, gate ensemble, seed) is unchanged and reruns it otherwise.
+Cells already in the JSON but not requested are kept (the R19 cells and the grid share one file).
+"""
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import platform
+import time
+from pathlib import Path
+
+import numpy as np
+
+from . import corridor as corridor_mod
+from .sweep_cells import check_own_tau, model_at_tau, model_target_fpr, run_cell, tau_at, val_scores, write_json
+
+FPR_GRID = (0.005, 0.01, 0.02)
+REACTIONS = ("md1", "md3", "md3+esc")
+R19_REACTIONS = ("md2", "mdinf")
+CORRIDORS = ("off", "on")
+ESC_FPR = 0.05
+FB_WINDOW_DAYS = 30
+SWEEP_FILE = "policy-sweep.json"
+SCORES_FILE = "legit-scores.npz"
+
+
+def parse_reaction(name: str) -> dict:
+    """``md<N>`` | ``mdinf`` with an optional ``+esc`` → ``{"max_declines": N | None, "esc": bool}``."""
+    n = name.strip().lower()
+    esc = n.endswith("+esc")
+    base = n[:-4] if esc else n
+    if base == "mdinf":
+        md = None
+    elif base.startswith("md") and base[2:].isdigit() and int(base[2:]) >= 1:
+        md = int(base[2:])
+    else:
+        raise ValueError(f"bad reaction {name!r}: expected md<N> (N >= 1) or mdinf, optionally +esc")
+    if esc and md == 1:
+        raise ValueError("escalation has no effect with md1 (the first decline blocks the card)")
+    return {"max_declines": md, "esc": esc}
+
+
+def cell_key(fpr: float, reaction: str, corridor: str) -> str:
+    return f"fpr={float(fpr):g}|{reaction}|corridor={corridor}"
+
+
+def config_hash(config: dict) -> str:
+    return hashlib.sha256(json.dumps(config, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def usd_uplift(rec: dict, confidence: float, seed: int, one_sided: bool, n_boot: int) -> None:
+    """Adds per run ``usd_uplift_mean`` / ``usd_uplift_upper``: the paired bootstrap of (VER_adv,i − VER_clean,i) · A_i
+    (the gate's ``uplift_ci`` on dollars, same seed and level), and ``worst_usd_uplift_upper`` / ``worst_run_usd``."""
+    from .metrics import uplift_ci
+    a = np.asarray(rec["amounts"], dtype=np.float64)
+    for r in rec["runs"].values():
+        m, _, hi = uplift_ci(np.asarray(r["ver_adv"]) * a, np.asarray(r["ver_clean"]) * a, confidence, n_boot, seed,
+                             one_sided=one_sided)
+        r["usd_uplift_mean"], r["usd_uplift_upper"] = float(m), float(hi)
+    w = max(rec["runs"], key=lambda k: rec["runs"][k]["usd_uplift_upper"])
+    rec["worst_run_usd"], rec["worst_usd_uplift_upper"] = w, rec["runs"][w]["usd_uplift_upper"]
+
+
+def _threat_without_policy(tm) -> dict:
+    d = dataclasses.asdict(dataclasses.replace(tm, corridor=None))
+    for k in ("max_declines", "tau_after_decline", "corridor"):
+        d.pop(k, None)
+    return d
+
+
+def _sha256(path) -> str | None:
+    return None if path is None else hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def machine_info() -> dict:
+    """The machine of a run (R17: the whole grid on one machine). ``HOST_MACHINE`` (set by the chain script on the
+    host) names the physical machine when the run is inside a container."""
+    return {"system": platform.system(), "machine": platform.machine(), "platform": platform.platform(),
+            "processor": platform.processor(), "cpu_count": os.cpu_count(),
+            "host_machine": os.environ.get("HOST_MACHINE")}
+
+
+def load_sweep(path) -> dict | None:
+    p = Path(path)
+    return json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
+
+
+# --- legitimate-stream score cache --------------------------------------------------------------------------------
+
+
+def save_scores(path, scores: dict, model_sha: str) -> None:
+    cards = np.array(sorted(scores), dtype=np.int64)
+    lens = np.array([len(scores[c]) for c in cards], dtype=np.int64)
+    p = np.concatenate([scores[c] for c in cards]) if len(cards) else np.empty(0)
+    tmp = Path(str(path) + ".tmp.npz")
+    np.savez(tmp, cards=cards, lens=lens, p=p.astype(np.float64), model_sha=np.array(model_sha))
+    tmp.replace(path)
+
+
+def load_scores(path, model_sha: str) -> dict | None:
+    p = Path(path)
+    if not p.is_file():
+        return None
+    with np.load(p, allow_pickle=False) as z:
+        if str(z["model_sha"]) != model_sha:
+            return None
+        cards, lens, vals = z["cards"], z["lens"], z["p"]
+    out, i = {}, 0
+    for c, n in zip(cards.tolist(), lens.tolist()):
+        out[int(c)] = vals[i:i + n].copy()
+        i += n
+    return out
+
+
+# --- the sweep ----------------------------------------------------------------------------------------------------
+
+
+def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs=FPR_GRID, reactions=REACTIONS,
+                 corridors=CORRIDORS, esc_fpr: float = ESC_FPR, r19: bool = False, seed: int = 42,
+                 n_jobs: int | None = None, out_dir, ensemble: bool = True, friction: bool = True,
+                 role: str = "grid", threat_path=None, corridor_path=None, gate_path=None, log=None) -> dict:
+    """Run (or resume) the cells of one model; returns the sweep dict also written to ``out_dir/SWEEP_FILE``."""
+    from .audit import N_BOOT, _versions
+    from .cli import git_info
+    say = log or (lambda m: None)
+    if role not in ("grid", "confirmation"):
+        raise ValueError(f"role must be grid or confirmation, got {role!r}")
+    specs = [(r, parse_reaction(r)) for r in reactions]
+    for c in corridors:
+        if c not in CORRIDORS:
+            raise ValueError(f"corridor must be off or on, got {c!r}")
+    if "on" in corridors:
+        if corridor_tm is None or corridor_tm.corridor is None:
+            raise ValueError("corridor 'on' needs a corridor threat model with a corridor section")
+        if _threat_without_policy(corridor_tm) != _threat_without_policy(tm):
+            raise ValueError("the corridor threat model differs from the threat model outside the corridor and the "
+                             "bank reaction: the corridor cells would not be comparable")
+    t0 = time.perf_counter()
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / SWEEP_FILE
+    model_sha = hashlib.sha256((Path(model_dir) / "model.json").read_bytes()).hexdigest()
+    old = load_sweep(path)
+    if old is not None and old.get("model_json_sha256") != model_sha:
+        raise ValueError(f"{path} belongs to another model (model.json SHA-256 {old.get('model_json_sha256')}); "
+                         "use another --out or --label")
+    if old is not None and old.get("role", "grid") != role:
+        raise ValueError(f"{path} has role {old.get('role')!r}, this run {role!r}")
+
+    own_fpr = model_target_fpr(model_dir)
+    if own_fpr is None:
+        raise ValueError(f"{model_dir}/model.json has no meta.target_fpr: the tau reproduction check cannot run")
+    y_val, p_val = val_scores(df, model)
+    taus = {float(f): tau_at(y_val, p_val, f) for f in sorted({*map(float, fprs), own_fpr})}
+    check_own_tau(model_dir, model, taus[own_fpr], own_fpr)
+    tau_esc = tau_at(y_val, p_val, esc_fpr)
+    grid_taus = [taus[float(f)] for f in fprs]
+    if any(sp["esc"] for _, sp in specs) and not (0 < tau_esc < min(grid_taus)):
+        raise ValueError(f"escalation threshold {tau_esc} (val FPR {esc_fpr}) must be in (0, every grid tau); grid "
+                         f"taus {grid_taus}")
+    say(f"{label}: own target FPR {own_fpr}, tau {model.tau:.6g}; grid taus "
+        + ", ".join(f"{f:g}: {t:.6g}" for f, t in taus.items()) + f"; escalation tau {tau_esc:.6g}")
+
+    tm_on = None
+    if "on" in corridors or (old and any(c["corridor"] == "on" for c in old.get("cells", []))):
+        if corridor_tm is not None and corridor_tm.corridor is not None:
+            tm_on = corridor_mod.prepare(dataclasses.replace(tm, corridor=corridor_tm.corridor), df)
+
+    from .features.columns import feature_set_name
+    data = old or {"cells": [], "friction": {"false_blocks": {}, "burden": {}}}
+    data.update(label=label, model_dir=str(model_dir), model_json_sha256=model_sha, role=role,
+                feature_set=feature_set_name(model.feature_columns), n_features=len(model.feature_columns),
+                own_target_fpr=own_fpr, own_tau=float(model.tau), esc_fpr=float(esc_fpr), tau_esc=tau_esc,
+                taus={**(old or {}).get("taus", {}), **{f"{f:g}": t for f, t in taus.items()}}, seed=int(seed),
+                gate={"attacks": list(cfg.attacks), "attack_seeds": list(cfg.attack_seeds),
+                      "confidence": cfg.confidence, "one_sided": cfg.one_sided, "spares_period": cfg.spares_period,
+                      "delta": cfg.delta, "recall_clean_min": cfg.recall_clean_min},
+                corridor_params=None if tm_on is None else tm_on.corridor.public())
+    cells = {c["key"]: c for c in data["cells"]}
+
+    def save():
+        data["cells"] = sorted(cells.values(), key=lambda c: (c["target_fpr"], c["reaction"], c["corridor"]))
+        amounts = next((c["amounts"] for c in data["cells"] if c.get("amounts")), None)
+        if amounts:
+            data["mean_amount"] = float(np.mean(amounts))
+            data["delta_usd"] = None if cfg.delta is None else float(cfg.delta * np.mean(amounts))
+        _attach_friction(data)
+        data["meta"] = {"seed": int(seed), **git_info(), "machine": machine_info(), "versions": _versions(),
+                        "threat_file": None if threat_path is None else str(threat_path),
+                        "threat_sha256": _sha256(threat_path),
+                        "corridor_threat_file": None if corridor_path is None else str(corridor_path),
+                        "corridor_threat_sha256": _sha256(corridor_path),
+                        "gate_file": None if gate_path is None else str(gate_path), "gate_sha256": _sha256(gate_path),
+                        "n_jobs": n_jobs, "wall_seconds_last_invocation": round(time.perf_counter() - t0, 1)}
+        write_json(path, data)
+
+    todo = [(float(f), r, sp, c) for f in fprs for r, sp in specs for c in corridors]
+    if r19:
+        todo += [(own_fpr, r, parse_reaction(r), "off") for r in R19_REACTIONS]
+    seen = set()
+    todo = [t for t in todo if not (cell_key(t[0], t[1], t[3]) in seen or seen.add(cell_key(t[0], t[1], t[3])))]
+
+    for fpr, rname, sp, corr in (todo if ensemble else []):
+        key = cell_key(fpr, rname, corr)
+        tau = taus[fpr]
+        tau2 = tau_esc if sp["esc"] else None
+        base = tm_on if corr == "on" else dataclasses.replace(tm, corridor=None)
+        tm_c = dataclasses.replace(base, max_declines=sp["max_declines"], tau_after_decline=tau2)
+        config = {"model_json_sha256": model_sha, "target_fpr": fpr, "tau": tau, "max_declines": sp["max_declines"],
+                  "tau_after_decline": tau2, "corridor": None if corr == "off" else tm_on.corridor.public(),
+                  "threat": _threat_without_policy(tm), "gate": data["gate"], "seed": int(seed)}
+        h = config_hash(config)
+        if key in cells and cells[key].get("config_hash") == h:
+            say(f"{label} {key}: done, skipped")
+            continue
+        t1 = time.perf_counter()
+        mdir, mdl = model_at_tau(model_dir, model, tau, fpr, out / "models" / f"fpr-{fpr:g}",
+                                 "policy-sweep: same weights, tau at target_fpr on val")
+        rec, _ = run_cell(df, mdl, mdir, tm_c, cfg, seed, n_jobs=n_jobs, threat_path=threat_path, per_target=True)
+        usd_uplift(rec, cfg.confidence, seed, cfg.one_sided, N_BOOT)
+        cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
+                "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr, **rec,
+                "U": rec["worst_uplift_upper"], "U_usd": rec["worst_usd_uplift_upper"],
+                "wall_seconds": round(time.perf_counter() - t1, 1)}
+        cells[key] = cell
+        say(f"{label} {key}: U {100 * cell['U']:.1f} % ({cell['worst_run']}), U$ {cell['U_usd']:.0f} $, mean uplift "
+            f"{100 * cell['mean_uplift']:.1f} %, test recall {cell['test_recall']:.4f}, {cell['wall_seconds']} s")
+        save()
+
+    if friction and cells:
+        _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save)
+    save()
+    return data
+
+
+def _fb_key(tau: float, md, tau2) -> str:
+    return json.dumps({"tau": tau, "max_declines": md, "tau_after_decline": tau2, "window_days": FB_WINDOW_DAYS},
+                      sort_keys=True)
+
+
+def _burden_key(tau: float, corridor_public: dict) -> str:
+    return json.dumps({"tau": tau, "corridor": corridor_public}, sort_keys=True, default=str)
+
+
+def _friction(df, model, model_dir, data, cells, tm_on, out, model_sha, n_jobs, say, save) -> None:
+    from .metrics import confirmation_burden, false_block_rate, legit_test_scores
+    fb, bu = data["friction"]["false_blocks"], data["friction"]["burden"]
+    need_fb = {_fb_key(c["tau"], c["max_declines"], c["tau_after_decline"]): c for c in cells.values()}
+    need_bu = {} if tm_on is None else {_burden_key(c["tau"], tm_on.corridor.public()): c
+                                        for c in cells.values() if c["corridor"] == "on"}
+    missing_fb = [k for k in need_fb if k not in fb]
+    missing_bu = [k for k in need_bu if k not in bu]
+    if any(c["corridor"] == "on" for c in cells.values()) and tm_on is None:
+        raise ValueError("corridor-on cells need --corridor-threat for their confirmation burden")
+    if not (missing_fb or missing_bu):
+        return
+    t0 = time.perf_counter()
+    scores = load_scores(out / SCORES_FILE, model_sha)
+    if scores is None:
+        scores = legit_test_scores(df, model, n_jobs=n_jobs, model_dir=model_dir)
+        save_scores(out / SCORES_FILE, scores, model_sha)
+        say(f"{data['label']}: legit test scores {sum(len(v) for v in scores.values())} ops, "
+            f"{time.perf_counter() - t0:.0f} s")
+    for k in missing_fb:
+        c = need_fb[k]
+        t1 = time.perf_counter()
+        r = false_block_rate(df, model, c["tau"], c["max_declines"], FB_WINDOW_DAYS,
+                             tau_after_decline=c["tau_after_decline"], n_jobs=n_jobs, scores=scores)
+        fb[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1))
+        say(f"{data['label']}: false blocks tau {c['tau']:.6g} {c['reaction']}: "
+            f"{100 * r.share_blocked_card_windows:.2f} % of card-months, {fb[k]['wall_seconds']} s")
+        save()
+    for k in missing_bu:
+        c = need_bu[k]
+        t1 = time.perf_counter()
+        r = confirmation_burden(df, scores, c["tau"], tm_on.corridor, n_jobs=n_jobs)
+        bu[k] = dict(dataclasses.asdict(r), wall_seconds=round(time.perf_counter() - t1, 1))
+        say(f"{data['label']}: burden tau {c['tau']:.6g}: {100 * r.share_confirm_card_days:.2f} % of card-days, "
+            f"{bu[k]['wall_seconds']} s")
+        save()
+
+
+def _attach_friction(data: dict) -> None:
+    """Per cell ``friction``: the false-block and burden entries of its (τ, reaction) and (τ, corridor), or None."""
+    fb, bu = data["friction"]["false_blocks"], data["friction"]["burden"]
+    cp = data.get("corridor_params")
+    for c in data["cells"]:
+        f = fb.get(_fb_key(c["tau"], c["max_declines"], c["tau_after_decline"]))
+        if c["corridor"] == "on":
+            b = None if cp is None else bu.get(_burden_key(c["tau"], cp))
+        else:
+            b = {"share_confirm_ops": 0.0, "share_confirm_card_days": 0.0}
+        c["friction"] = None if f is None or b is None else {
+            "share_blocked_card_windows": f["share_blocked_card_windows"],
+            "share_blocked_cards": f["share_blocked_cards"], "decline_rate": f["decline_rate"],
+            "share_confirm_ops": b["share_confirm_ops"], "share_confirm_card_days": b["share_confirm_card_days"]}
+
+
+def _pct(x, d: int = 1) -> str:
+    return "–" if x is None or (isinstance(x, float) and math.isnan(x)) else f"{100 * x:.{d}f} %"
+
+
+def sweep_markdown(data: dict) -> str:
+    g = data["gate"]
+    lines = [f"# Bank-policy sweep: {data['label']} ({data['role']})", "",
+             f"Model `{data['model_dir']}` ({data['feature_set']}, {data['n_features']} features), own target FPR "
+             f"{data['own_target_fpr']:g}, τ {data['own_tau']:.6g}; escalation τ' {data['tau_esc']:.6g} (val FPR "
+             f"{data['esc_fpr']:g}). Ensemble: {', '.join(g['attacks'])} × seeds {g['attack_seeds']}; δ {g['delta']}"
+             + (f", δ$ = δ · mean A = {data['delta_usd']:.0f} $ (mean A {data['mean_amount']:.2f} $)"
+                if data.get("delta_usd") is not None else "") + ".", "",
+             "U = worst one-sided upper bound of the paired uplift VER_adv − VER_clean over the runs; U$ = the same "
+             "statistic on (VER_adv,i − VER_clean,i) · A_i. Friction on the legitimate test stream: false-blocked "
+             "card-months (30-day windows) and card-days with an owner confirmation.", "",
+             "| target FPR | τ | reaction | corridor | U (run) | U$ | mean uplift | test recall | test FPR | "
+             "blocked card-months | blocked cards | confirm card-days | time |",
+             "|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    for c in data["cells"]:
+        f = c.get("friction") or {}
+        lines.append(f"| {c['target_fpr']:g} | {c['tau']:.4g} | {c['reaction']} | {c['corridor']} | "
+                     f"{_pct(c['U'])} ({c['worst_run']}) | {c['U_usd']:.0f} $ | {_pct(c['mean_uplift'])} | "
+                     f"{c['test_recall']:.4f} | {c['test_fpr']:.4f} | {_pct(f.get('share_blocked_card_windows'), 2)} | "
+                     f"{_pct(f.get('share_blocked_cards'), 2)} | {_pct(f.get('share_confirm_card_days'), 2)} | "
+                     f"{c['wall_seconds']} s |")
+    lines += ["", "## Runs (one-sided upper bound of the uplift per attack/seed)", "",
+              "| target FPR | reaction | corridor | runs |", "|---:|---|---|---|"]
+    for c in data["cells"]:
+        lines.append(f"| {c['target_fpr']:g} | {c['reaction']} | {c['corridor']} | "
+                     + ", ".join(f"{k} {_pct(r['uplift_upper'])}" for k, r in c["runs"].items()) + " |")
+    m = data.get("meta", {})
+    mach = m.get("machine", {})
+    lines += ["", f"git `{m.get('git_sha')}` (uncommitted changes: {m.get('git_dirty')}); machine "
+              f"{mach.get('host_machine') or mach.get('platform')} ({mach.get('cpu_count')} CPUs visible); seed "
+              f"{data['seed']}.", ""]
+    return "\n".join(lines)
+
+
+def write_markdown(data: dict, out_dir) -> None:
+    (Path(out_dir) / "policy-sweep.md").write_text(sweep_markdown(data), encoding="utf-8")

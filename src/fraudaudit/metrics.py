@@ -140,6 +140,16 @@ def _fb_job(args):
     return _card_windows(args, _FB["model"], _FB["params"])
 
 
+def _fb_cached_job(args):
+    """One card from cached scores: ``(g, test_start, p, params)``."""
+    g, test_start, p, params = args
+    seq = _SeqServing(p)
+    out = _card_windows((g, test_start), seq, params)
+    if seq.i != len(p):
+        raise RuntimeError(f"card {int(g['cc_num'].iloc[0])}: {seq.i} of {len(p)} cached scores consumed")
+    return out
+
+
 def _card_windows(args, serving, params) -> list[tuple]:
     """Replay of one card: ``[(window, n_ops, n_decided, n_declines, blocked)]``, in window order."""
     from types import SimpleNamespace
@@ -170,6 +180,9 @@ def _card_windows(args, serving, params) -> list[tuple]:
         n_ops += 1
         if bank.blocked:
             bank.state.push(tx)  # the real operation still happens (elsewhere); only the decision is not asked
+            skip = getattr(serving, "skip", None)
+            if skip is not None:  # cached scores: this operation's score is not used
+                skip()
         else:
             bank.submit(tx)
     if bank is not None:
@@ -179,7 +192,7 @@ def _card_windows(args, serving, params) -> list[tuple]:
 
 def false_block_rate(df: pd.DataFrame, model_or_serving, tau: float, max_declines: int | None,
                      window_days: int = 30, *, tau_after_decline: float | None = None,
-                     n_jobs: int | None = None, model_dir=None) -> FalseBlockResult:
+                     n_jobs: int | None = None, model_dir=None, scores: dict | None = None) -> FalseBlockResult:
     """Share of legitimate (card, window) pairs a bank policy would block.
 
     Replay: the state of every card is built from all its operations before the test start (history);
@@ -194,7 +207,10 @@ def false_block_rate(df: pd.DataFrame, model_or_serving, tau: float, max_decline
     ``p >= tau`` (the policy's own ``tau``).
 
     ``model_or_serving``: a ``Serving`` or a fitted model. ``n_jobs > 1`` needs ``model_dir`` (every worker
-    loads its own model); results are identical for any ``n_jobs``."""
+    loads its own model); results are identical for any ``n_jobs``. ``scores`` (the dict of ``legit_test_scores``
+    of the same model; ``model_or_serving`` and ``model_dir`` are then unused): the cached p of every legitimate test
+    operation – the state sees every operation whatever the decision, so p does not depend on τ or the reaction –,
+    replayed in the same order (a blocked operation's score is skipped); identical to the live replay."""
     import multiprocessing as mp
     import os
     from concurrent.futures import ProcessPoolExecutor
@@ -220,7 +236,14 @@ def false_block_rate(df: pd.DataFrame, model_or_serving, tau: float, max_decline
     groups = [(g.reset_index(drop=True), test_start) for _, g in sub.groupby("cc_num", sort=True)]
     params = (float(tau), max_declines, tau_after_decline, window_days * 86_400 * 10**9)
     jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs
-    if jobs > 1 and len(groups) > 1:
+    if scores is not None:
+        args = [(g, ts, scores[int(g["cc_num"].iloc[0])], params) for g, ts in groups]
+        if jobs > 1 and len(groups) > 1:
+            with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn")) as ex:
+                parts = list(ex.map(_fb_cached_job, args, chunksize=max(1, len(groups) // (4 * jobs))))
+        else:
+            parts = [_fb_cached_job(a) for a in args]
+    elif jobs > 1 and len(groups) > 1:
         if model_dir is None:
             raise ValueError("n_jobs > 1 needs model_dir: every worker loads its own model")
         with ProcessPoolExecutor(max_workers=min(jobs, len(groups)), mp_context=mp.get_context("spawn"),
@@ -337,10 +360,13 @@ def legit_test_scores(df: pd.DataFrame, model_or_serving, *, n_jobs: int | None 
 
 
 class _SeqServing:
-    """Replays cached scores in call order."""
+    """Replays cached scores in call order; ``skip`` passes over the score of an operation that is not decided."""
 
     def __init__(self, p: np.ndarray) -> None:
         self.p, self.i = p, 0
+
+    def skip(self) -> None:
+        self.i += 1
 
     def decide(self, state, tx):
         from .serving.core import Decision

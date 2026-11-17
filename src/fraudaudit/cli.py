@@ -125,6 +125,39 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--out", type=Path, default=Path("out/corridor-posthoc"))
     ph.add_argument("--seed", type=int, default=42)
 
+    ps = sub.add_parser("policy-sweep", help="bank-policy grid (Task 19): tau x bank reaction x corridor on one or "
+                                            "more models; U, U$, clean quality and friction per cell; resumable "
+                                            "<out>/<label>/policy-sweep.json/.md")
+    ps.add_argument("--data", type=Path, default=Path("data"))
+    ps.add_argument("--model", type=Path, action="append", required=True, help="artifact directory (repeatable)")
+    ps.add_argument("--label", action="append", required=True, help="label of each --model, in the same order")
+    ps.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"),
+                    help="threat model of the cells (max_declines / tau_after_decline / corridor are set per cell)")
+    ps.add_argument("--corridor-threat", type=Path, default=Path("threat-models/realistic-corridor-v1v2.yaml"),
+                    help="its corridor section is the corridor of the corridor-on cells")
+    ps.add_argument("--gate", type=Path, default=Path("gate.yaml"), help="attacks, attack seeds, δ (read only)")
+    ps.add_argument("--target-fpr", type=_deltas, default=[0.005, 0.01, 0.02],
+                    help="comma-separated target FPRs on clean val (default 0.005,0.01,0.02)")
+    ps.add_argument("--reactions", type=_names, default=["md1", "md3", "md3+esc"],
+                    help="comma-separated bank reactions md<N> | mdinf, optionally +esc (default md1,md3,md3+esc)")
+    ps.add_argument("--esc-fpr", type=float, default=0.05, help="val FPR of the escalation threshold (default 0.05)")
+    ps.add_argument("--corridor", type=_names, default=["off", "on"], help="comma-separated off,on (default both)")
+    ps.add_argument("--r19", action="store_true", help="also the R19 cells md2 and mdinf at the own tau, corridor off")
+    ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
+                    help="confirmation: a T2 confirmation run with fresh seeds (--gate gate-seeds-456.yaml)")
+    stage = ps.add_mutually_exclusive_group()
+    stage.add_argument("--no-friction", action="store_true", help="ensemble cells only")
+    stage.add_argument("--friction-only", action="store_true", help="friction of the cells already in the JSON only")
+    ps.add_argument("--out", type=Path, default=Path("out/t19"), help="writes <out>/<label>/policy-sweep.json/.md")
+    ps.add_argument("--seed", type=int, default=42)
+    ps.add_argument("--n-jobs", type=int, default=None, help="worker processes (default: cpu count)")
+
+    pm = sub.add_parser("policy-summary", help="Task 19 summary: Pareto fronts, T1 / T2 / policy-vs-model "
+                                              "hypotheses, R19 bias and the T2 confirmation plan")
+    pm.add_argument("sweeps", type=Path, nargs="+", help="policy-sweep.json files (grid and confirmation)")
+    pm.add_argument("--out", type=Path, default=Path("out/t19/summary"))
+    pm.add_argument("--resolution", type=float, default=0.036, help="R of T1 (default 0.036, M3 calibration)")
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -475,6 +508,53 @@ def cmd_corridor_posthoc(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_policy_sweep(args: argparse.Namespace) -> int:
+    import yaml
+
+    from fraudaudit.data import load_raw
+    from fraudaudit.gate import GateConfig
+    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
+    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.policy_sweep import parse_reaction, policy_sweep, write_markdown
+    from fraudaudit.threat import ThreatModel
+
+    try:
+        if len(args.model) != len(args.label) or len(set(args.label)) != len(args.label):
+            raise ValueError("give one distinct --label per --model")
+        for r in args.reactions:
+            parse_reaction(r)
+        cfg = GateConfig.from_yaml(args.gate)
+        tm = ThreatModel.from_yaml(args.threat)
+        ctm = ThreatModel.from_yaml(args.corridor_threat)  # also for runs without corridor cells: earlier ones may have
+        df = load_raw(args.data)
+        models = [FraudModel.from_artifacts(load_artifacts(m)) for m in args.model]  # SHA-256 before deserialisation
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
+        print(f"error: policy-sweep configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    for mdir, label, model in zip(args.model, args.label, models):
+        data = policy_sweep(df, model, mdir, label, tm, ctm, cfg, fprs=tuple(args.target_fpr),
+                            reactions=tuple(args.reactions), corridors=tuple(args.corridor), esc_fpr=args.esc_fpr,
+                            r19=args.r19, seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out / label,
+                            ensemble=not args.friction_only, friction=not args.no_friction, role=args.role,
+                            threat_path=args.threat, corridor_path=args.corridor_threat,
+                            gate_path=args.gate, log=lambda m: print(m, file=sys.stderr, flush=True))
+        write_markdown(data, args.out / label)
+        print((args.out / label / "policy-sweep.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
+def cmd_policy_summary(args: argparse.Namespace) -> int:
+    from fraudaudit.policy_summary import summarize
+    try:
+        res = summarize(args.sweeps, args.out, resolution=args.resolution)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"error: policy-summary: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print((args.out / "hypotheses.md").read_text(encoding="utf-8"), flush=True)
+    print(json.dumps({"confirmation_plan": res["confirmation_plan"]}, indent=2), flush=True)
+    return 0
+
+
 def _baseline_brief(b: dict | None) -> dict | None:
     """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
     if b is None or "error" in b:
@@ -563,6 +643,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_corridor_sweep(args)
     if args.command == "corridor-posthoc":
         return cmd_corridor_posthoc(args)
+    if args.command == "policy-sweep":
+        return cmd_policy_sweep(args)
+    if args.command == "policy-summary":
+        return cmd_policy_summary(args)
     return 0
 
 
