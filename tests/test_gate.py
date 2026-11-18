@@ -202,10 +202,12 @@ def test_summary_has_dollar_interpretation(base):
     meta = {"gate": dataclasses.asdict(c), "seed": 7, "wall_seconds": 12.3}
     md = summary_markdown(checks, res, meta)
     assert md.splitlines()[0].startswith("# ") and "❌ FAILED" in md.split("\n## ")[0]
-    med = base.meta["median_amount"]
-    x = f"{0.30 * med:.0f}"
-    y = f"{0.05 * med:.0f}"
+    mean_a = base.meta["mean_amount"]  # R32: δ$ = δ · mean A of the targets, not the median
+    assert mean_a == pytest.approx(float(np.mean([t["amount"] for t in base.per_target])))
+    x = f"{0.30 * mean_a:.0f}"
+    y = f"{0.05 * mean_a:.0f}"
     assert f"up to ~{x} $" in md and f"an allowed ~{y} $" in md
+    assert "δ$ = δ · mean A" in md and "median A" in md
     assert ("per compromised card" in md) if base.meta["n_target_cards"] == base.n_targets else ("per episode" in md)
     assert "| es | 1 |" in md and "| random | 1 |" in md and "worst" in md
     assert "Recommendations" in md and "fraudaudit harden" in md and "do not weaken the attack or δ" in md
@@ -358,6 +360,16 @@ def test_nonfinite_uplift_in_a_later_run_fails(base):
     assert "❌ FAILED" in md.split("\n## ")[0]
 
 
+def test_audit_summary_dollars_use_the_mean_amount(base):
+    """R32 p. 7: the dollar line of the audit summary uses the mean A of the targets (the median only as extra)."""
+    from fraudaudit.audit import summary_markdown as audit_md, to_json
+    md = audit_md(to_json(base))
+    mean_a, med = base.meta["mean_amount"], base.meta["median_amount"]
+    assert f"share × mean episode amount A of the targets = {mean_a:.2f} $" in md
+    assert f"median A {med:.2f} $" in md
+    assert f"≈ {base.uplift[0] * mean_a:.0f} $" in md
+
+
 def test_nonfinite_recall_in_a_later_run_fails(base):
     c2 = cfg(attacks=["random"], attack_seeds=[1, 2])
     res = {run_key("random", 1): fake(base, 0.01), run_key("random", 2): fake(base, 0.01, recall=float("nan"))}
@@ -369,7 +381,7 @@ def test_summary_dollar_wording_per_card_or_episode(base):
     c = cfg(attacks=["random"], attack_seeds=[1])
     res = {run_key("random", 1): fake(base, 0.2)}
     md = summary_markdown(decide(c, res, None), res, {})
-    assert "approximately: share × median episode amount" in md
+    assert "approximately: share × mean episode amount A of the targets" in md
     one_per_card = base.meta["n_target_cards"] == base.n_targets
     assert ("per compromised card (one target episode per card)" in md) == one_per_card
     many = dataclasses.replace(res[run_key("random", 1)],
@@ -752,6 +764,8 @@ def test_committed_positive_control_and_seed_gates():
     assert "replay" not in base.attacks and not base.positive_control
     assert "replay" not in GATE_PATH.read_text() and "positive_control" not in GATE_PATH.read_text()
     assert s456 == dataclasses.replace(base, attack_seeds=[4, 5, 6])
+    s49 = GateConfig.from_yaml(ROOT / "gate-seeds-4-9.yaml")  # Task 19b front confirmation (R32)
+    assert s49 == dataclasses.replace(base, attack_seeds=[4, 5, 6, 7, 8, 9])
 
 
 @pytest.mark.parametrize("attacks,pc", [(["replay"], False), (["random", "replay"], True), (["random", "replay"], False),

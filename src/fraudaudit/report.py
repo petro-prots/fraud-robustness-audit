@@ -186,7 +186,7 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     w = results[worst_key]
     wm = w.meta
     conf = int(round(100 * wm["confidence"]))
-    med = float(wm["median_amount"])
+    mean_a = float(wm["mean_amount"])  # δ$ = δ · mean A of the targets (R32)
     w_attack, w_seed = parse_run_key(worst_key)
     delta = up.threshold
     failed = [c for c in checks if not c.passed]
@@ -209,14 +209,15 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               ""]
     per_card = int(wm["n_target_cards"]) == int(w.n_targets)
     unit = ("per compromised card (one target episode per card)" if per_card else "per episode")
-    head = f"In dollars (approximately: share × median episode amount A = {_num(med, 2)} $): "
+    head = (f"In dollars (approximately: share × mean episode amount A of the targets = {_num(mean_a, 2)} $; "
+            f"δ$ = δ · mean A; median A {_num(float(wm['median_amount']), 2)} $ for information): ")
     if up.value is None or not math.isfinite(up.value):
         lines.append(head + "not computed – the VER uplift of the worst run is not finite.")
     elif delta is not None:
-        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * med, 0)} $ {unit} against an allowed "
-                     f"~{_num(delta * med, 0)} $.")
+        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * mean_a, 0)} $ {unit} against an "
+                     f"allowed ~{_num(delta * mean_a, 0)} $.")
     else:
-        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * med, 0)} $ {unit}; the allowed "
+        lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * mean_a, 0)} $ {unit}; the allowed "
                      "amount is not set.")
     lines += ["", "## Checks", "", "| check | value | threshold | result |", "|---|---:|---|---|"]
     for c in checks:

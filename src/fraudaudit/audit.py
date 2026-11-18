@@ -439,6 +439,7 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
         "n_ver_adv_gt_1": int((v_adv > 1).sum()), "max_ver_adv": float(v_adv.max()),
         "n_ver_clean_gt_1": int((v_clean > 1).sum()), "max_ver_clean": float(v_clean.max()),
         "median_amount": float(np.median([t["amount"] for t in per_target])),
+        "mean_amount": float(np.mean([t["amount"] for t in per_target])),
         **(extra_meta or {}),
     }
     if tm.corridor is not None:
@@ -784,7 +785,7 @@ def summary_markdown(data: dict) -> str:
     """English Markdown summary of ``to_json`` output (no verdict: the gate is a later step)."""
     m, b = data["meta"], data["best"]
     va, vc, up = data["ver_adv"], data["ver_clean"], data["uplift"]
-    med = m["median_amount"]
+    mean_a = m["mean_amount"]  # δ$ = δ · mean A of the targets (R32); the median is printed as extra information
     conf = int(round(100 * m["confidence"]))
     lines = [
         "# Episode-attack robustness audit (minimal)",
@@ -814,10 +815,11 @@ def summary_markdown(data: dict) -> str:
         "from the card state before the episode begins, so VER_clean is a replay of the fraud operations "
         "only, not the bank's historical outcome.",
         "",
-        f"- Uplift in dollars (approximately: share × median episode amount A = {_num(med, 2)} $): "
-        f"≈ {_num(up['mean'] * med, 0)} $ "
-        + (f"(one-sided upper bound {_num(up['upper'] * med, 0)} $)" if m.get("one_sided") else
-           f"[{_num(up['lower'] * med, 0)}; {_num(up['upper'] * med, 0)}]")
+        f"- Uplift in dollars (approximately: share × mean episode amount A of the targets = {_num(mean_a, 2)} $; "
+        f"median A {_num(m['median_amount'], 2)} $): "
+        f"≈ {_num(up['mean'] * mean_a, 0)} $ "
+        + (f"(one-sided upper bound {_num(up['upper'] * mean_a, 0)} $)" if m.get("one_sided") else
+           f"[{_num(up['lower'] * mean_a, 0)}; {_num(up['upper'] * mean_a, 0)}]")
         + " per episode.",
         f"- VER > 1 (because of the lower bound of the operation amount): adversarial episodes {m['n_ver_adv_gt_1']} "
         f"(max VER_adv {_num(m['max_ver_adv'])}), real {m['n_ver_clean_gt_1']} "

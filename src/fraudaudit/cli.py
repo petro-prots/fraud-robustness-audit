@@ -142,6 +142,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma-separated bank reactions md<N> | mdinf, optionally +esc (default md1,md3,md3+esc)")
     ps.add_argument("--esc-fpr", type=float, default=0.05, help="val FPR of the escalation threshold (default 0.05)")
     ps.add_argument("--corridor", type=_names, default=["off", "on"], help="comma-separated off,on (default both)")
+    ps.add_argument("--corridor-kappa", type=_deltas, default=None,
+                    help="comma-separated kappa of the V1 daily split for the corridor-on cells (Task 19b variants; "
+                         "default: the corridor threat file's)")
+    ps.add_argument("--corridor-q", type=_deltas, default=None,
+                    help="comma-separated corridor quantiles q for the corridor-on cells (default: the file's)")
     ps.add_argument("--r19", action="store_true", help="also the R19 cells md2 and mdinf at the own tau, corridor off")
     ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
                     help="confirmation: a T2 confirmation run with fresh seeds (--gate gate-seeds-456.yaml)")
@@ -157,6 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("sweeps", type=Path, nargs="+", help="policy-sweep.json files (grid and confirmation)")
     pm.add_argument("--out", type=Path, default=Path("out/t19/summary"))
     pm.add_argument("--resolution", type=float, default=0.036, help="R of T1 (default 0.036, M3 calibration)")
+    pm.add_argument("--confirm-rule", choices=["t2", "front"], default="t2",
+                    help="t2: Task 19 green-cell confirmation plan (confirmations.tsv); front: Task 19b – the Pareto "
+                         "front confirmed on fresh seeds, margin X, risk-appetite curve (confirmations-front.tsv)")
+    pm.add_argument("--merge-commits", type=_names, default=None,
+                    help="comma-separated git SHAs whose cells may be merged (Task 19 + Task 19b after the "
+                         "reproduction check); default: one commit only")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -526,6 +537,11 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
         ctm = ThreatModel.from_yaml(args.corridor_threat)  # also for runs without corridor cells: earlier ones may have
+        if args.corridor_kappa or args.corridor_q:
+            from fraudaudit.policy_sweep import corridor_variants
+            if "on" not in args.corridor or ctm.corridor is None:
+                raise ValueError("--corridor-kappa / --corridor-q need --corridor on and a corridor threat model")
+            corridor_variants(ctm.corridor, args.corridor_kappa, args.corridor_q)
         df = load_raw(args.data)
         models = [FraudModel.from_artifacts(load_artifacts(m)) for m in args.model]  # SHA-256 before deserialisation
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
@@ -533,7 +549,8 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
         return 2
     for mdir, label, model in zip(args.model, args.label, models):
         data = policy_sweep(df, model, mdir, label, tm, ctm, cfg, fprs=tuple(args.target_fpr),
-                            reactions=tuple(args.reactions), corridors=tuple(args.corridor), esc_fpr=args.esc_fpr,
+                            reactions=tuple(args.reactions), corridors=tuple(args.corridor),
+                            kappas=args.corridor_kappa, qs=args.corridor_q, esc_fpr=args.esc_fpr,
                             r19=args.r19, seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out / label,
                             ensemble=not args.friction_only, friction=not args.no_friction, role=args.role,
                             threat_path=args.threat, corridor_path=args.corridor_threat,
@@ -546,7 +563,8 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
 def cmd_policy_summary(args: argparse.Namespace) -> int:
     from fraudaudit.policy_summary import summarize
     try:
-        res = summarize(args.sweeps, args.out, resolution=args.resolution)
+        res = summarize(args.sweeps, args.out, resolution=args.resolution, confirm_rule=args.confirm_rule,
+                        merge_commits=args.merge_commits)
     except (OSError, ValueError, KeyError) as e:
         print(f"error: policy-summary: {type(e).__name__}: {e}", file=sys.stderr)
         return 2

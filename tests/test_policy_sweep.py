@@ -88,10 +88,10 @@ def test_policy_vs_model_toy():
     # softest (0.005, md3, off) U 0.6; strictest (0.02, md1, on) U 0.6 − 0.10 − 0.01 = 0.49
     assert res["policy_span"]["a"] == pytest.approx(0.11) and res["policy_span"]["b"] == pytest.approx(0.11)
     assert res["median_model_span"] == pytest.approx(0.02) and res["median_seed_spread"] == pytest.approx(0.02)
-    assert res["verdict"] == "supported" and res["interaction"] == "none"
+    assert res["verdict"] == "supported" and "interaction" not in res  # R32: described in its own table, no verdict
     flat = toy_grid(tau_step=0.0, corr_step=0.0, esc_step=0.0)
     res2 = ps.policy_vs_model({"a": a, "flat": flat}, resolution=0.036)
-    assert res2["policy_span"]["flat"] == pytest.approx(0.0) and "only on a" in res2["interaction"]
+    assert res2["policy_span"]["flat"] == pytest.approx(0.0) and res2["policy_span"]["a"] == pytest.approx(0.11)
 
 
 def test_t2_pick_and_confirmation():
@@ -189,7 +189,9 @@ def sweep(env, tmp_path_factory):
 CELL_KEYS = {"key", "config_hash", "target_fpr", "tau", "reaction", "max_declines", "tau_after_decline", "corridor",
              "runs", "worst_run", "worst_uplift_upper", "mean_uplift", "max_ver_adv", "test_recall", "test_fpr",
              "amounts", "targets", "U", "U_usd", "worst_run_usd", "worst_usd_uplift_upper", "wall_seconds",
-             "ensemble_seconds", "friction", "provenance"}
+             "ensemble_seconds", "friction", "provenance", "corridor_kappa", "corridor_q", "corridor_params",
+             "corridor_params_sha256", "n_corridor_runs", "n_bound_violations", "n_headroom_violations",
+             "n_block_violations"}
 
 
 def test_policy_sweep_cell_schema(env, sweep):
@@ -314,6 +316,21 @@ def test_cli_policy_sweep_parser():
     assert str(a.corridor_threat).endswith("realistic-corridor-v1v2.yaml")
     with pytest.raises(SystemExit):
         build_parser().parse_args(["policy-sweep", "--model", "m", "--label", "l", "--no-friction", "--friction-only"])
+    assert a.corridor_kappa is None and a.corridor_q is None
+    v = build_parser().parse_args(["policy-sweep", "--model", "m", "--label", "l", "--corridor-kappa", "1.25,1.5",
+                                   "--corridor-q", "0.98,0.99"])
+    assert v.corridor_kappa == [1.25, 1.5] and v.corridor_q == [0.98, 0.99]
+    sm = build_parser().parse_args(["policy-summary", "x.json", "--confirm-rule", "front", "--merge-commits",
+                                    "abc1234,def5678"])
+    assert sm.confirm_rule == "front" and sm.merge_commits == ["abc1234", "def5678"]
+    assert build_parser().parse_args(["policy-summary", "x.json"]).confirm_rule == "t2"
+
+
+def test_cli_policy_sweep_refuses_variants_without_corridor_on(capsys):
+    from fraudaudit.cli import main
+    code = main(["policy-sweep", "--model", "models", "--label", "x", "--corridor", "off", "--corridor-kappa", "1.5",
+                 "--data", "/nonexistent"])
+    assert code == 2 and "need --corridor on" in capsys.readouterr().err
 
 
 # ---- review fixes: wiring of the cell policy, provenance ---------------------------------------------------------
@@ -391,3 +408,379 @@ def test_summary_refuses_mixed_provenance(sweep, tmp_path):
     p2.write_text(json.dumps(other))
     with pytest.raises(ValueError, match="more than one code version"):
         ps.summarize([out / "m" / "policy-sweep.json", p2], tmp_path / "s")
+
+
+# ---- Task 19b: corridor strength, merge, front confirmation, margin X, risk-appetite curve (R32) -----------------
+
+FILE_KQ = (2.0, 0.99)
+
+
+def _cp(kappa, q):
+    return {"q": q, "daily": {"mode": "weekly_split", "kappa": kappa}, "confirmed_extends": True}
+
+
+def _ccell(fpr, reaction, corridor, U, fb, cf, kappa=None, q=None, runs=None):
+    """A toy cell in the normalised form of policy_summary (corridor κ / q, variant flag, cards ever blocked)."""
+    var = None if corridor == "off" or (kappa, q) == FILE_KQ else (kappa, q)
+    c = _cell(fpr, reaction, corridor, U, fb, cf, runs)
+    c["key"] = cell_key(fpr, reaction, corridor, var)
+    c["friction"]["share_blocked_cards"] = min(1.0, 2 * fb)
+    c["U_usd"] = 1000 * U
+    c.update(corridor_kappa=kappa if corridor == "on" else None, corridor_q=q if corridor == "on" else None,
+             corridor_variant=var is not None)
+    if reaction in ("md2", "mdinf"):
+        c["max_declines"] = None if reaction == "mdinf" else 2
+    return c
+
+
+def test_cell_key_of_the_file_variant_is_todays_key():
+    from fraudaudit.policy_sweep import corridor_variants, variant_id
+    ctm = ThreatModel.from_yaml(TM_V1V2)
+    assert variant_id(ctm.corridor, 2, 0.99) is None and variant_id(ctm.corridor, 1.5, 0.99) == (1.5, 0.99)
+    assert cell_key(0.01, "md3", "on", None) == "fpr=0.01|md3|corridor=on"
+    assert cell_key(0.01, "md3", "on", (1.25, 0.98)) == "fpr=0.01|md3|corridor=on|kappa=1.25|q=0.98"
+    assert corridor_variants(ctm.corridor, [1.25, 1.5], [0.98, 0.99]) == [(1.25, 0.98), (1.25, 0.99), (1.5, 0.98),
+                                                                          (1.5, 0.99)]
+    assert corridor_variants(ctm.corridor) == [(2.0, 0.99)]
+    with pytest.raises(ValueError, match="weekly_split"):
+        corridor_variants(dataclasses.replace(ctm.corridor, daily_mode="quantile", kappa=None), [1.5], None)
+
+
+def test_t1_corridor_strength_pairs_only_existing():
+    """κ axis: q 0.99: κ 2 → 1.5, 1.5 → 1.25; q 0.98: 1.5 → 1.25 (κ 2 / q 0.98 absent) – 3 × 2 reactions; q axis:
+    0.99 → 0.98 at κ 1.5 and 1.25 – 2 × 2. Other τ have only the file's corridor: no pairs there."""
+    levels = (1.25, 1.5, 2.0)
+    cells = []
+    for f in (0.005, 0.01, 0.02):
+        for r in ("md1", "md3", "md3+esc"):
+            cells.append(_ccell(f, r, "off", 0.6, 0.1, 0.0))
+            cells.append(_ccell(f, r, "on", 0.2 + 0.08 * 2 + 0.05, 0.1, 0.06, *FILE_KQ))
+    for r in ("md3", "md3+esc"):
+        for k in (1.25, 1.5):
+            for q in (0.98, 0.99):
+                U = 0.2 + 0.08 * levels.index(k) + (0.05 if q == 0.99 else 0)
+                cf = 0.1 - 0.02 * levels.index(k) - (0.01 if q == 0.99 else 0)
+                cells.append(_ccell(0.01, r, "on", U, 0.1, cf, k, q))
+    res = ps.t1({"a": {"cells": cells}}, resolution=0.036)
+    assert res["kappa"]["a"]["n_pairs"] == 6 and res["q"]["a"]["n_pairs"] == 4
+    assert res["kappa"]["a"]["median_dU"] == pytest.approx(-0.08) and res["kappa"]["a"]["verdict"] == "supported"
+    assert res["q"]["a"]["median_dU"] == pytest.approx(-0.05) and res["q"]["a"]["verdict"] == "supported"
+    assert res["kappa"]["a"]["median_dfriction"] == pytest.approx(0.02)
+    pairs = ps.variant_pairs(cells, "kappa")
+    assert {(w["corridor_kappa"], w["corridor_q"], s["corridor_kappa"]) for w, s in pairs} == {
+        (2.0, 0.99, 1.5), (1.5, 0.99, 1.25), (1.5, 0.98, 1.25)}
+    # the Task 19 axes still see exactly the 18 cells with the file's corridor
+    assert res["corridor"]["a"]["n_pairs"] == 9
+    assert "kappa" not in ps.t1({"a": toy_grid()})  # no variants: Task 19 output unchanged
+
+
+def test_front_toy_strict_dominance_ties_kept_r19_excluded():
+    cells = [_ccell(0.01, "md3", "off", 0.30, 0.10, 0.0),  # A front
+             _ccell(0.02, "md3", "off", 0.20, 0.20, 0.0),  # B front
+             _ccell(0.02, "md3", "on", 0.20, 0.20, 0.05, *FILE_KQ),  # C: exact tie with B, kept
+             _ccell(0.02, "md3+esc", "off", 0.25, 0.20, 0.0),  # D dominated by B
+             _ccell(0.02, "md1", "off", 0.30, 0.30, 0.0),  # E dominated
+             _ccell(0.01, "md2", "off", 0.05, 0.0, 0.0), _ccell(0.01, "mdinf", "off", 0.01, 0.0, 0.0)]  # R19: out
+    front = ps.front_cells({"label": "a", "cells": cells})
+    assert {c["key"] for c in front} == {cells[0]["key"], cells[1]["key"], cells[2]["key"]}
+
+
+def _conf_runs(u_s: dict, attacks=("es", "random", "stepwise")) -> dict:
+    """Runs whose per-seed max over the attacks is ``u_s[seed]`` (the other attacks below it)."""
+    runs = {}
+    for sd, u in u_s.items():
+        for i, a in enumerate(attacks):
+            runs[f"{a}/{sd}"] = {"uplift_upper": u - 0.01 * i}
+    return runs
+
+
+def test_confirmation_stats_and_margin():
+    u_s = {4: 0.10, 5: 0.12, 6: 0.08, 7: 0.15, 8: 0.11, 9: 0.09}
+    st = ps.confirmation_stats({"key": "k", "runs": _conf_runs(u_s)}, 0.12, ["es", "random", "stepwise"])
+    assert st["U_s"] == {str(k): pytest.approx(v) for k, v in u_s.items()} and st["n_runs"] == 18
+    assert st["median"] == pytest.approx(0.105) and st["worst"] == pytest.approx(0.15)
+    assert st["x_c"] == pytest.approx(0.03) and len(st["run_upper"]) == 18
+    with pytest.raises(ValueError, match="every attack"):
+        ps.confirmation_stats({"key": "k", "runs": _conf_runs(u_s, ("es", "random"))}, 0.1, ["es", "random", "stepwise"])
+    m = ps.margin({"a": [0.03, -0.01], "b": [0.05], "c": []})
+    assert m["X"] == pytest.approx(0.05) and m["p90"] == pytest.approx(0.046) and m["n_confirmed"] == 3
+    assert m["per_model"] == {"a": pytest.approx(0.03), "b": pytest.approx(0.05), "c": None}
+    assert ps.margin({"a": []})["X"] is None
+
+
+def test_passing_rule_boundaries():
+    assert ps.passes(0.10, 0.14, 0.10)  # median = δ′ and worst = δ′ + 0.04 pass
+    assert not ps.passes(0.10 + 1e-6, 0.12, 0.10) and not ps.passes(0.09, 0.14 + 1e-6, 0.10)
+    for d in ps.DELTA_PRIMES:  # the boundary holds for every δ′ despite binary floats (0.30 + 0.04 < 0.34)
+        assert ps.passes(d, round(d + 0.04, 2), d) and not ps.passes(d, round(d + 0.04, 2) + 1e-6, d)
+    assert len(ps.DELTA_PRIMES) == 43 and ps.DELTA_PRIMES[0] == 0.08 and ps.DELTA_PRIMES[-1] == 0.5
+
+
+def _toy_19b():
+    """A model whose front is c1 (md1), c2 (md3+esc, corridor κ 1.25), c3 (md3, off); c4 dominated by c2. c1 and c2
+    are confirmed on seeds 4–9, c3 is pending."""
+    c1 = _ccell(0.02, "md1", "off", 0.08, 0.40, 0.0)
+    c2 = _ccell(0.01, "md3+esc", "on", 0.12, 0.10, 0.07, 1.25, 0.98)
+    c3 = _ccell(0.005, "md3", "off", 0.30, 0.05, 0.0)
+    c4 = _ccell(0.01, "md3", "on", 0.15, 0.10, 0.06, 1.25, 0.98)
+    gate = {"delta": 0.1, "attack_seeds": [1, 2, 3], "attacks": ["es", "random", "stepwise"]}
+    grid = {"label": "a", "model_dir": "m", "model_json_sha256": "sha", "gate": gate, "cells": [c1, c2, c3, c4]}
+    conf = {"label": "a", "model_json_sha256": "sha", "gate": dict(gate, attack_seeds=[4, 5, 6, 7, 8, 9]),
+            "cells": [dict(c1, runs=_conf_runs({s: 0.09 for s in range(4, 10)})),
+                      dict(c2, runs=_conf_runs(dict(zip(range(4, 10), (0.12, 0.13, 0.14, 0.15, 0.16, 0.20)))))]}
+    return grid, conf, (c1, c2, c3, c4)
+
+
+def test_front_analysis_and_appetite_curve():
+    grid, conf, (c1, c2, c3, c4) = _toy_19b()
+    fa = ps.front_analysis({"a": grid}, {"a": conf})
+    rows = {r["key"]: r for r in fa["front"]["a"]}
+    assert set(rows) == {c1["key"], c2["key"], c3["key"]}
+    assert rows[c2["key"]]["confirmation"]["median"] == pytest.approx(0.145)
+    assert rows[c2["key"]]["confirmation"]["x_c"] == pytest.approx(0.08)
+    assert rows[c3["key"]]["confirmation"] is None and rows[c1["key"]]["md1"]
+    assert fa["margin"]["X"] == pytest.approx(0.08)
+    assert [p["key"] for p in fa["plan"]] == [c3["key"]] and fa["plan"][0]["kappa"] is None
+    app = {round(e["delta"], 2): e for e in ps.appetite(fa["front"], {"a": grid}, fa["margin"]["X"])["a"]}
+    key = lambda e: None if e is None else e["key"]  # noqa: E731
+    assert key(app[0.08]["A_with_md1"]) is None  # nothing passes: «none»
+    assert key(app[0.09]["A_with_md1"]) == c1["key"] and key(app[0.09]["A_without_md1"]) is None  # md1 excluded
+    assert key(app[0.15]["A_without_md1"]) is None  # c2: median 14.5 % ≤ 15 % but worst 20 % > 19 %
+    assert key(app[0.16]["A_with_md1"]) == c2["key"] == key(app[0.16]["A_without_md1"])  # fewer false blocks than c1
+    assert app[0.16]["A_with_md1"]["median"] == pytest.approx(0.145)
+    assert key(app[0.16]["B_with_md1"]) == c1["key"] and key(app[0.16]["B_without_md1"]) is None  # U ≤ 0.08
+    assert key(app[0.20]["B_with_md1"]) == c2["key"]  # U ≤ 0.12: c2 is cheaper than c1
+    assert key(app[0.38]["B_without_md1"]) == c3["key"]  # U ≤ 0.30: c3 has the fewest false blocks
+    none_x = ps.appetite(fa["front"], {"a": grid}, None)["a"][0]
+    assert none_x["B_with_md1"] is None and none_x["B_without_md1"] is None
+    md = ps.appetite_markdown({"appetite": {"a": list(app.values())}, "margin": fa["margin"], "delta": 0.1})
+    assert "gate δ = 10 %" in md and ps.MD1_NOTE in md and "| none |" in md
+
+
+def test_confirmation_must_match_the_corridor_variant():
+    grid, conf, (c1, c2, c3, c4) = _toy_19b()
+    bad = dict(conf, cells=[dict(c2, corridor_kappa=1.5, runs=conf["cells"][1]["runs"])])
+    with pytest.raises(ValueError, match="corridor_kappa"):
+        ps.front_analysis({"a": grid}, {"a": bad})
+
+
+def _sweep_file(label, cells, *, sha="m", own_tau=0.9, gate_sha="g", threat_sha="t", ctm_sha="c", git="abc1234567",
+                cp=None):
+    for c in cells:
+        c["provenance"] = {"git_sha": git, "git_dirty": False, "host_machine": "box"}
+    return {"label": label, "role": "grid", "model_dir": "m", "model_json_sha256": sha, "own_target_fpr": 0.01,
+            "own_tau": own_tau, "esc_fpr": 0.05, "tau_esc": 0.1, "seed": 42, "taus": {"0.01": own_tau},
+            "gate": {"delta": 0.1, "attack_seeds": [1], "attacks": ["es"]}, "corridor_params": cp or _cp(*FILE_KQ),
+            "mean_amount": 100.0, "cells": cells, "friction": {"false_blocks": {}, "burden": {}},
+            "meta": {"gate_sha256": gate_sha, "threat_sha256": threat_sha, "corridor_threat_sha256": ctm_sha,
+                     "git_sha": git}}
+
+
+def test_merge_task19_and_19b_sweeps_and_refusals():
+    old = [_cell(0.01, "md3", "on", 0.2, 0.1, 0.05), _cell(0.01, "md3", "off", 0.3, 0.1, 0.0)]  # Task 19 records
+    new = [dict(_cell(0.01, "md3", "on", 0.15, 0.1, 0.07), key=cell_key(0.01, "md3", "on", (1.25, 0.98)),
+                corridor_params=_cp(1.25, 0.98), corridor_kappa=1.25, corridor_q=0.98)]
+    a = ps.normalize(_sweep_file("x", old), "t19.json")
+    b = ps.normalize(_sweep_file("x", new, git="def7654321"), "t19b.json")
+    on = next(c for c in a["cells"] if c["corridor"] == "on")
+    assert (on["corridor_kappa"], on["corridor_q"], on["corridor_variant"]) == (2.0, 0.99, False)
+    m = ps.merge_sweeps([a, b])
+    assert len(m["cells"]) == 3 and sum(c["corridor_variant"] for c in m["cells"]) == 1
+    assert [x["file"] for x in m["sources"]] == ["t19.json", "t19b.json"]
+    for kw, what in (({"sha": "other"}, "model_json_sha256"), ({"own_tau": 0.8}, "own_tau"),
+                     ({"gate_sha": "g2"}, "gate_sha256"), ({"threat_sha": "t2"}, "threat_sha256"),
+                     ({"ctm_sha": "c2"}, "corridor_threat_sha256"), ({"cp": _cp(2.0, 0.98)}, "corridor_params")):
+        bad = ps.normalize(_sweep_file("x", json.loads(json.dumps(new)), **kw), "bad.json")
+        with pytest.raises(ValueError, match=f"refusing to merge.*{what}"):
+            ps.merge_sweeps([a, bad])
+    with pytest.raises(ValueError, match="more than one file"):
+        ps.merge_sweeps([a, ps.normalize(_sweep_file("x", json.loads(json.dumps(old))), "dup.json")])
+    # two commits only when both are named
+    prov = ps.provenances([m])
+    assert {p["git_sha"] for p in prov} == {"abc1234567", "def7654321"}
+    with pytest.raises(ValueError, match="more than one code version"):
+        ps.check_provenance(prov)
+    with pytest.raises(ValueError, match="more than one code version"):
+        ps.check_provenance(prov, ["abc1234"])
+    ps.check_provenance(prov, ["abc1234", "def7654321"])
+    with pytest.raises(ValueError, match="more than one code version"):  # a dirty tree is never merged
+        ps.check_provenance([dict(prov[0], git_dirty=True)], ["abc1234"])
+
+
+def test_interaction_table_toy():
+    base, hard = toy_grid(), toy_grid(tau_step=-0.02)
+    t1_res = ps.t1({"m3-base": base, "m3-hard": hard, "solo": toy_grid()})
+    it = ps.interaction_table(t1_res, {"m3-base": base, "m3-hard": hard, "solo": toy_grid()})
+    assert it["families"] == {"m3": ["m3-base", "m3-hard"]}
+    tau = next(r for r in it["rows"] if r["axis"] == "tau")
+    assert tau["median_dU_base"] == pytest.approx(-0.05) and tau["median_dU_hardened"] == pytest.approx(-0.02)
+    assert tau["difference"] == pytest.approx(0.03)
+    assert (tau["verdict_base"], tau["verdict_hardened"]) == ("supported", "inconclusive")
+    assert len(it["rows"]) == len(ps.AXES)
+    ratios = [(c["U"] - 0.01) / c["U"] for c in base["cells"] if c["corridor"] == "off"]
+    e = it["corridor_relative_effect"]["m3-base"]
+    assert e["n_pairs"] == 9 and e["median_ratio"] == pytest.approx(float(np.median(ratios))) and e["n_skipped"] == 0
+    md = "\n".join(ps.interaction_markdown(it))
+    assert "Descriptive only" in md and "supported" in md and "interaction: none" not in md
+
+
+def test_violation_counts_from_run_meta():
+    from types import SimpleNamespace
+
+    from fraudaudit.policy_sweep import violation_counts
+    runs = {"es/1": SimpleNamespace(meta={"corridor": {"n_bound_violations": 1, "n_headroom_violations": 2,
+                                                       "n_block_violations": 0}}),
+            "es/2": SimpleNamespace(meta={"corridor": {"n_bound_violations": 0, "n_headroom_violations": 1}})}
+    assert violation_counts(runs, True) == {"n_corridor_runs": 2, "n_bound_violations": 1, "n_headroom_violations": 3,
+                                            "n_block_violations": 0}
+    assert violation_counts(runs, False)["n_corridor_runs"] == 0
+    with pytest.raises(RuntimeError):
+        violation_counts({"es/1": SimpleNamespace(meta={})}, True)
+    cells = [dict(_cell(0.01, "md3", "on", 0.1, 0.1, 0.1), n_corridor_runs=9, n_bound_violations=1,
+                  n_headroom_violations=0, n_block_violations=2), _cell(0.01, "md1", "on", 0.1, 0.1, 0.1),
+             dict(_cell(0.01, "md3", "off", 0.1, 0.1, 0.0), n_corridor_runs=0, n_bound_violations=None)]
+    v = ps.violation_totals([{"cells": cells}])
+    assert (v["n_cells"], v["n_corridor_runs"], v["n_bound_violations"], v["n_block_violations"]) == (1, 9, 1, 2)
+    assert v["n_on_cells_without_counters"] == 1 and v["any"]
+    line = ps.violations_line(v)
+    assert line.startswith("**1 violations of the corridor bound in 9 corridor runs") and "not recomputed" in line
+
+
+def test_r19_reports_the_difference_in_pp():
+    r = ps.rel_overestimation(np.array([0.3, 0.5, 0.7]), np.array([0.2, 0.4, 0.6]))
+    assert r["diff"] == pytest.approx(0.1) and r["diff_lower"] == pytest.approx(0.1) == r["diff_upper"]
+    md = ps.r19_markdown({"m2-base": {"adv_es": {"md1": r}}})
+    assert "10.00 [10.00; 10.00]" in md and "Spearman" in md and "Task 24" in md
+
+
+@pytest.fixture(scope="module")
+def vsweep(env, tmp_path_factory):
+    """Two corridor-variant cells (κ 1.25 / 1.5, q 0.98) at the own τ, md3, run with a spy on run_cell."""
+    from fraudaudit import policy_sweep as mod
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    out = tmp_path_factory.mktemp("vsweep")
+    seen, real = [], mod.run_cell
+
+    def spy(df_, mdl, mdir, tm_c, *a, **k):
+        c = tm_c.corridor
+        seen.append({"kappa": c.kappa, "q": c.q, "floor_q": c.floor_fit.q, "split": c.split is not None,
+                     "extends": c.confirmed_extends, "lookback": c.lookback_days, "md": tm_c.max_declines,
+                     "public": c.public()})
+        return real(df_, mdl, mdir, tm_c, *a, **k)
+
+    mod.run_cell = spy
+    try:
+        data = mod.policy_sweep(df, model, d, "m", dataclasses.replace(tm, max_declines=7), ctm, g, fprs=(0.01,),
+                                reactions=("md3",), corridors=("on",), kappas=(1.25, 1.5), qs=(0.98,), esc_fpr=0.2,
+                                seed=1, n_jobs=1, out_dir=out / "m")
+    finally:
+        mod.run_cell = real
+    return data, out, seen
+
+
+def test_corridor_variant_reaches_the_cell(env, vsweep):
+    from fraudaudit.policy_sweep import params_sha256
+    data, _, seen = vsweep
+    _, ctm, _ = _setup(env)
+    assert sorted((s["kappa"], s["q"], s["floor_q"]) for s in seen) == [(1.25, 0.98, 0.98), (1.5, 0.98, 0.98)]
+    assert all(s["split"] and s["extends"] and s["lookback"] == 60 and s["md"] == 3 for s in seen)
+    assert {c["key"] for c in data["cells"]} == {cell_key(0.01, "md3", "on", (1.25, 0.98)),
+                                                 cell_key(0.01, "md3", "on", (1.5, 0.98))}
+    pub = {json.dumps(s["public"], sort_keys=True) for s in seen}
+    for c in data["cells"]:
+        assert set(c) == CELL_KEYS
+        assert json.dumps(c["corridor_params"], sort_keys=True) in pub
+        assert c["corridor_params_sha256"] == params_sha256(c["corridor_params"])
+        assert (c["corridor_kappa"], c["corridor_q"]) == (c["corridor_params"]["daily"]["kappa"], 0.98)
+        assert c["n_corridor_runs"] == len(c["runs"]) and isinstance(c["n_bound_violations"], int)
+        assert c["friction"]["share_confirm_card_days"] >= 0  # the burden of the variant's own corridor
+    # every other corridor parameter as in the file; the file's own corridor stays the sweep-level one
+    other = {k: v for k, v in seen[0]["public"].items() if k not in ("q", "daily")}
+    assert other == {k: v for k, v in data["corridor_params"].items() if k not in ("q", "daily")}
+    assert data["corridor_params"]["q"] == ctm.corridor.q
+    assert len(data["friction"]["burden"]) == 2  # one burden entry per variant
+
+
+def test_corridor_variant_n_jobs_identical(env, vsweep, tmp_path):
+    from fraudaudit.policy_sweep import policy_sweep
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    data, _, _ = vsweep
+    par = policy_sweep(df, model, d, "m", tm, ctm, g, fprs=(0.01,), reactions=("md3",), corridors=("on",),
+                       kappas=(1.25,), qs=(0.98,), esc_fpr=0.2, seed=1, n_jobs=2, out_dir=tmp_path / "p")
+    a = next(c for c in data["cells"] if c["key"] == cell_key(0.01, "md3", "on", (1.25, 0.98)))
+    b = par["cells"][0]
+    for k in ("key", "config_hash", "U", "U_usd", "runs", "friction", "corridor_params", "n_bound_violations",
+              "n_headroom_violations", "n_block_violations"):
+        assert a[k] == b[k], k
+
+
+def test_task19_records_resume_without_variant_fields(env, sweep, monkeypatch, tmp_path):
+    """Records of Task 19 (no κ / q / violation fields) are skipped by a rerun with the same grid – with or without
+    an explicit file variant – and their friction is reused."""
+    from fraudaudit import policy_sweep as mod
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    _, out = sweep
+    raw = json.loads((out / "m" / "policy-sweep.json").read_text())
+    for c in raw["cells"]:
+        for k in ("corridor_kappa", "corridor_q", "corridor_params", "corridor_params_sha256", "n_corridor_runs",
+                  "n_bound_violations", "n_headroom_violations", "n_block_violations"):
+            c.pop(k)
+    (tmp_path / "m").mkdir()
+    (tmp_path / "m" / "policy-sweep.json").write_text(json.dumps(raw))
+    import shutil
+    shutil.copy(out / "m" / mod.SCORES_FILE, tmp_path / "m" / mod.SCORES_FILE)
+    calls = []
+    real = mod.run_cell
+    monkeypatch.setattr(mod, "run_cell", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    for kw in ({}, {"kappas": (ctm.corridor.kappa,), "qs": (ctm.corridor.q,)}):
+        again = mod.policy_sweep(df, model, d, "m", tm, ctm, g, fprs=(0.01, 0.05), reactions=("md1", "md3+esc"),
+                                 corridors=("off", "on"), esc_fpr=0.2, r19=True, seed=1, n_jobs=1,
+                                 out_dir=tmp_path / "m", **kw)
+        assert calls == [] and {c["key"] for c in again["cells"]} == {c["key"] for c in raw["cells"]}
+        assert all(c["friction"] is not None for c in again["cells"])
+    assert mod.sweep_markdown(again)  # renders old records (no counters: n/a)
+
+
+def test_policy_summary_front_mode_end_to_end(env, sweep, vsweep, tmp_path):
+    """Task 19-like and Task 19b-like files of one label merged; the front confirmed by a confirmation file; every
+    Task 19b output written."""
+    from fraudaudit.cli import main
+    _, out0 = sweep
+    _, outv, _ = vsweep
+    first = main(["policy-summary", str(out0 / "m" / "policy-sweep.json"), str(outv / "m" / "policy-sweep.json"),
+                  "--out", str(tmp_path / "s0"), "--confirm-rule", "front"])
+    assert first == 0
+    plan = (tmp_path / "s0" / "confirmations-front.tsv").read_text().splitlines()
+    front = json.loads((tmp_path / "s0" / "front.json").read_text())
+    assert len(plan) == len(front["front"]["m"]) >= 1 and front["margin"]["X"] is None
+    for line in plan:
+        f = line.split("\t")
+        assert len(f) == 8 and f[0] == "m" and (f[5] == "-") == (f[4] == "off")
+    # a confirmation file for every front cell (fabricated runs on seed 2, disjoint from the grid's seed 1)
+    grid = {c["key"]: c for p in (out0, outv) for c in json.loads((p / "m" / "policy-sweep.json").read_text())["cells"]}
+    conf = json.loads((outv / "m" / "policy-sweep.json").read_text())
+    conf["role"], conf["gate"] = "confirmation", dict(conf["gate"], attack_seeds=[2])
+    conf["cells"] = [dict(grid[ln.split("\t")[7]], runs={k.replace("/1", "/2"): dict(r, uplift_upper=r["uplift_upper"]
+                                                                                       + 0.01)
+                                                         for k, r in grid[ln.split("\t")[7]]["runs"].items()})
+                     for ln in plan]
+    pc = tmp_path / "conf.json"
+    pc.write_text(json.dumps(conf))
+    code = main(["policy-summary", str(out0 / "m" / "policy-sweep.json"), str(outv / "m" / "policy-sweep.json"),
+                 str(pc), "--out", str(tmp_path / "s"), "--confirm-rule", "front"])
+    assert code == 0
+    s = tmp_path / "s"
+    for name in ("hypotheses.md", "summary.json", "front.md", "front.json", "appetite.md", "appetite.json",
+                 "appetite.png", "front-blocks.png", "front-confirm.png"):
+        assert (s / name).stat().st_size > 0, name
+    assert (s / "confirmations-front.tsv").read_text() == ""
+    res = json.loads((s / "summary.json").read_text())
+    assert res["margin"]["X"] is not None and res["margin"]["n_confirmed"] == len(plan)
+    assert "kappa" in res["t1"] and "t2" not in res and len(res["appetite"]["m"]) == 43
+    n_on = sum(c["corridor"] == "on" for c in [*grid.values(), *conf["cells"]])
+    assert res["violations"]["n_cells"] == n_on and res["violations"]["n_corridor_runs"] == 2 * n_on
+    md = (s / "hypotheses.md").read_text()
+    assert "Task 19b" in md and "corridor runs" in md and "Descriptive only" in md
