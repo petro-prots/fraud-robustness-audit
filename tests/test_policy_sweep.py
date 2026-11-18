@@ -105,7 +105,7 @@ def test_t2_pick_and_confirmation():
     plan = ps.confirmation_plan({"a": g}, {"a": res})
     assert plan == [{"label": "a", "model_dir": "m", "target_fpr": picked["target_fpr"], "reaction": picked["reaction"],
                      "corridor": picked["corridor"], "key": picked["key"]}]
-    conf = {"a": {"gate": {"attack_seeds": [4, 5, 6], "attacks": ["es"]}, "model_json_sha256": "sha",
+    conf = {"a": {"gate": dict(g["gate"], attack_seeds=[4, 5, 6]), "model_json_sha256": "sha",
                   "cells": [dict(picked, U=0.2, runs={"es/4": {"uplift_upper": 0.2}})]}}
     res2 = ps.t2({"a": g}, conf, 0.10)["a"]
     assert res2["t2"] == "not confirmed" and ps.confirmation_plan({"a": g}, {"a": res2}) == []
@@ -113,8 +113,10 @@ def test_t2_pick_and_confirmation():
     ok = ps.t2({"a": g}, {"a": dict(conf["a"], cells=[dict(picked, runs={"es/4": {"uplift_upper": 0.05}})])}, 0.10)
     assert ok["a"]["t2"] == "confirmed"
     # M5: an invalid confirmation is refused, never counted
-    bad = [dict(conf["a"], gate={"attack_seeds": [1, 4], "attacks": ["es"]}),  # seeds overlap the grid's
-           dict(conf["a"], gate={"attack_seeds": [4], "attacks": ["random"]}),  # other attacks
+    bad = [dict(conf["a"], gate=dict(g["gate"], attack_seeds=[1, 4])),  # seeds overlap the grid's
+           dict(conf["a"], gate=dict(g["gate"], attack_seeds=[4], attacks=["random"])),  # other attacks
+           dict(conf["a"], gate=dict(g["gate"], attack_seeds=[4, 5, 6], delta=0.2)),  # another gate (I2)
+           dict(conf["a"], seed=7),  # another base seed (I2)
            dict(conf["a"], model_json_sha256="other"),
            dict(conf["a"], cells=[dict(picked, tau=0.5, runs={"es/4": {"uplift_upper": 0.05}})]),
            dict(conf["a"], cells=[dict(picked, corridor="x", runs={"es/4": {"uplift_upper": 0.05}})])]
@@ -559,9 +561,41 @@ def test_front_analysis_and_appetite_curve():
 
 def test_confirmation_must_match_the_corridor_variant():
     grid, conf, (c1, c2, c3, c4) = _toy_19b()
-    bad = dict(conf, cells=[dict(c2, corridor_kappa=1.5, runs=conf["cells"][1]["runs"])])
-    with pytest.raises(ValueError, match="corridor_kappa"):
-        ps.front_analysis({"a": grid}, {"a": bad})
+    r2 = conf["cells"][1]["runs"]
+    for field, val in (("corridor_kappa", 1.5), ("corridor_q", 0.99),
+                       ("corridor_params", dict(_cp(1.25, 0.98), lookback_days=90))):
+        bad = dict(conf, cells=[dict(c2, runs=r2, **{field: val})])
+        with pytest.raises(ValueError, match=field):
+            ps.front_analysis({"a": grid}, {"a": bad})
+
+
+def test_front_confirmation_validity_i2():
+    """I2: the front's confirmation needs exactly seeds 4–9, every attack per seed (18 runs), the same seed, gate
+    (apart from the seeds) and threat / corridor-threat files."""
+    grid, conf, (c1, c2, c3, c4) = _toy_19b()
+    grid = dict(grid, seed=42, meta={"threat_sha256": "t", "corridor_threat_sha256": "c"})
+    conf = dict(conf, seed=42, meta={"threat_sha256": "t", "corridor_threat_sha256": "c"})
+    assert ps.front_analysis({"a": grid}, {"a": conf})["margin"]["n_confirmed"] == 2
+    s456 = dict(conf, gate=dict(conf["gate"], attack_seeds=[4, 5, 6]),
+                cells=[dict(c, runs={k: r for k, r in c["runs"].items() if int(k.rsplit("/", 1)[1]) <= 6})
+                       for c in conf["cells"]])
+    with pytest.raises(ValueError, match="seeds"):
+        ps.front_analysis({"a": grid}, {"a": s456})
+    missing = dict(conf, cells=[dict(conf["cells"][0], runs={k: r for k, r in conf["cells"][0]["runs"].items()
+                                                              if k != "stepwise/7"}), conf["cells"][1]])
+    with pytest.raises(ValueError, match="every attack"):
+        ps.front_analysis({"a": grid}, {"a": missing})
+    for bad in (dict(conf, seed=7), dict(conf, gate=dict(conf["gate"], delta=0.2)),
+                dict(conf, meta={"threat_sha256": "t2", "corridor_threat_sha256": "c"}),
+                dict(conf, meta={"threat_sha256": "t", "corridor_threat_sha256": "c2"})):
+        with pytest.raises(ValueError, match="confirmation"):
+            ps.front_analysis({"a": grid}, {"a": bad})
+    with pytest.raises(ValueError, match="every attack"):  # 12 runs instead of 18
+        ps.confirmation_stats({"key": "k", "runs": _conf_runs({s: 0.1 for s in range(4, 10)}, ("es", "random"))},
+                              0.1, ["es", "random", "stepwise"], expected_seeds=range(4, 10))
+    ok = ps.confirmation_stats({"key": "k", "runs": _conf_runs({s: 0.1 for s in range(4, 10)})}, 0.1,
+                               ["es", "random", "stepwise"], expected_seeds=range(4, 10))
+    assert ok["n_runs"] == 18 and ok["seeds"] == [4, 5, 6, 7, 8, 9]
 
 
 def _sweep_file(label, cells, *, sha="m", own_tau=0.9, gate_sha="g", threat_sha="t", ctm_sha="c", git="abc1234567",
@@ -595,6 +629,21 @@ def test_merge_task19_and_19b_sweeps_and_refusals():
             ps.merge_sweeps([a, bad])
     with pytest.raises(ValueError, match="more than one file"):
         ps.merge_sweeps([a, ps.normalize(_sweep_file("x", json.loads(json.dumps(old))), "dup.json")])
+    other_a = _sweep_file("x", json.loads(json.dumps(new)), git="def7654321")
+    other_a["mean_amount"] = 101.0
+    with pytest.raises(ValueError, match="refusing to merge.*mean_amount"):
+        ps.merge_sweeps([a, ps.normalize(other_a, "bad.json")])
+    # I4: a friction entry of the same key in two files must be identical (apart from wall time / provenance)
+    fb = {"share_blocked_card_windows": 0.1, "share_blocked_cards": 0.2, "wall_seconds": 1.0,
+          "provenance": {"git_sha": "abc1234567"}}
+    fa_ = _sweep_file("x", json.loads(json.dumps(old)))
+    fa_["friction"] = {"false_blocks": {"k": fb}, "burden": {}}
+    fb_ = _sweep_file("x", json.loads(json.dumps(new)), git="def7654321")
+    fb_["friction"] = {"false_blocks": {"k": dict(fb, wall_seconds=9.0, provenance={"git_sha": "def"})}, "burden": {}}
+    ps.merge_sweeps([ps.normalize(fa_, "a.json"), ps.normalize(fb_, "b.json")])  # same shares: merged
+    fb_["friction"]["false_blocks"]["k"]["share_blocked_card_windows"] = 0.1 + 1e-12
+    with pytest.raises(ValueError, match="friction entry"):
+        ps.merge_sweeps([ps.normalize(fa_, "a.json"), ps.normalize(fb_, "b.json")])
     # two commits only when both are named
     prov = ps.provenances([m])
     assert {p["git_sha"] for p in prov} == {"abc1234567", "def7654321"}
@@ -669,19 +718,31 @@ def vsweep(env, tmp_path_factory):
                      "public": c.public()})
         return real(df_, mdl, mdir, tm_c, *a, **k)
 
+    from fraudaudit import metrics
+    real_bu = metrics.confirmation_burden
+
+    def spy_bu(df_, scores, tau, cor, *a, **k):
+        r = real_bu(df_, scores, tau, cor, *a, **k)
+        seen.append({"burden": True, "kappa": cor.kappa, "q": cor.q, "floor_q": cor.floor_fit.q,
+                     "public": cor.public(), "card_days": r.share_confirm_card_days})
+        return r
+
     mod.run_cell = spy
+    metrics.confirmation_burden = spy_bu
     try:
         data = mod.policy_sweep(df, model, d, "m", dataclasses.replace(tm, max_declines=7), ctm, g, fprs=(0.01,),
                                 reactions=("md3",), corridors=("on",), kappas=(1.25, 1.5), qs=(0.98,), esc_fpr=0.2,
                                 seed=1, n_jobs=1, out_dir=out / "m")
     finally:
         mod.run_cell = real
+        metrics.confirmation_burden = real_bu
     return data, out, seen
 
 
 def test_corridor_variant_reaches_the_cell(env, vsweep):
     from fraudaudit.policy_sweep import params_sha256
-    data, _, seen = vsweep
+    data, _, seen_all = vsweep
+    seen = [s for s in seen_all if not s.get("burden")]
     _, ctm, _ = _setup(env)
     assert sorted((s["kappa"], s["q"], s["floor_q"]) for s in seen) == [(1.25, 0.98, 0.98), (1.5, 0.98, 0.98)]
     assert all(s["split"] and s["extends"] and s["lookback"] == 60 and s["md"] == 3 for s in seen)
@@ -700,6 +761,13 @@ def test_corridor_variant_reaches_the_cell(env, vsweep):
     assert other == {k: v for k, v in data["corridor_params"].items() if k not in ("q", "daily")}
     assert data["corridor_params"]["q"] == ctm.corridor.q
     assert len(data["friction"]["burden"]) == 2  # one burden entry per variant
+    # I1: the confirmation burden of every variant cell uses that cell's own κ, q and the floor fitted for that q
+    bu = [s for s in seen_all if s.get("burden")]
+    assert sorted((s["kappa"], s["q"], s["floor_q"]) for s in bu) == [(1.25, 0.98, 0.98), (1.5, 0.98, 0.98)]
+    for c in data["cells"]:
+        b = next(s for s in bu if s["public"] == c["corridor_params"])
+        assert c["friction"]["share_confirm_card_days"] == b["card_days"]
+    assert bu[0]["public"] != bu[1]["public"] != data["corridor_params"]
 
 
 def test_corridor_variant_n_jobs_identical(env, vsweep, tmp_path):
@@ -735,7 +803,7 @@ def test_task19_records_resume_without_variant_fields(env, sweep, monkeypatch, t
     calls = []
     real = mod.run_cell
     monkeypatch.setattr(mod, "run_cell", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
-    for kw in ({}, {"kappas": (ctm.corridor.kappa,), "qs": (ctm.corridor.q,)}):
+    for kw in ({}, {"kappas": (ctm.corridor.kappa,), "qs": (ctm.corridor.q,)}):  # noqa: B007
         again = mod.policy_sweep(df, model, d, "m", tm, ctm, g, fprs=(0.01, 0.05), reactions=("md1", "md3+esc"),
                                  corridors=("off", "on"), esc_fpr=0.2, r19=True, seed=1, n_jobs=1,
                                  out_dir=tmp_path / "m", **kw)
@@ -759,20 +827,31 @@ def test_policy_summary_front_mode_end_to_end(env, sweep, vsweep, tmp_path):
     for line in plan:
         f = line.split("\t")
         assert len(f) == 8 and f[0] == "m" and (f[5] == "-") == (f[4] == "off")
-    # a confirmation file for every front cell (fabricated runs on seed 2, disjoint from the grid's seed 1)
+    # a confirmation file for every front cell (fabricated runs on seeds 4–9, disjoint from the grid's seed 1)
     grid = {c["key"]: c for p in (out0, outv) for c in json.loads((p / "m" / "policy-sweep.json").read_text())["cells"]}
     conf = json.loads((outv / "m" / "policy-sweep.json").read_text())
-    conf["role"], conf["gate"] = "confirmation", dict(conf["gate"], attack_seeds=[2])
-    conf["cells"] = [dict(grid[ln.split("\t")[7]], runs={k.replace("/1", "/2"): dict(r, uplift_upper=r["uplift_upper"]
-                                                                                       + 0.01)
-                                                         for k, r in grid[ln.split("\t")[7]]["runs"].items()})
-                     for ln in plan]
+    conf["role"], conf["gate"] = "confirmation", dict(conf["gate"], attack_seeds=list(range(4, 10)))
+    conf["cells"] = [dict(grid[ln.split("\t")[7]], runs={k.replace("/1", f"/{sd}"): dict(
+        r, uplift_upper=r["uplift_upper"] + 0.01 * (sd - 3)) for sd in range(4, 10)
+        for k, r in grid[ln.split("\t")[7]]["runs"].items()}) for ln in plan]
     pc = tmp_path / "conf.json"
     pc.write_text(json.dumps(conf))
     code = main(["policy-summary", str(out0 / "m" / "policy-sweep.json"), str(outv / "m" / "policy-sweep.json"),
                  str(pc), "--out", str(tmp_path / "s"), "--confirm-rule", "front"])
     assert code == 0
     s = tmp_path / "s"
+    assert "PROVISIONAL" in (tmp_path / "s0" / "front.md").read_text()  # nothing confirmed yet (M1)
+    assert "PROVISIONAL" in (tmp_path / "s0" / "appetite.md").read_text()
+    assert "PROVISIONAL" not in (s / "front.md").read_text()
+    # preflight (I3): load + merge + provenance only, writes nothing; a mismatching file is refused
+    files = [str(out0 / "m" / "policy-sweep.json"), str(outv / "m" / "policy-sweep.json")]
+    assert main(["policy-summary", *files, "--check-merge", "--confirm-rule", "front", "--out",
+                 str(tmp_path / "pre")]) == 0 and not (tmp_path / "pre").exists()
+    bad = json.loads((outv / "m" / "policy-sweep.json").read_text())
+    bad["esc_fpr"] = 0.3
+    (tmp_path / "bad.json").write_text(json.dumps(bad))
+    assert main(["policy-summary", files[0], str(tmp_path / "bad.json"), "--check-merge", "--out",
+                 str(tmp_path / "pre")]) == 2
     for name in ("hypotheses.md", "summary.json", "front.md", "front.json", "appetite.md", "appetite.json",
                  "appetite.png", "front-blocks.png", "front-confirm.png"):
         assert (s / name).stat().st_size > 0, name

@@ -149,7 +149,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma-separated corridor quantiles q for the corridor-on cells (default: the file's)")
     ps.add_argument("--r19", action="store_true", help="also the R19 cells md2 and mdinf at the own tau, corridor off")
     ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
-                    help="confirmation: a T2 confirmation run with fresh seeds (--gate gate-seeds-456.yaml)")
+                    help="confirmation: a confirmation run with fresh seeds (Task 19 T2: --gate gate-seeds-456.yaml; "
+                         "Task 19b front: --gate gate-seeds-4-9.yaml)")
     stage = ps.add_mutually_exclusive_group()
     stage.add_argument("--no-friction", action="store_true", help="ensemble cells only")
     stage.add_argument("--friction-only", action="store_true", help="friction of the cells already in the JSON only")
@@ -168,6 +169,8 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--merge-commits", type=_names, default=None,
                     help="comma-separated git SHAs whose cells may be merged (Task 19 + Task 19b after the "
                          "reproduction check); default: one commit only")
+    pm.add_argument("--check-merge", action="store_true",
+                    help="only load, merge and check provenance (a preflight); writes nothing")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -564,10 +567,13 @@ def cmd_policy_summary(args: argparse.Namespace) -> int:
     from fraudaudit.policy_summary import summarize
     try:
         res = summarize(args.sweeps, args.out, resolution=args.resolution, confirm_rule=args.confirm_rule,
-                        merge_commits=args.merge_commits)
+                        merge_commits=args.merge_commits, check_only=args.check_merge)
     except (OSError, ValueError, KeyError) as e:
         print(f"error: policy-summary: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
+    if args.check_merge:
+        print(json.dumps(res, indent=2), flush=True)
+        return 0
     print((args.out / "hypotheses.md").read_text(encoding="utf-8"), flush=True)
     print(json.dumps({"confirmation_plan": res["confirmation_plan"]}, indent=2), flush=True)
     return 0

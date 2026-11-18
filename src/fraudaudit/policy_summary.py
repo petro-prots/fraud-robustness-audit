@@ -274,7 +274,9 @@ def t2(sweeps: dict, confirmations: dict, delta: float) -> dict:
 
 def check_confirmation(grid: dict, cell: dict, conf: dict, conf_cell: dict) -> None:
     """ValueError unless the confirmation sweep is a valid fresh-seed rerun of the picked cell: same model (model.json
-    SHA-256), same attacks, attack seeds disjoint from the grid's, same τ, reaction and corridor."""
+    SHA-256), same base seed, same gate apart from the attack seeds (attacks, δ, confidence, …), attack seeds disjoint
+    from the grid's, same threat and corridor-threat files (SHA-256), same τ, reaction and corridor (κ, q and every
+    other corridor parameter)."""
     g, c = grid["gate"], conf["gate"]
     errs = []
     if conf.get("model_json_sha256") != grid.get("model_json_sha256"):
@@ -283,7 +285,16 @@ def check_confirmation(grid: dict, cell: dict, conf: dict, conf_cell: dict) -> N
         errs.append(f"attacks {c['attacks']} != {g['attacks']}")
     if set(c["attack_seeds"]) & set(g["attack_seeds"]):
         errs.append(f"attack seeds {c['attack_seeds']} overlap the grid's {g['attack_seeds']}")
-    for k in ("tau", "max_declines", "tau_after_decline", "corridor", "reaction", "corridor_kappa", "corridor_q"):
+    gd = sorted(k for k in set(g) | set(c) if k not in ("attack_seeds", "attacks") and g.get(k) != c.get(k))
+    if gd:
+        errs.append(f"gate fields {gd} differ")
+    if conf.get("seed") != grid.get("seed"):
+        errs.append(f"seed {conf.get('seed')} != {grid.get('seed')}")
+    for k in MERGE_META[1:]:
+        if (conf.get("meta") or {}).get(k) != (grid.get("meta") or {}).get(k):
+            errs.append(f"meta.{k} differs")
+    for k in ("tau", "max_declines", "tau_after_decline", "corridor", "reaction", "corridor_kappa", "corridor_q",
+              "corridor_params"):
         if conf_cell.get(k) != cell.get(k):
             errs.append(f"{k} {conf_cell.get(k)!r} != {cell.get(k)!r}")
     if errs:
@@ -447,9 +458,13 @@ def front_cells(sweep: dict) -> list[dict]:
     return [c for c, f in zip(g, flags) if f]
 
 
-def confirmation_stats(conf_cell: dict, u_grid: float, attacks=None) -> dict:
+CONFIRM_SEEDS = (4, 5, 6, 7, 8, 9)  # the pre-registered fresh seeds of the front confirmation (gate-seeds-4-9.yaml)
+
+
+def confirmation_stats(conf_cell: dict, u_grid: float, attacks=None, expected_seeds=None) -> dict:
     """Per seed s: U_s = max over the attacks of the run upper bounds; median and worst over the seeds; x_c = worst −
-    the cell's U on the gate seeds; all run upper bounds."""
+    the cell's U on the gate seeds; all run upper bounds. ValueError unless every seed has every attack and (with
+    ``expected_seeds``) the seeds are exactly those and the run count is attacks × seeds."""
     by_seed: dict = {}
     for rk, r in conf_cell["runs"].items():
         a, sd = rk.rsplit("/", 1)
@@ -460,6 +475,13 @@ def confirmation_stats(conf_cell: dict, u_grid: float, attacks=None) -> dict:
         bad = {sd: sorted(v) for sd, v in by_seed.items() if sorted(v) != sorted(attacks)}
         if bad:
             raise ValueError(f"confirmation of {conf_cell['key']}: seeds without every attack {sorted(attacks)}: {bad}")
+    if expected_seeds is not None:
+        want = sorted(int(x) for x in expected_seeds)
+        if sorted(by_seed) != want:
+            raise ValueError(f"confirmation of {conf_cell['key']}: seeds {sorted(by_seed)}, the rule needs {want}")
+        if attacks is not None and len(conf_cell["runs"]) != len(attacks) * len(want):
+            raise ValueError(f"confirmation of {conf_cell['key']}: {len(conf_cell['runs'])} runs, the rule needs "
+                             f"{len(attacks) * len(want)}")
     u_s = {sd: max(v.values()) for sd, v in sorted(by_seed.items())}
     vals = list(u_s.values())
     worst = float(max(vals))
@@ -482,9 +504,9 @@ def margin(xs_by_label: dict) -> dict:
             "n_confirmed": len(allx)}
 
 
-def front_analysis(grid: dict, conf: dict) -> dict:
+def front_analysis(grid: dict, conf: dict, expected_seeds=CONFIRM_SEEDS) -> dict:
     """Per model the front cells with their confirmation (or None), the margin X and the plan of the front cells
-    still to confirm (``confirmations-front.tsv``)."""
+    still to confirm (``confirmations-front.tsv``). A confirmation must use exactly ``expected_seeds`` (R32: 4–9)."""
     front, plan = {}, []
     for lab, s in grid.items():
         cs = conf.get(lab)
@@ -495,7 +517,10 @@ def front_analysis(grid: dict, conf: dict) -> dict:
             row["confirmation"] = None
             if cc is not None:
                 check_confirmation(s, c, cs, cc)
-                row["confirmation"] = dict(confirmation_stats(cc, c["U"], cs["gate"]["attacks"]),
+                if sorted(cs["gate"]["attack_seeds"]) != sorted(expected_seeds):
+                    raise ValueError(f"confirmation of {lab} {c['key']}: attack seeds {cs['gate']['attack_seeds']}, "
+                                     f"the front rule needs {list(expected_seeds)} (gate-seeds-4-9.yaml)")
+                row["confirmation"] = dict(confirmation_stats(cc, c["U"], cs["gate"]["attacks"], expected_seeds),
                                            attack_seeds=list(cs["gate"]["attack_seeds"]))
             else:
                 plan.append({"label": lab, "model_dir": s["model_dir"], "target_fpr": c["target_fpr"],
@@ -505,7 +530,9 @@ def front_analysis(grid: dict, conf: dict) -> dict:
             rows.append(row)
         front[lab] = sorted(rows, key=lambda r: (r["blocked_card_months"], r["U"], r["key"]))
     xs = {lab: [r["confirmation"]["x_c"] for r in rows if r["confirmation"]] for lab, rows in front.items()}
-    return {"front": front, "margin": margin(xs), "plan": plan}
+    m = margin(xs)
+    m.update(n_front=sum(len(r) for r in front.values()), n_pending=len(plan), provisional=bool(plan))
+    return {"front": front, "margin": m, "plan": plan}
 
 
 def _cheapest(rows: list[dict]) -> dict | None:
@@ -695,6 +722,15 @@ def merge_sweeps(sweeps: list[dict]) -> dict:
         if errs:
             raise ValueError(f"refusing to merge the sweeps of {lab!r} ({', '.join(files)}): they differ in "
                              + ", ".join(errs))
+    for kind in ("false_blocks", "burden"):  # I4: one friction entry, one value (a free check of the recomputation)
+        seen: dict = {}
+        for src in (x for s in sweeps for x in s["sources"]):
+            for k, e in ((src.get("friction") or {}).get(kind) or {}).items():
+                v = {f: x for f, x in e.items() if f not in ("wall_seconds", "provenance")}
+                if k in seen and seen[k][1] != v:
+                    raise ValueError(f"refusing to merge the sweeps of {lab!r}: the {kind} friction entry {k} differs "
+                                     f"between {seen[k][0]} and {src['file']}")
+                seen.setdefault(k, (src["file"], v))
     keys = [c["key"] for s in sweeps for c in s["cells"]]
     dup = sorted({k for k in keys if keys.count(k) > 1})
     if dup:
@@ -754,10 +790,11 @@ def check_provenance(prov: list[dict], merge_commits=None) -> None:
 
 
 def summarize(paths, out_dir, resolution: float = RESOLUTION, confirm_rule: str = "t2",
-              merge_commits=None) -> dict:
+              merge_commits=None, check_only: bool = False) -> dict:
     """The summary of the policy sweeps. ``confirm_rule`` ``t2`` (Task 19: the T2 green-cell confirmation plan
     ``confirmations.tsv``) or ``front`` (Task 19b: the front confirmed on fresh seeds, margin X, risk-appetite curve,
-    plan ``confirmations-front.tsv``)."""
+    plan ``confirmations-front.tsv``). ``check_only``: only load, merge and check provenance and δ (a cheap preflight
+    of the chain); nothing is written."""
     if confirm_rule not in CONFIRM_RULES:
         raise ValueError(f"confirm_rule must be one of {CONFIRM_RULES}, got {confirm_rule!r}")
     grid, conf = load(paths)
@@ -769,6 +806,9 @@ def summarize(paths, out_dir, resolution: float = RESOLUTION, confirm_rule: str 
     if len(deltas) != 1 or None in deltas:
         raise ValueError(f"the sweeps disagree on δ or δ is null: {sorted(map(str, deltas))}")
     delta = deltas.pop()
+    if check_only:
+        return {"check": "ok", "labels": list(grid), "provenances": prov,
+                "n_cells": {lab: len(s["cells"]) for lab, s in grid.items()}}
     t1_res = t1(grid, resolution)
     res = {"delta": delta, "resolution": resolution, "confirm_rule": confirm_rule, "t1": t1_res,
            "policy_vs_model": policy_vs_model(grid, resolution), "interaction": interaction_table(t1_res, grid),
@@ -927,7 +967,10 @@ def front_markdown(res: dict) -> str:
              "extras md2 / mdinf excluded) on (U on the gate seeds, false-blocked card-months), both minimised, strict "
              "dominance, exact ties kept. Confirmation: the same cell, all attacks × fresh seeds; per seed U_s = max "
              "over the attacks of the one-sided upper bound; x_c = worst_s U_s − U (gate seeds).", "",
-             f"**Margin X = {_pct(m['X'], 2)}** (max x_c over {m['n_confirmed']} confirmed front cells of all models); "
+             (f"**PROVISIONAL – {m['n_pending']} of {m['n_front']} front cells are not confirmed yet.** "
+              if m.get("provisional") else "")
+             + f"**Margin X = {_pct(m['X'], 2)}** (max x_c over {m['n_confirmed']} confirmed of {m.get('n_front', '?')} "
+             "front cells of all models); "
              f"90th percentile of x_c {_pct(m['p90'], 2)}; per model max: "
              + ", ".join(f"{lab} {_pct(x, 2)}" for lab, x in m["per_model"].items()) + ".",
              "Recommendation for a bank that runs only the 3-seed gate: take a policy with U (gate seeds) ≤ δ′ − X.",
@@ -965,7 +1008,12 @@ def _choice(e: dict | None, confirmed: bool) -> list[str]:
 
 def appetite_markdown(res: dict) -> str:
     X = res["margin"]["X"]
-    lines = ["# Task 19b: bank risk appetite δ′ → cheapest passing policy → its price for customers", "",
+    prov = res["margin"].get("provisional")
+    lines = ["# Task 19b: bank risk appetite δ′ → cheapest passing policy → its price for customers", ""]
+    if prov:
+        lines += [f"**PROVISIONAL: {res['margin']['n_pending']} of {res['margin']['n_front']} front cells are not "
+                  "confirmed yet; X and the curves change when they are.**", ""]
+    lines += [
              f"δ′ = {DELTA_PRIMES[0]:.2f} … {DELTA_PRIMES[-1]:.2f}, step 1 pp (below 0.08 the gate's resolution, 3.6–4.1 pp, "
              "makes the curve unreliable). (A) cheapest confirmed front cell that passes at δ′: median_s U_s ≤ δ′ and "
              f"worst_s U_s ≤ δ′ + {WORST_SLACK:g} on the fresh seeds. (B) recommended with margin X = {_pct(X, 2)}: "
