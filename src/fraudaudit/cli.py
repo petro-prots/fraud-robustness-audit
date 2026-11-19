@@ -1,5 +1,7 @@
 import argparse
+import dataclasses
 import json
+import math
 import os
 import platform
 import subprocess
@@ -43,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--threat", type=Path, default=Path("threat-models/realistic.yaml"))
     audit.add_argument("--gate", type=Path, default=Path("gate.yaml"),
                        help="gate rules: thresholds, attacks and attack seeds (the worst run decides)")
+    audit.add_argument("--policy", type=Path, default=None,
+                       help="bank policy file (policies/*.yaml: max_declines, corridor κ and q) overlaid on the threat "
+                            "model; default: the threat file's own policy")
+    audit.add_argument("--delta", type=float, default=None,
+                       help="the bar δ′ (share of the episode amount) instead of the gate file's δ; the report names "
+                            "the source")
     audit.add_argument("--skew-report", type=Path, default=None,
                        help="JSON of `fraudaudit skew --out`; adds the skew check")
     audit.add_argument("--single-threat", type=Path, default=Path("threat-models/single-transaction.yaml"),
@@ -147,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "default: the corridor threat file's)")
     ps.add_argument("--corridor-q", type=_deltas, default=None,
                     help="comma-separated corridor quantiles q for the corridor-on cells (default: the file's)")
+    ps.add_argument("--recon-budget-ops", type=int, default=None,
+                    help="reconnaissance budget of the gate's attacker (operations on spare cards) instead of the "
+                         "threat files' value, for both --threat and --corridor-threat (R33 sensitivity check; "
+                         "delta, thresholds and the rest of the threat model stay)")
     ps.add_argument("--r19", action="store_true", help="also the R19 cells md2 and mdinf at the own tau, corridor off")
     ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
                     help="confirmation: a confirmation run with fresh seeds (Task 19 T2: --gate gate-seeds-456.yaml; "
@@ -171,6 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "reproduction check); default: one commit only")
     pm.add_argument("--check-merge", action="store_true",
                     help="only load, merge and check provenance (a preflight); writes nothing")
+
+    bs = sub.add_parser("budget-sensitivity", help="R33: U of the same cells at several reconnaissance budgets against "
+                                                  "the budget-2000 reference; pre-registered hypothesis H")
+    bs.add_argument("--reference", type=Path, required=True, help="directory with <label>/policy-sweep.json at budget 2000")
+    bs.add_argument("--budget", action="append", required=True, metavar="B=DIR", help="budget=directory (repeatable)")
+    bs.add_argument("--labels", type=_names, required=True, help="comma-separated model labels")
+    bs.add_argument("--out", type=Path, required=True)
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -267,6 +286,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
     import yaml
 
+    from fraudaudit.bankpolicy import BankPolicy, file_sha256
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig, decide, passed, run_ensemble
     from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
@@ -279,6 +299,14 @@ def cmd_audit(args: argparse.Namespace) -> int:
     try:
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
+        policy = None if args.policy is None else BankPolicy.from_yaml(args.policy)
+        if policy is not None:
+            tm = policy.apply(tm)
+        if args.delta is not None:
+            if not math.isfinite(args.delta) or not 0 <= args.delta <= 1:
+                raise ValueError(f"--delta must be a share of the episode amount in [0, 1] (a bar above 1 can never "
+                                 f"fail), got {args.delta}")
+            cfg = dataclasses.replace(cfg, delta=float(args.delta))
         tms = None if args.no_baseline else SingleTxThreatModel.from_yaml(args.single_threat)
         skew_json = None if args.skew_report is None else json.loads(args.skew_report.read_text(encoding="utf-8"))
         skew = None if skew_json is None else skew_from_json(skew_json)
@@ -324,6 +352,9 @@ def cmd_audit(args: argparse.Namespace) -> int:
     meta = {"seed": int(args.seed), **git_info(), "gate_file": str(args.gate),
             "model_target_fpr": None if model_fpr is None else float(model_fpr),
             "gate_sha256": hashlib.sha256(args.gate.read_bytes()).hexdigest(),
+            "policy": None if policy is None else {"file": str(args.policy), "sha256": file_sha256(args.policy),
+                                                   **policy.public()},
+            "delta_source": "--delta" if args.delta is not None else str(args.gate),
             "skew_report": None if args.skew_report is None else str(args.skew_report),
             "wall_seconds": round(time.perf_counter() - t1, 1),
             "wall_seconds_with_loading": round(time.perf_counter() - t0, 1)}
@@ -540,6 +571,11 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
         cfg = GateConfig.from_yaml(args.gate)
         tm = ThreatModel.from_yaml(args.threat)
         ctm = ThreatModel.from_yaml(args.corridor_threat)  # also for runs without corridor cells: earlier ones may have
+        if args.recon_budget_ops is not None:
+            if args.recon_budget_ops < 1:
+                raise ValueError(f"--recon-budget-ops must be a positive integer, got {args.recon_budget_ops}")
+            tm = dataclasses.replace(tm, recon_budget_ops=args.recon_budget_ops)
+            ctm = dataclasses.replace(ctm, recon_budget_ops=args.recon_budget_ops)
         if args.corridor_kappa or args.corridor_q:
             from fraudaudit.policy_sweep import corridor_variants
             if "on" not in args.corridor or ctm.corridor is None:
@@ -560,6 +596,28 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
                             gate_path=args.gate, log=lambda m: print(m, file=sys.stderr, flush=True))
         write_markdown(data, args.out / label)
         print((args.out / label / "policy-sweep.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
+def cmd_budget_sensitivity(args: argparse.Namespace) -> int:
+    from fraudaudit.budget_sensitivity import compare, markdown
+    try:
+        budgets = {}
+        for item in args.budget:
+            b, sep, p = item.partition("=")
+            if not sep:
+                raise ValueError(f"--budget expects B=DIR, got {item!r}")
+            if int(b) in budgets:
+                raise ValueError(f"--budget {b} given twice")
+            budgets[int(b)] = Path(p)
+        res = compare(args.reference, budgets, args.labels)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"error: budget-sensitivity: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "budget-sensitivity.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
+    (args.out / "budget-sensitivity.md").write_text(markdown(res), encoding="utf-8")
+    print((args.out / "budget-sensitivity.md").read_text(encoding="utf-8"), flush=True)
     return 0
 
 
@@ -669,6 +727,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_corridor_posthoc(args)
     if args.command == "policy-sweep":
         return cmd_policy_sweep(args)
+    if args.command == "budget-sensitivity":
+        return cmd_budget_sensitivity(args)
     if args.command == "policy-summary":
         return cmd_policy_summary(args)
     return 0

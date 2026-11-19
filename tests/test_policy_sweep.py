@@ -193,7 +193,7 @@ CELL_KEYS = {"key", "config_hash", "target_fpr", "tau", "reaction", "max_decline
              "amounts", "targets", "U", "U_usd", "worst_run_usd", "worst_usd_uplift_upper", "wall_seconds",
              "ensemble_seconds", "friction", "provenance", "corridor_kappa", "corridor_q", "corridor_params",
              "corridor_params_sha256", "n_corridor_runs", "n_bound_violations", "n_headroom_violations",
-             "n_block_violations"}
+             "n_block_violations", "recon_budget_ops"}
 
 
 def test_policy_sweep_cell_schema(env, sweep):
@@ -863,3 +863,32 @@ def test_policy_summary_front_mode_end_to_end(env, sweep, vsweep, tmp_path):
     assert res["violations"]["n_cells"] == n_on and res["violations"]["n_corridor_runs"] == 2 * n_on
     md = (s / "hypotheses.md").read_text()
     assert "Task 19b" in md and "corridor runs" in md and "Descriptive only" in md
+
+
+# ---- R33: attack-budget sensitivity (--recon-budget-ops) ---------------------------------------------------------
+
+def test_sweep_records_the_recon_budget(sweep):
+    data, _ = sweep
+    assert data["meta"]["recon_budget_ops"] == 100
+
+
+def test_another_recon_budget_is_another_cell(env, sweep, tmp_path):
+    """The budget is part of the cell's config hash (so a cell is never reused across budgets) and of the meta."""
+    from fraudaudit.policy_sweep import policy_sweep
+    df, model, d = env
+    tm, ctm, g = _setup(env)
+    kw = dict(fprs=(0.01,), reactions=("md3",), corridors=("off",), seed=1, n_jobs=1, friction=False)
+    a = policy_sweep(df, model, d, "m", tm, ctm, g, out_dir=tmp_path / "a", **kw)
+    b = policy_sweep(df, model, d, "m", dataclasses.replace(tm, recon_budget_ops=150),
+                     dataclasses.replace(ctm, recon_budget_ops=150), g, out_dir=tmp_path / "b", **kw)
+    assert a["meta"]["recon_budget_ops"] == 100 and b["meta"]["recon_budget_ops"] == 150
+    assert a["cells"][0]["config_hash"] != b["cells"][0]["config_hash"]
+
+
+def test_cli_policy_sweep_recon_budget_option(capsys):
+    from fraudaudit.cli import build_parser, main
+    a = build_parser().parse_args(["policy-sweep", "--model", "m", "--label", "l", "--recon-budget-ops", "8000"])
+    assert a.recon_budget_ops == 8000
+    assert build_parser().parse_args(["policy-sweep", "--model", "m", "--label", "l"]).recon_budget_ops is None
+    code = main(["policy-sweep", "--model", "models", "--label", "x", "--recon-budget-ops", "0", "--data", "/nonexistent"])
+    assert code == 2 and "positive integer" in capsys.readouterr().err

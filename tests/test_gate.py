@@ -794,3 +794,55 @@ def test_positive_control_discriminates_ver_vs_uplift_mutant(df, model, tm, mode
     assert passed(decide(g, res))
     mutant = {k: dataclasses.replace(v, uplift=v.ver_adv) for k, v in res.items()}  # «VER_adv upper ≤ δ»
     assert not by_name(decide(g, mutant))["ver_uplift"].passed
+
+
+# --- bank policy and bar as parameters of the audit (R33) ---
+
+def _spy_ensemble(monkeypatch):
+    import fraudaudit.gate as gate_mod
+    seen = {}
+    real = gate_mod.run_ensemble
+
+    def spy(df, model, tm, cfg, *a, **kw):
+        seen["tm"], seen["cfg"] = tm, cfg
+        return real(df, model, tm, cfg, *a, **kw)
+
+    monkeypatch.setattr(gate_mod, "run_ensemble", spy)
+    return seen
+
+
+def test_cli_audit_policy_and_delta_reach_the_ensemble(cli_env, tmp_path, monkeypatch):
+    seen = _spy_ensemble(monkeypatch)
+    pol = tmp_path / "policy.yaml"
+    pol.write_text("name: tight\nmax_declines: 2\ncorridor: off\n")
+    code, out, summary = cli_env(dict(GATE_LOOSE, delta=None), "--policy", str(pol), "--delta", "1")
+    assert code == 0  # δ null in the file would fail closed: --delta replaced it
+    assert seen["tm"].max_declines == 2 and seen["tm"].corridor is None and seen["cfg"].delta == 1.0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["gate"]["delta"] == 1.0 and data["meta"]["delta_source"] == "--delta"
+    assert data["meta"]["policy"]["name"] == "tight" and data["meta"]["policy"]["max_declines"] == 2
+    assert len(data["meta"]["policy"]["sha256"]) == 64
+    md = (out / "summary.md").read_text(encoding="utf-8")
+    assert "Chosen by the bank" in md and "tight" in md and "bar δ′ = 100.0 %" in md and "`--delta`" in md
+
+
+def test_cli_audit_without_policy_and_delta_is_unchanged(cli_env, monkeypatch):
+    seen = _spy_ensemble(monkeypatch)
+    code, out, _ = cli_env(GATE_LOOSE)
+    assert code == 0 and seen["tm"].max_declines == 1 and seen["cfg"].delta == 10.0
+    data = json.loads((out / "audit.json").read_text(encoding="utf-8"))
+    assert data["meta"]["policy"] is None and data["meta"]["delta_source"].endswith("gate.yaml")
+    assert "Chosen by the bank" not in (out / "summary.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("extra", [["--delta", "-0.1"], ["--delta", "nan"], ["--delta", "1.5"]])
+def test_cli_audit_rejects_a_bad_delta(cli_env, extra):
+    code, out, _ = cli_env(GATE_LOOSE, *extra)
+    assert code == 2 and "error" in (out / "summary.md").read_text(encoding="utf-8").lower()
+
+
+def test_cli_audit_corridor_policy_needs_a_corridor_threat(cli_env, tmp_path):
+    pol = tmp_path / "policy.yaml"
+    pol.write_text("name: c\nmax_declines: 3\ncorridor: {kappa: 1.25, q: 0.98}\n")
+    code, out, _ = cli_env(GATE_LOOSE, "--policy", str(pol))
+    assert code == 2 and "no `corridor:` section" in (out / "summary.md").read_text(encoding="utf-8")

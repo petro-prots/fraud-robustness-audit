@@ -303,6 +303,7 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
             data["delta_usd"] = None if cfg.delta is None else float(cfg.delta * np.mean(amounts))
         _attach_friction(data)
         data["meta"] = {"seed": int(seed), **git_info(), "machine": machine_info(), "versions": _versions(),
+                        "recon_budget_ops": int(tm.recon_budget_ops),
                         "threat_file": None if threat_path is None else str(threat_path),
                         "threat_sha256": _sha256(threat_path),
                         "corridor_threat_file": None if corridor_path is None else str(corridor_path),
@@ -341,7 +342,8 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                              per_target=True)
         usd_uplift(rec, cfg.confidence, seed, cfg.one_sided, N_BOOT)
         cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
-                "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr, **rec,
+                "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr,
+                "recon_budget_ops": int(tm_c.recon_budget_ops), **rec,
                 "corridor_kappa": None if cpub is None else cpub["daily"].get("kappa"),
                 "corridor_q": None if cpub is None else float(cpub["q"]),
                 "corridor_params": cpub, "corridor_params_sha256": params_sha256(cpub),

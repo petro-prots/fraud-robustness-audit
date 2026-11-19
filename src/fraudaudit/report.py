@@ -192,6 +192,10 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     failed = [c for c in checks if not c.passed]
 
     lines = [f"# {'✅ ' + VERDICT_OK if ok else '❌ ' + VERDICT_FAIL} – episode-attack robustness gate", ""]
+    if meta.get("policy") or meta.get("delta_source") == "--delta":
+        lines += ["**Bank-chosen policy / bar – a demonstration of the gate parameters, not the gate of record.** The bar "
+                  "δ′ was set by the bank (in the demonstration from the uplift measured for this policy and model, "
+                  "plus the margin), so a pass confirms the measurement, it does not certify the model at δ = 10 %.", ""]
     if (meta.get("gate") or {}).get("positive_control"):
         lines += ["**Positive control (`replay`), not a gate verdict on the model:** it only checks the decision chain "
                   "(paired bootstrap of the uplift → worst run → verdict) on an uplift that is 0 by construction.", ""]
@@ -219,6 +223,17 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
     else:
         lines.append(head + f"the attack gives the fraudster up to ~{_num(up.value * mean_a, 0)} $ {unit}; the allowed "
                      "amount is not set.")
+    pol = meta.get("policy")
+    if pol or meta.get("delta_source") == "--delta":
+        what = []
+        if pol:
+            cor = ("corridor off" if pol["corridor"] == "off"
+                   else f"corridor κ {pol['corridor']['kappa']:g}, q {pol['corridor']['q']:g}")
+            what.append(f"bank policy **{pol['name']}** (`{pol['file']}`, SHA-256 `{pol['sha256']}`): "
+                        f"max_declines {pol['max_declines']}, {cor}")
+        if meta.get("delta_source") == "--delta" and delta is not None:
+            what.append(f"bar δ′ = {_pct(delta)} set by the bank on the command line (`--delta`)")
+        lines += ["", "Chosen by the bank, not by the gate: " + "; ".join(what) + "."]
     lines += ["", "## Checks", "", "| check | value | threshold | result |", "|---|---:|---|---|"]
     for c in checks:
         title = _TITLE[c.name].format(conf=conf, side=_side(w))
@@ -338,6 +353,11 @@ def summary_markdown(checks: list[Check], results: dict, meta: dict, merchants=N
               f"- threat model: `{wm['threat_model']['file']}`, SHA-256 `{wm['threat_model']['sha256']}`"]
     if meta.get("gate_file"):
         lines.append(f"- gate: `{meta['gate_file']}`, SHA-256 `{meta.get('gate_sha256')}`")
+    if meta.get("delta_source") == "--delta":
+        lines.append("- δ of the gate file is replaced by `--delta`")
+    if meta.get("policy"):
+        lines.append(f"- bank policy: `{meta['policy']['file']}`, SHA-256 `{meta['policy']['sha256']}`; it overrides "
+                     "max_declines and the corridor κ and q of the threat file")
     if "model_target_fpr" in meta:
         mt = meta["model_target_fpr"]
         lines.append("- the model's target_fpr is not given – the check was skipped" if mt is None
