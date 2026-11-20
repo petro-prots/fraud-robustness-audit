@@ -287,6 +287,7 @@ def _versions() -> dict:
 
 def clean_quality(df: pd.DataFrame, model, periods: tuple[str, ...] = ("val", "test")) -> dict:
     """Recall/FPR/precision of ``model`` at its tau on clean operations of ``periods`` (``val`` and ``test``)."""
+    from .model.history import score_rows
     from .model.pipeline import features, quality
     per = period(df).to_numpy()
     F = features(df, model.encoder)
@@ -294,7 +295,7 @@ def clean_quality(df: pd.DataFrame, model, periods: tuple[str, ...] = ("val", "t
     out = {}
     for name in periods:
         m = per == name
-        p = np.asarray(model.predict_proba(F[m]), dtype=np.float64) if m.any() else np.empty(0)
+        p = score_rows(model, df, F, m) if m.any() else np.empty(0)
         out[name] = quality(y[m], p, model.tau)
     return out
 

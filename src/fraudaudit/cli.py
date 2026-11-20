@@ -27,11 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=int, default=20, help="20 as in the bachelor listing; lower only for probes")
     train.add_argument("--sample-frac", type=float, default=None,
                        help="subsample fit rows (timing probes only)")
-    train.add_argument("--model-kind", choices=("mlp", "xgb"), default="mlp",
-                       help="mlp (the bachelor model, default) or xgb (gradient-boosted trees; hyperparameters "
-                            "chosen on clean val over the fixed grid unless --xgb-params is given)")
+    train.add_argument("--model-kind", choices=("mlp", "xgb", "gru"), default="mlp",
+                       help="mlp (the bachelor model, default), xgb (gradient-boosted trees) or gru (GRU over the "
+                            "card's last k operations); xgb/gru hyperparameters are chosen on clean val over the "
+                            "fixed grid unless --xgb-params / --gru-params is given")
     train.add_argument("--xgb-params", type=_xgb_params, default=None, metavar="DEPTH,N_ESTIMATORS",
                        help="xgb only: skip the grid search and train with these values (e.g. 6,200)")
+    train.add_argument("--gru-params", type=_gru_params, default=None, metavar="K,HIDDEN",
+                       help="gru only: skip the grid search and train with this window and size (e.g. 5,32)")
 
     skew = sub.add_parser("skew", help="check that the batch and serving feature paths agree")
     skew.add_argument("--data", type=Path, default=Path("data"))
@@ -258,6 +261,17 @@ def _xgb_params(text: str) -> dict:
     return {"max_depth": depth, "n_estimators": n_est}
 
 
+def _gru_params(text: str) -> dict:
+    """``--gru-params K,HIDDEN``: two integers, K >= 2 (the current operation + at least one earlier one)."""
+    try:
+        k, hidden = (int(x) for x in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected K,HIDDEN (two integers), got {text!r}") from None
+    if k < 2 or hidden < 1:
+        raise argparse.ArgumentTypeError("K must be >= 2 and HIDDEN positive")
+    return {"k": k, "hidden": hidden}
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.model.pipeline import train_model
@@ -265,12 +279,19 @@ def cmd_train(args: argparse.Namespace) -> int:
     if args.xgb_params and args.model_kind != "xgb":
         print("error: --xgb-params needs --model-kind xgb", file=sys.stderr)
         return 2
+    if args.gru_params and args.model_kind != "gru":
+        print("error: --gru-params needs --model-kind gru", file=sys.stderr)
+        return 2
     df = load_raw(args.data)
     print(f"loaded {len(df)} rows", flush=True)
     if args.model_kind == "xgb":
         from fraudaudit.model.xgb import train_xgb_model
         params = args.xgb_params
         model, report = train_xgb_model(df, seed=args.seed, params=params, sample_frac=args.sample_frac)
+    elif args.model_kind == "gru":
+        from fraudaudit.model.gru import train_gru_model
+        model, report = train_gru_model(df, seed=args.seed, params=args.gru_params, epochs=args.epochs,
+                                        sample_frac=args.sample_frac, verbose=2)
     else:
         model, report = train_model(df, seed=args.seed, epochs=args.epochs,
                                     sample_frac=args.sample_frac, verbose=2)

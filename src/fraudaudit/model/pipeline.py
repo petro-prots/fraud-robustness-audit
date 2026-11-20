@@ -144,11 +144,15 @@ def features(df: pd.DataFrame, encoder: BaseEncoder) -> np.ndarray:
     return pd.concat([base, agg], axis=1)[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
 
 
-def split_and_balance(df: pd.DataFrame, seed: int, sample_frac: float | None = None):
+def split_and_balance(df: pd.DataFrame, seed: int, sample_frac: float | None = None, *, with_stream: bool = False):
     """Features on the whole stream; encoder fit and balancing on ``fit`` only. Returns
     ``(encoder, F, y, rows, balanced_idx)`` where ``balanced_idx`` indexes the ``fit`` rows: every legit row once,
-    fraud resampled with replacement to the number of legit rows (``random_state=seed``). Shared by the MLP and the
-    XGBoost trainers, so both see the same rows."""
+    fraud resampled with replacement to the number of legit rows (``random_state=seed``). Shared by the MLP, the
+    XGBoost and the GRU trainers, so all see the same rows.
+
+    ``with_stream=True`` (sequence models) appends ``(F_all, pos)``: the features of the whole stream and, per
+    period, the positions in the stream of the rows kept in ``F[period]`` – so the true card history of any row,
+    resampled or not, can be looked up in ``F_all``."""
     per = period(df).to_numpy()
     fit_mask = per == "fit"
     encoder = BaseEncoder().fit(df[fit_mask])
@@ -156,18 +160,21 @@ def split_and_balance(df: pd.DataFrame, seed: int, sample_frac: float | None = N
     y_all = df["is_fraud"].to_numpy(dtype=np.int64)
     row_all = df["row"].to_numpy(dtype=np.int64)
 
-    F, y, rows = {}, {}, {}
+    F, y, rows, pos = {}, {}, {}, {}
     for name in PERIODS:
         m = per == name
-        F[name], y[name], rows[name] = F_all[m], y_all[m], row_all[m]
+        F[name], y[name], rows[name], pos[name] = F_all[m], y_all[m], row_all[m], np.flatnonzero(m)
     if sample_frac is not None:
         rng = np.random.default_rng(seed)
         keep = np.sort(rng.choice(len(F["fit"]), size=max(1, int(round(len(F["fit"]) * sample_frac))),
                                   replace=False))
         F["fit"], y["fit"], rows["fit"] = F["fit"][keep], y["fit"][keep], rows["fit"][keep]
+        pos["fit"] = pos["fit"][keep]
     legit, fraud = y["fit"] == 0, y["fit"] == 1
     up = resample(np.flatnonzero(fraud), replace=True, n_samples=int(legit.sum()), random_state=seed)
     idx = np.concatenate([np.flatnonzero(legit), up])
+    if with_stream:
+        return encoder, F, y, rows, idx, F_all, pos
     return encoder, F, y, rows, idx
 
 
@@ -194,6 +201,9 @@ def load_model(model_dir):
     if a.kind == "xgb":
         from .xgb import XGBFraudModel
         return XGBFraudModel.from_artifacts(a)
+    if a.kind == "gru":
+        from .gru import GRUFraudModel
+        return GRUFraudModel.from_artifacts(a)
     if a.kind != "mlp":
         raise ValueError(f"no model class for kind {a.kind!r}")
     return FraudModel.from_artifacts(a)

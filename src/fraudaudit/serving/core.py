@@ -8,12 +8,14 @@ columns inside ``FraudModel.predict_proba``.
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 
 import numpy as np
 
 from ..features.base import PREFIX, hour_features
 from ..features.columns import BASE_COLUMNS, FEATURE_COLUMNS
+from ..model.history import ArrayHistory
 from .state import CardState, Tx
 
 _N_BASE = len(BASE_COLUMNS)
@@ -41,6 +43,8 @@ class Serving:
         self._category = {c: i for i, c in enumerate(enc.categories)}  # index 0 = dropped baseline
         self._gender = set(enc.genders)
         self._cat0 = _COL[f"category_{enc.categories[1]}"]
+        self._history_rows = int(getattr(model, "history_rows", 0))  # > 0: a sequence model (GRU) needs the history
+        self._token = uuid.uuid4().hex  # marks the history rows cached in ``HistoryEntry`` as built by this instance
 
     def _base(self, state: CardState, tx: Tx) -> np.ndarray:
         prof = state.profile
@@ -88,7 +92,35 @@ class Serving:
             raise ValueError(f"non-finite features: {bad}")
         return f
 
+    def history(self, state: CardState, rows: int | None = None) -> ArrayHistory:
+        """The card's previous ``rows`` operations (default: what the model needs) as feature rows, oldest first,
+        left-padded with a False mask for a card with fewer: the serving side of ``model.history``."""
+        r = self._history_rows if rows is None else int(rows)
+        if not state._hx_known:
+            raise ValueError("this CardState was built from a frame without merchant/merch_lat/merch_long columns: "
+                             "it cannot feed a sequence model")
+        entries = state._hx[-r:] if r else ()
+        out = np.zeros((1, r, len(FEATURE_COLUMNS)), dtype=np.float32)
+        valid = np.zeros((1, r), dtype=bool)
+        off = r - len(entries)
+        for i, e in enumerate(entries):
+            if e.token != self._token:
+                f = np.empty(len(FEATURE_COLUMNS), dtype=np.float32)
+                f[:_N_BASE] = self._base(state, e.tx)
+                f[_N_BASE:] = e.agg
+                if not np.isfinite(f).all():
+                    raise ValueError("non-finite history features")
+                e.row, e.token = f, self._token
+            out[0, off + i] = e.row
+            valid[0, off + i] = True
+        return ArrayHistory(out, valid)
+
     def decide(self, state: CardState, tx: Tx) -> Decision:
-        """One operation, one call of the compiled ``predict_proba``; declined iff ``p >= tau``."""
-        p = float(self.model.predict_proba(self.features(state, tx)[np.newaxis, :])[0])
+        """One operation, one call of the compiled ``predict_proba``; declined iff ``p >= tau``. A sequence model
+        also gets the card's previous rows (``history``): the same call, the same state, no other path."""
+        f = self.features(state, tx)[np.newaxis, :]
+        if self._history_rows:
+            p = float(self.model.predict_proba(f, history=self.history(state))[0])
+        else:
+            p = float(self.model.predict_proba(f)[0])
         return Decision(p=p, declined=p >= self.tau)

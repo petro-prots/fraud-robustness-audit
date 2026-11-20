@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 from .features.columns import AGG_COLUMNS, FEATURE_COLUMNS
+from .model.history import score_rows
 from .model.pipeline import features
 from .serving.core import Serving
 from .serving.state import CardState, Tx, profile_of
@@ -104,7 +105,7 @@ def skew_check(df: pd.DataFrame, model, n_cards: int, seed: int, atol: float = 1
     sub = df[df["cc_num"].isin(chosen)].sort_values(["ts", "row"], kind="stable")
     sub = sub[_REPLAY_COLS].reset_index(drop=True)
     batch = features(sub, model.encoder)  # aggregates are per card: a card subset gives the same values
-    p_batch = np.asarray(model.predict_proba(batch), dtype=np.float64)
+    p_batch = score_rows(model, sub, batch)  # a sequence model gets the true history of every row (``sub`` is in time order)
 
     groups = [g for _, g in sub.groupby("cc_num", sort=True)]
     jobs = (os.cpu_count() or 1) if n_jobs is None else n_jobs

@@ -20,9 +20,10 @@ def val_scores(df: pd.DataFrame, model) -> tuple[np.ndarray, np.ndarray]:
     """(labels, p) of the clean val rows: features on the WHOLE stream (the windowed aggregates need the history
     before val), as in training."""
     from .data import period
+    from .model.history import score_rows
     from .model.pipeline import features
     m = (period(df) == "val").to_numpy()
-    p = np.asarray(model.predict_proba(features(df, model.encoder)[m]), dtype=np.float64)
+    p = score_rows(model, df, features(df, model.encoder), m)
     return df.loc[m, "is_fraud"].to_numpy(dtype=np.int64), p
 
 

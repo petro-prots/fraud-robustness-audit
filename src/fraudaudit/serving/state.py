@@ -40,6 +40,38 @@ _NO_PREV_NS = NO_PREV_SECS * _NS
 _HOUR_NS = HOUR_SECS * _NS
 _CAT_NS = CAT_WINDOW_SECS * _NS
 _COL = {c: i for i, c in enumerate(AGG_COLUMNS)}
+HISTORY_ROWS = 19  # previous operations kept for sequence models: k_max 20 of the GRU grid minus the current one
+
+
+class HistoryEntry:
+    """One previous operation of a card for sequence models: the ``Tx``, its ``AGG_COLUMNS`` row at its own time and
+    a cache slot ``row``/``token`` for the full 38-feature row, filled by the ``Serving`` (token) that built it."""
+    __slots__ = ("tx", "agg", "row", "token")
+
+    def __init__(self, tx, agg: np.ndarray) -> None:
+        self.tx, self.agg, self.row, self.token = tx, agg, None, None
+
+
+def _aggregate_row(times, amts, cats, hi: int, t: int, amt: float, category: str) -> np.ndarray:
+    """AGG_COLUMNS of an operation at ``t`` (ns) given the time-ordered operations ``times[:hi]`` (all strictly
+    before ``t``): the one implementation behind ``CardState.aggregates`` and the history rows of sequence models."""
+    out = np.zeros(len(AGG_COLUMNS), dtype=np.float64)
+    for k, w in enumerate(_WINDOWS_NS):
+        lo = bisect_left(times, t - w, 0, hi)  # first t_j >= t - w
+        n = hi - lo
+        if n > 0:
+            out[k] = n
+            out[3 + k] = sum(amts[lo:hi]) / n
+    gap = t - times[hi - 1] if hi > 0 else _NO_PREV_NS
+    out[6] = min(gap, _NO_PREV_NS) / _NS
+    lo = bisect_left(times, t - _HOUR_NS, 0, hi)
+    out[_COL["cnt_1h"]] = hi - lo
+    out[_COL["sum_1h"]] = sum(amts[lo:hi])
+    lo = bisect_left(times, t - _CAT_NS, 0, hi)
+    category = str(category)
+    out[_COL["cnt_cat_24h"]] = sum(1 for c in cats[lo:hi] if c == category)
+    out[_COL["amt_ratio_30d"]] = amt_ratio(float(amt), out[_COL["mean_amt_30d"]])
+    return out
 
 
 @dataclass(frozen=True)
@@ -182,6 +214,39 @@ class SpendHistory:
         return v
 
 
+_TX_COLUMNS = ("merchant", "merch_lat", "merch_long")
+
+
+def _history_entries(h: pd.DataFrame, before: np.ndarray, t_all: np.ndarray, amt_all: np.ndarray) -> tuple:
+    """``(entries, known)`` for ``CardState.from_history``: the last ``HISTORY_ROWS`` operations of ``h`` flagged by
+    the mask ``before`` (every operation before the state time, any age), as ``HistoryEntry`` (``Tx``, AGG_COLUMNS row at its own
+    time), oldest first; the row sees every earlier operation of ``h`` (the card's whole history, as the batch
+    path). ``known`` is False when ``h`` lacks the columns of a ``Tx`` (such a state cannot feed a sequence model)."""
+    if not all(c in h for c in _TX_COLUMNS):
+        return (), False
+    idx = np.flatnonzero(before)
+    if idx.size == 0:
+        return (), True
+    order = idx[np.argsort(t_all[idx], kind="stable")]
+    t_s, a_s = t_all[order], amt_all[order]
+    cat_s = h["category"].astype(str).to_numpy()[order]
+    n_keep = min(HISTORY_ROWS, order.size)
+    first = order.size - n_keep
+    start = int(np.searchsorted(t_s, t_s[first] - _KEEP_NS, "left"))
+    times, amts, cats = t_s[start:].tolist(), a_s[start:].tolist(), cat_s[start:].tolist()
+    merchant = h["merchant"].astype(str).to_numpy()[order]
+    mlat = h["merch_lat"].to_numpy(dtype=np.float64)[order]
+    mlong = h["merch_long"].to_numpy(dtype=np.float64)[order]
+    out = []
+    for q in range(first, order.size):
+        j = q - start
+        agg = _aggregate_row(times, amts, cats, bisect_left(times, times[j]), times[j], amts[j], cats[j])
+        tx = Tx(ts=pd.Timestamp(int(t_s[q])), amt=float(a_s[q]), merchant=str(merchant[q]), category=str(cat_s[q]),
+                merch_lat=float(mlat[q]), merch_long=float(mlong[q]))
+        out.append(HistoryEntry(tx, agg))
+    return tuple(out), True
+
+
 def _cents(a: float) -> int:
     return int(round(float(a) * 100))
 
@@ -199,6 +264,13 @@ class CardState:
         self._k: list[int] = []  # owner-confirmed amount in cents (0 unless the owner confirmed it; corridor V2)
         self._now: int | None = None  # ns; None = no time seen yet
         self.spend: SpendHistory = SpendHistory.empty()
+        # The last ``HISTORY_ROWS`` operations of the card of ANY age and any origin (owner or attacker, passed or
+        # declined), oldest first, as ``HistoryEntry`` (Tx, AGG_COLUMNS row at its own time): what a sequence model (GRU) needs
+        # to rebuild the feature rows of the card's previous operations. A persistent tuple, shared by copies.
+        self._hx: tuple = ()
+        self._hx_known = True  # False: ``from_history`` got a frame without the columns of a Tx
+        self._memo: tuple | None = None  # (version, t, amt, category, row): the last ``aggregates`` answer
+        self._ver = 0  # bumped by every push
 
     @classmethod
     def from_history(cls, profile: CardProfile, history: pd.DataFrame, at: pd.Timestamp) -> "CardState":
@@ -225,6 +297,7 @@ class CardState:
         lm = t_all < at_ns
         lo = np.argsort(t_all[lm], kind="stable")
         s.spend = SpendHistory(t_all[lm][lo], amt_all[lm][lo])
+        s._hx, s._hx_known = _history_entries(h, lm, t_all, amt_all)
         return s
 
     @property
@@ -245,24 +318,12 @@ class CardState:
         is not changed."""
         t = pd.Timestamp(ts).value
         self._check_time(t, "query")
-        times, amts = self._t, self._a
-        hi = bisect_left(times, t)  # ops strictly before t: [0, hi)
-        out = np.zeros(len(AGG_COLUMNS), dtype=np.float64)
-        for k, w in enumerate(_WINDOWS_NS):
-            lo = bisect_left(times, t - w, 0, hi)  # first t_j >= t - w
-            n = hi - lo
-            if n > 0:
-                out[k] = n
-                out[3 + k] = sum(amts[lo:hi]) / n
-        gap = t - times[hi - 1] if hi > 0 else _NO_PREV_NS
-        out[6] = min(gap, _NO_PREV_NS) / _NS
-        lo = bisect_left(times, t - _HOUR_NS, 0, hi)
-        out[_COL["cnt_1h"]] = hi - lo
-        out[_COL["sum_1h"]] = sum(amts[lo:hi])
-        lo = bisect_left(times, t - _CAT_NS, 0, hi)
-        category = str(category)
-        out[_COL["cnt_cat_24h"]] = sum(1 for c in self._c[lo:hi] if c == category)
-        out[_COL["amt_ratio_30d"]] = amt_ratio(float(amt), out[_COL["mean_amt_30d"]])
+        m = self._memo
+        if m is not None and m[0] == self._ver and m[1] == t and m[2] == float(amt) and m[3] == str(category):
+            return m[4].copy()
+        times = self._t
+        out = _aggregate_row(times, self._a, self._c, bisect_left(times, t), t, amt, category)  # ops strictly before t
+        self._memo = (self._ver, t, float(amt), str(category), out.copy())
         return out
 
     def auto_sum_cents(self, t_ns: int, w_ns: int) -> int:
@@ -296,6 +357,9 @@ class CardState:
             raise ValueError("a confirmed operation passed and was not auto-approved")
         t = pd.Timestamp(tx.ts).value
         self._check_time(t, "push")
+        agg = self.aggregates(tx.ts, tx.amt, tx.category)  # the row of ``tx`` itself (usually memoised by ``decide``)
+        self._hx = (self._hx + (HistoryEntry(tx, agg),))[-HISTORY_ROWS:]
+        self._ver += 1
         self._t.append(t)
         self._a.append(float(tx.amt))
         self._c.append(str(tx.category))
@@ -314,4 +378,5 @@ class CardState:
         c._k = list(self._k)
         c._now = self._now
         c.spend = self.spend  # persistent: shared
+        c._hx, c._hx_known, c._ver = self._hx, self._hx_known, self._ver  # persistent tuple: shared
         return c

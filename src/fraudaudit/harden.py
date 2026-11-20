@@ -483,6 +483,9 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         if getattr(model, "kind", "mlp") == "xgb":  # same procedure, the clean-val hyperparameters of the input model
             from .model.xgb import train_xgb_model
             new_model, rep = train_xgb_model(df_r, seed=seed, params=model.params)
+        elif getattr(model, "kind", "mlp") == "gru":  # same procedure, k/hidden chosen on the base's clean val
+            from .model.gru import train_gru_model
+            new_model, rep = train_gru_model(df_r, seed=seed, params=model.params, epochs=epochs)
         elif getattr(model, "kind", "mlp") == "mlp":
             new_model, rep = train_model(df_r, seed=seed, epochs=epochs)
         else:
@@ -539,6 +542,7 @@ def fp_diagnostic(df: pd.DataFrame, models: dict) -> dict:
 
     Diagnostic only, computed after the last round: no hardening decision (rounds, early stop, τ, final model)
     depends on it; τ stays the one chosen on val."""
+    from .model.history import score_rows
     from .model.pipeline import features
     m = (period(df) == "test").to_numpy()
     t = df.loc[m]
@@ -546,8 +550,7 @@ def fp_diagnostic(df: pd.DataFrame, models: dict) -> dict:
     keys = {"month": t["ts"].dt.strftime("%Y-%m").to_numpy(), "category": t["category"].astype(str).to_numpy()}
     out: dict = {"by_month": {}, "by_category": {}, "total": {}}
     for name, model in models.items():
-        F = features(df, model.encoder)[m]
-        fp = (np.asarray(model.predict_proba(F)) >= model.tau) & legit
+        fp = (score_rows(model, df, features(df, model.encoder), m) >= model.tau) & legit
         out["total"][name] = {"fp": int(fp.sum()), "n_legit": int(legit.sum()),
                               "fpr": float(fp.sum() / max(1, legit.sum())), "tau": float(model.tau)}
         for kname, k in keys.items():

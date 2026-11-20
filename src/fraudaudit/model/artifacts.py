@@ -36,6 +36,7 @@ SCALER_FILE = "scaler.skops"
 IFOREST_FILE = "iforest.skops"
 ENCODER_FILE = "encoder.json"
 XGB_FILE = "xgb.json"  # XGBoost's own JSON model format: plain text, no pickle
+GRU_FILE = "gru.keras"
 MODEL_FILE = "model.json"  # tau, feature_columns, versions, meta: hashed, unlike manifest.json
 MANIFEST_FILE = "manifest.json"
 HASHED_FILES = (MLP_FILE, SCALER_FILE, IFOREST_FILE, ENCODER_FILE, MODEL_FILE)  # the MLP kind (the default)
@@ -46,6 +47,7 @@ MANIFEST_FORMAT = 1
 KIND_FILES: dict[str, tuple[str, ...]] = {
     "mlp": HASHED_FILES,
     "xgb": (XGB_FILE, ENCODER_FILE, MODEL_FILE),
+    "gru": (GRU_FILE, SCALER_FILE, ENCODER_FILE, MODEL_FILE),
 }
 
 # Types outside skops' built-in safe set that StandardScaler and IsolationForest
@@ -73,6 +75,8 @@ class Artifacts:
     kind: str = "mlp"
     xgb: object | None = None  # xgboost.Booster when kind == "xgb"
     xgb_params: dict | None = None
+    gru: keras.Model | None = None  # when kind == "gru" (the scaler is in ``scaler``)
+    gru_params: dict | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -154,6 +158,34 @@ def save_xgb_artifacts(out_dir: Path, *, booster, encoder: BaseEncoder, tau: flo
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def save_gru_artifacts(out_dir: Path, *, net: keras.Model, scaler: StandardScaler, encoder: BaseEncoder, tau: float,
+                       meta: dict, params: dict, feature_columns=FEATURE_COLUMNS) -> None:
+    """GRU kind: ``gru.keras`` (loaded with ``safe_mode=True``), ``scaler.skops``, ``encoder.json``, ``model.json``
+    (with ``kind`` and the chosen window/size ``gru_params`` = ``{"k", "hidden"}``) and a manifest with ``kind``. No
+    IsolationForest flag."""
+    feature_set_name(feature_columns)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    net.save(out_dir / GRU_FILE)
+    sio.dump(scaler, out_dir / SCALER_FILE)
+    (out_dir / ENCODER_FILE).write_text(
+        json.dumps(encoder.to_json(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    model_info = {
+        "kind": "gru",
+        "tau": float(tau),
+        "feature_columns": list(feature_columns),
+        "gru_params": {"k": int(params["k"]), "hidden": int(params["hidden"])},
+        "versions": _versions(),
+        "meta": meta,
+    }
+    (out_dir / MODEL_FILE).write_text(
+        json.dumps(model_info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest = {"format": MANIFEST_FORMAT, "kind": "gru",
+                "sha256": {name: _sha256(out_dir / name) for name in KIND_FILES["gru"]}}
+    (out_dir / MANIFEST_FILE).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _read_json(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -189,6 +221,11 @@ def _check_model_info(info: dict, kind: str = "mlp") -> None:
         if not isinstance(p, dict) or any(isinstance(p.get(k), bool) or not isinstance(p.get(k), int)
                                           for k in ("max_depth", "n_estimators")):
             raise ArtifactIntegrityError("xgb_params must hold integer max_depth and n_estimators")
+    if kind == "gru":
+        p = info.get("gru_params")
+        if not isinstance(p, dict) or any(isinstance(p.get(k), bool) or not isinstance(p.get(k), int) or p.get(k) < 1
+                                          for k in ("k", "hidden")) or p["k"] < 2:
+            raise ArtifactIntegrityError("gru_params must hold integer k >= 2 and hidden >= 1")
     tau = info.get("tau")
     if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau) \
             or not 0.0 <= tau <= 1.0:
@@ -241,6 +278,14 @@ def load_artifacts(model_dir: Path) -> Artifacts:
         return Artifacts(mlp=None, scaler=None, iforest=None, encoder=encoder, tau=float(info["tau"]),
                          meta=info["meta"], manifest=manifest, feature_columns=tuple(info["feature_columns"]),
                          kind="xgb", xgb=booster, xgb_params=dict(info["xgb_params"]))
+    if kind == "gru":
+        from .gru import configure_tf  # before the first TensorFlow op: fixed threads, deterministic ops
+        configure_tf()
+        net = keras.models.load_model(model_dir / GRU_FILE, safe_mode=True, compile=False)
+        return Artifacts(mlp=None, scaler=_load_skops(model_dir / SCALER_FILE), iforest=None, encoder=encoder,
+                         tau=float(info["tau"]), meta=info["meta"], manifest=manifest,
+                         feature_columns=tuple(info["feature_columns"]), kind="gru", gru=net,
+                         gru_params=dict(info["gru_params"]))
     if kind != "mlp":
         raise ArtifactIntegrityError(f"no loader for model kind {kind!r}")
     mlp = keras.models.load_model(model_dir / MLP_FILE, safe_mode=True, compile=False)
