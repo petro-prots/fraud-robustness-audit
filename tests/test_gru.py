@@ -405,16 +405,16 @@ print(json.dumps({{"p": hashlib.sha256(p.tobytes()).hexdigest(), "w": w, "tau": 
 """
 
 
-def _probe() -> dict:
+def _probe(hashseed: str = "0") -> dict:
     out = subprocess.run([sys.executable, "-c", PROBE.format(tests=str(TESTS))], capture_output=True, text=True,
-                         check=True, cwd=ROOT, env={**__import__("os").environ, "PYTHONHASHSEED": "0"})
+                         check=True, cwd=ROOT, env={**__import__("os").environ, "PYTHONHASHSEED": hashseed})
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
 def test_training_twice_is_bit_for_bit_identical_k5_h32():
     """R37 addendum: the smallest grid variant (k 5, hidden 32) trained twice (two fresh processes) gives the same
     weights and the same validation scores, bit for bit; strict mode = deterministic ops and one thread each."""
-    a, b = _probe(), _probe()
+    a, b = _probe("0"), _probe("12345")  # different hash seeds: the real chain does not pin PYTHONHASHSEED
     assert a["tf"]["strict"] is True and a["tf"]["intra_op_threads"] == 1 and a["tf"]["inter_op_threads"] == 1
     assert a == b
 
@@ -588,3 +588,29 @@ def test_non_strict_training_refused_without_flag(monkeypatch):
     monkeypatch.setattr(gru, "configure_tf", lambda: {"strict": False})
     with pytest.raises(RuntimeError, match="strict"):
         gru.train_gru_model(None, 1, params={"k": 5, "hidden": 8})
+
+
+def test_batches_are_reshuffled_every_epoch(monkeypatch):
+    """R38: the batch order is default_rng([seed, epoch]); Keras must really call on_epoch_end each epoch."""
+    import numpy as np
+    from fraudaudit.model import gru as g
+    seen = []
+    orig = g._Batches.on_epoch_end
+
+    def spy(self):
+        orig(self)
+        seen.append(self._perm.copy())
+    monkeypatch.setattr(g._Batches, "on_epoch_end", spy)
+    n = 200
+    Fs = np.random.default_rng(0).normal(size=(n, g.N_FEATURES)).astype("float32")
+    prev = np.full((n, 4), -1, dtype=np.int64)
+    pos = np.arange(n)
+    y = (np.arange(n) % 2).astype("float32")
+    monkeypatch.setenv(g.ALLOW_NONSTRICT_ENV, "1")
+    g._fit_net(Fs, prev, pos, y, 5, 8, 42, 3)
+    # Keras calls on_epoch_end after each of the 3 epochs and once more after the last one (a look-ahead that trains
+    # nothing), so at least 3 calls; the order for epoch e must be default_rng([seed, e]) and differ between epochs
+    assert len(seen) >= 3
+    for e in (1, 2, 3):
+        assert np.array_equal(seen[e - 1], np.random.default_rng([42, e]).permutation(n))
+    assert not np.array_equal(seen[0], seen[1]) and not np.array_equal(seen[1], seen[2])

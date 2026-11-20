@@ -58,6 +58,11 @@ KIND_FILES: dict[str, tuple[str, ...]] = {
 TRUSTED_SKOPS_TYPES: tuple[str, ...] = ()
 
 
+def _max_window() -> int:
+    from ..serving.state import HISTORY_ROWS  # lazy: serving imports this module
+    return HISTORY_ROWS + 1
+
+
 class ArtifactIntegrityError(RuntimeError):
     """An artifact is missing, altered, or contains a type outside the allow-list."""
 
@@ -224,8 +229,9 @@ def _check_model_info(info: dict, kind: str = "mlp") -> None:
     if kind == "gru":
         p = info.get("gru_params")
         if not isinstance(p, dict) or any(isinstance(p.get(k), bool) or not isinstance(p.get(k), int) or p.get(k) < 1
-                                          for k in ("k", "hidden")) or not 2 <= p["k"] <= 20:
-            raise ArtifactIntegrityError("gru_params must hold integer 2 <= k <= 20 and hidden >= 1")
+                                          for k in ("k", "hidden")) or not 2 <= p["k"] <= _max_window() \
+                or set(p) != {"k", "hidden"}:
+            raise ArtifactIntegrityError(f"gru_params must be exactly integer k in 2..{_max_window()} and hidden >= 1")
     tau = info.get("tau")
     if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau) \
             or not 0.0 <= tau <= 1.0:
@@ -279,9 +285,20 @@ def load_artifacts(model_dir: Path) -> Artifacts:
                          meta=info["meta"], manifest=manifest, feature_columns=tuple(info["feature_columns"]),
                          kind="xgb", xgb=booster, xgb_params=dict(info["xgb_params"]))
     if kind == "gru":
-        from .gru import configure_tf  # before the first TensorFlow op: fixed threads, deterministic ops
-        configure_tf()
+        import os
+        from .gru import ALLOW_NONSTRICT_ENV, configure_tf  # before the first TensorFlow op: fixed threads, det. ops
+        cfg = configure_tf()
+        if not cfg["strict"] and not os.environ.get(ALLOW_NONSTRICT_ENV):
+            raise ArtifactIntegrityError(
+                f"a GRU model must be loaded in strict reproducibility mode ({cfg}): TensorFlow already ran in this "
+                f"process with other settings (one model kind per process; {ALLOW_NONSTRICT_ENV}=1 only in tests)")
         net = keras.models.load_model(model_dir / GRU_FILE, safe_mode=True, compile=False)
+        gp = info["gru_params"]
+        shapes = [tuple(i.shape) for i in net.inputs]
+        units = [l.units for l in net.layers if isinstance(l, keras.layers.GRU)]
+        if shapes != [(None, gp["k"], len(FEATURE_COLUMNS)), (None, gp["k"])] or units != [gp["hidden"]]:
+            raise ArtifactIntegrityError(f"gru.keras (inputs {shapes}, GRU units {units}) does not match "
+                                         f"gru_params {gp}")
         return Artifacts(mlp=None, scaler=_load_skops(model_dir / SCALER_FILE), iforest=None, encoder=encoder,
                          tau=float(info["tau"]), meta=info["meta"], manifest=manifest,
                          feature_columns=tuple(info["feature_columns"]), kind="gru", gru=net,
