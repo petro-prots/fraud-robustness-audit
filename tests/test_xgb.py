@@ -213,3 +213,34 @@ def test_harden_round_with_xgb(df, model_dir, tmp_path):
     assert a.kind == "xgb" and a.meta["harden"]["round"] == 2 and "test" not in a.meta
     assert a.meta["xgb"]["selection"] is None
     assert a.meta["fraud_rows"]["fit"] > int(((hmod.period(df) == "fit") & (df["is_fraud"] == 1)).sum())
+
+
+def test_unknown_kinds_are_refused(trained, tmp_path):
+    trained[0].save(tmp_path, meta={})
+    m = json.loads((tmp_path / "manifest.json").read_text())
+    (tmp_path / "manifest.json").write_text(json.dumps({**m, "kind": ["xgb"]}))
+    with pytest.raises(ArtifactIntegrityError):
+        load_artifacts(tmp_path)
+
+
+def test_xgb_params_cli_validation():
+    from fraudaudit import cli
+    ok = cli.build_parser().parse_args(["train", "--model-kind", "xgb", "--xgb-params", "6,200"])
+    assert ok.xgb_params == {"max_depth": 6, "n_estimators": 200}
+    for bad in ("6", "6,200,1", "0,200", "a,b"):
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(["train", "--model-kind", "xgb", "--xgb-params", bad])
+
+
+def test_non_finite_grid_tau_is_stored_as_null(df, monkeypatch):
+    real = xmod.threshold_at_fpr
+    calls = {"n": 0}
+
+    def flaky(y, p, fpr):
+        calls["n"] += 1
+        return float("inf") if calls["n"] == 1 else real(y, p, fpr)
+
+    monkeypatch.setattr(xmod, "threshold_at_fpr", flaky)
+    _, rep = train_xgb_model(df, seed=0, grid=((2, 5), (2, 9)))
+    assert rep["xgb"]["selection"][0]["tau"] is None
+    json.dumps(rep, allow_nan=False)

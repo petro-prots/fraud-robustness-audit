@@ -194,6 +194,8 @@ def load_model(model_dir):
     if a.kind == "xgb":
         from .xgb import XGBFraudModel
         return XGBFraudModel.from_artifacts(a)
+    if a.kind != "mlp":
+        raise ValueError(f"no model class for kind {a.kind!r}")
     return FraudModel.from_artifacts(a)
 
 

@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--model-kind", choices=("mlp", "xgb"), default="mlp",
                        help="mlp (the bachelor model, default) or xgb (gradient-boosted trees; hyperparameters "
                             "chosen on clean val over the fixed grid unless --xgb-params is given)")
-    train.add_argument("--xgb-params", default=None, metavar="DEPTH,N_ESTIMATORS",
+    train.add_argument("--xgb-params", type=_xgb_params, default=None, metavar="DEPTH,N_ESTIMATORS",
                        help="xgb only: skip the grid search and train with these values (e.g. 6,200)")
 
     skew = sub.add_parser("skew", help="check that the batch and serving feature paths agree")
@@ -247,18 +247,29 @@ def _model_sha256(model_dir: Path) -> str:
     return hashlib.sha256((model_dir / "model.json").read_bytes()).hexdigest()
 
 
+def _xgb_params(text: str) -> dict:
+    """``--xgb-params DEPTH,N_ESTIMATORS``: two positive integers."""
+    try:
+        depth, n_est = (int(v) for v in text.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected DEPTH,N_ESTIMATORS (two integers), got {text!r}") from None
+    if depth < 1 or n_est < 1:
+        raise argparse.ArgumentTypeError("DEPTH and N_ESTIMATORS must be positive")
+    return {"max_depth": depth, "n_estimators": n_est}
+
+
 def cmd_train(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.model.pipeline import train_model
 
+    if args.xgb_params and args.model_kind != "xgb":
+        print("error: --xgb-params needs --model-kind xgb", file=sys.stderr)
+        return 2
     df = load_raw(args.data)
     print(f"loaded {len(df)} rows", flush=True)
     if args.model_kind == "xgb":
         from fraudaudit.model.xgb import train_xgb_model
-        params = None
-        if args.xgb_params:
-            depth, n_est = (int(v) for v in args.xgb_params.split(","))
-            params = {"max_depth": depth, "n_estimators": n_est}
+        params = args.xgb_params
         model, report = train_xgb_model(df, seed=args.seed, params=params, sample_frac=args.sample_frac)
     else:
         model, report = train_model(df, seed=args.seed, epochs=args.epochs,

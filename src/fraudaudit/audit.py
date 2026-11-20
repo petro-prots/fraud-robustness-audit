@@ -274,9 +274,15 @@ def _versions() -> dict:
     import tensorflow as tf
 
     from . import __version__
-    return {"python": platform.python_version(), "fraudaudit": __version__, "numpy": np.__version__,
-            "pandas": pd.__version__, "scikit-learn": sklearn.__version__, "scipy": scipy.__version__,
-            "tensorflow": tf.__version__, "keras": keras.__version__}
+    v = {"python": platform.python_version(), "fraudaudit": __version__, "numpy": np.__version__,
+         "pandas": pd.__version__, "scikit-learn": sklearn.__version__, "scipy": scipy.__version__,
+         "tensorflow": tf.__version__, "keras": keras.__version__}
+    try:
+        import xgboost
+        v["xgboost"] = xgboost.__version__
+    except ImportError:
+        pass
+    return v
 
 
 def clean_quality(df: pd.DataFrame, model, periods: tuple[str, ...] = ("val", "test")) -> dict:
@@ -420,7 +426,7 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
                          "params": dataclasses.asdict(tm)},
         "model": {"dir": None if model_dir is None else str(model_dir),
                   "model_json_sha256": None if model_dir is None else _sha256(Path(model_dir) / "model.json"),
-                  "tau": float(model.tau)},
+                  "tau": float(model.tau), "kind": getattr(model, "kind", "mlp")},
         "target_periods": list(target_periods),
         "spares_period": spares_period,
         "one_sided": one_sided,

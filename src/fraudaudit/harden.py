@@ -483,8 +483,10 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         if getattr(model, "kind", "mlp") == "xgb":  # same procedure, the clean-val hyperparameters of the input model
             from .model.xgb import train_xgb_model
             new_model, rep = train_xgb_model(df_r, seed=seed, params=model.params)
-        else:
+        elif getattr(model, "kind", "mlp") == "mlp":
             new_model, rep = train_model(df_r, seed=seed, epochs=epochs)
+        else:
+            raise ValueError(f"harden has no trainer for model kind {model.kind!r}")
         t_train = time.perf_counter() - t1
         rdir = out / f"round-{r}"
         by_round = {str(g): sum(len(x["ops"]) for x in selected if x["round"] == g) for g in range(1, r + 1)}

@@ -171,7 +171,7 @@ def _check_manifest(manifest: dict) -> tuple[str, dict]:
     if manifest.get("format") != MANIFEST_FORMAT:
         raise ArtifactIntegrityError(f"unsupported manifest format: {manifest.get('format')!r}")
     kind = manifest.get("kind", "mlp")
-    if kind not in KIND_FILES or ("kind" in manifest and kind == "mlp"):
+    if not isinstance(kind, str) or kind not in KIND_FILES or ("kind" in manifest and kind == "mlp"):
         raise ArtifactIntegrityError(f"unsupported model kind in the manifest: {manifest.get('kind')!r}")
     files = KIND_FILES[kind]
     if not isinstance(expected, dict) or set(expected) != set(files):
@@ -241,6 +241,8 @@ def load_artifacts(model_dir: Path) -> Artifacts:
         return Artifacts(mlp=None, scaler=None, iforest=None, encoder=encoder, tau=float(info["tau"]),
                          meta=info["meta"], manifest=manifest, feature_columns=tuple(info["feature_columns"]),
                          kind="xgb", xgb=booster, xgb_params=dict(info["xgb_params"]))
+    if kind != "mlp":
+        raise ArtifactIntegrityError(f"no loader for model kind {kind!r}")
     mlp = keras.models.load_model(model_dir / MLP_FILE, safe_mode=True, compile=False)
     scaler = _load_skops(model_dir / SCALER_FILE)
     iforest = _load_skops(model_dir / IFOREST_FILE)

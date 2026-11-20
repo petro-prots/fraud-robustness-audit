@@ -98,7 +98,8 @@ def train_xgb_model(df: pd.DataFrame, seed: int, params: dict | None = None, gri
             p_val = m.predict_proba(F["val"])
             tau = threshold_at_fpr(y["val"], p_val, TARGET_FPR)
             q = quality(y["val"], p_val, tau)
-            selection.append({"max_depth": depth, "n_estimators": n_est, "tau": float(tau),
+            selection.append({"max_depth": depth, "n_estimators": n_est,
+                              "tau": float(tau) if math.isfinite(tau) else None,
                               "recall": q["recall"], "fpr": q["fpr"]})
             boosters[(depth, n_est)] = booster
         best = pick_best(selection)
