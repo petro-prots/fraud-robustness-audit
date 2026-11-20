@@ -614,3 +614,34 @@ def test_batches_are_reshuffled_every_epoch(monkeypatch):
     for e in (1, 2, 3):
         assert np.array_equal(seen[e - 1], np.random.default_rng([42, e]).permutation(n))
     assert not np.array_equal(seen[0], seen[1]) and not np.array_equal(seen[1], seen[2])
+
+
+def test_audit_start_state_from_history_scores_like_the_batch_path(df, trained):
+    """The state every audit episode starts from is ``CardState.from_history(profile, earlier rows, at)``; the skew
+    check only replays from an empty state. Compare, at several cut points of several cards (more than 19 earlier
+    operations and more than 30 days of history, timestamps differing at the cut), the probability of
+    ``Serving.decide`` on that state with the batch path (``features`` + ``score_rows`` over the ordered card)."""
+    from fraudaudit.skew import _REPLAY_COLS
+    from fraudaudit.model.pipeline import features
+    m = trained[0]
+    serving = Serving(m)
+    checked = 0
+    for cc in sorted(df["cc_num"].unique())[:12]:
+        g = df[df["cc_num"] == cc].sort_values(["ts", "row"], kind="stable")[_REPLAY_COLS].reset_index(drop=True)
+        if len(g) < 40:
+            continue
+        F = features(g, m.encoder)
+        p_batch = score_rows(m, g, F)
+        profile = profile_of(g, cc)
+        for cut in (len(g) // 3, len(g) // 2, len(g) - 2):
+            while cut < len(g) - 1 and g["ts"].iloc[cut] == g["ts"].iloc[cut - 1]:
+                cut += 1
+            at = g["ts"].iloc[cut]
+            hist = g.iloc[:cut]
+            if cut <= HISTORY_ROWS or at - hist["ts"].iloc[0] <= pd.Timedelta(days=30):
+                continue
+            state = CardState.from_history(profile, hist, at=at)
+            p = serving.decide(state, _tx(next(g.iloc[cut:cut + 1].itertuples(index=False)))).p
+            assert abs(p - p_batch[cut]) <= 1e-4, (cc, cut, p, p_batch[cut])
+            checked += 1
+    assert checked >= 6
