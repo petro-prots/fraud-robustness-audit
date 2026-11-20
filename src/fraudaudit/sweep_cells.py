@@ -53,12 +53,12 @@ def check_own_tau(model_dir, model, tau: float, fpr: float) -> None:
 def model_at_tau(model_dir, model, tau: float, fpr: float, derived_dir, note: str):
     """(directory, model) at threshold ``tau``: the model itself when ``tau`` equals its own τ, else a derived
     directory ``derived_dir`` (``derive_with_tau``: same weights, ``meta.target_fpr = fpr``)."""
-    from .model.artifacts import derive_with_tau, load_artifacts
-    from .model.pipeline import FraudModel
+    from .model.artifacts import derive_with_tau
+    from .model.pipeline import load_model
     if math.isclose(tau, float(model.tau), rel_tol=1e-6):
         return Path(model_dir), model
     derive_with_tau(model_dir, derived_dir, tau, {"target_fpr": float(fpr), "note": note})
-    return Path(derived_dir), FraudModel.from_artifacts(load_artifacts(derived_dir))
+    return Path(derived_dir), load_model(derived_dir)
 
 
 def run_cell(df, model, model_dir, tm, cfg, seed: int, *, n_jobs=None, threat_path=None,

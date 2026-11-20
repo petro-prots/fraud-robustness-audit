@@ -421,7 +421,7 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
     if tuple(getattr(model, "feature_columns", FEATURE_COLUMNS)) != FEATURE_COLUMNS:
         raise ValueError("harden retrains on the current feature set (38 FEATURE_COLUMNS); the input model uses "
                          f"another one ({len(model.feature_columns)} columns): its rounds would not be comparable")
-    from .model.pipeline import EPOCHS, FraudModel, train_model
+    from .model.pipeline import EPOCHS, load_model, train_model
     say = log or (lambda m: None)
     jobs = max(1, int(n_jobs if n_jobs is not None else (os.cpu_count() or 1)))
     epochs = EPOCHS if epochs is None else int(epochs)
@@ -480,7 +480,11 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         adv = adversarial_frame(df, selected, slots)
         df_r = insert_rows(df, adv)
         t1 = time.perf_counter()
-        new_model, rep = train_model(df_r, seed=seed, epochs=epochs)
+        if getattr(model, "kind", "mlp") == "xgb":  # same procedure, the clean-val hyperparameters of the input model
+            from .model.xgb import train_xgb_model
+            new_model, rep = train_xgb_model(df_r, seed=seed, params=model.params)
+        else:
+            new_model, rep = train_model(df_r, seed=seed, epochs=epochs)
         t_train = time.perf_counter() - t1
         rdir = out / f"round-{r}"
         by_round = {str(g): sum(len(x["ops"]) for x in selected if x["round"] == g) for g in range(1, r + 1)}
@@ -498,8 +502,7 @@ def harden(df: pd.DataFrame, model, tm: ThreatModel, gate_cfg, rounds: int = ROU
         (rdir / "adversarial-rows.csv").write_text(adv.to_csv(index=False), encoding="utf-8")
         say(f"round {r}: trained on {len(adv)} adversarial rows in {t_train:.0f} s, tau {new_model.tau:.6g}, "
             f"val recall {rep['val']['recall']:.4f} FPR {rep['val']['fpr']:.4f}")
-        from .model.artifacts import load_artifacts
-        cur_model, cur_dir = FraudModel.from_artifacts(load_artifacts(rdir)), rdir
+        cur_model, cur_dir = load_model(rdir), rdir
         t2 = time.perf_counter()
         res = _mini_audit(df, cur_model, tm, gate_cfg, seed, val_eps, h_eps, n_jobs=jobs, model_dir=cur_dir,
                           seeds=mini_audit_seeds, threat_path=threat_path)

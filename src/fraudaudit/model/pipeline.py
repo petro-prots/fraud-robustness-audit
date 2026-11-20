@@ -111,7 +111,11 @@ class FraudModel:
         Xs = self.scaler.transform(F)
         return np.hstack([Xs, iforest_flag(self.iforest, Xs)]).astype(np.float32)
 
-    def predict_proba(self, F: np.ndarray) -> np.ndarray:
+    kind = "mlp"
+
+    def predict_proba(self, F: np.ndarray, history=None) -> np.ndarray:
+        """``history`` (the card's previous feature rows) is part of the common model interface (sequence models
+        use it); the MLP scores one row at a time and ignores it."""
         X = self.mlp_inputs(F)
         return self._forward(tf.constant(X)).numpy().reshape(-1).astype(np.float64)
 
@@ -140,12 +144,11 @@ def features(df: pd.DataFrame, encoder: BaseEncoder) -> np.ndarray:
     return pd.concat([base, agg], axis=1)[list(FEATURE_COLUMNS)].to_numpy(dtype=np.float32)
 
 
-def build_datasets(df: pd.DataFrame, seed: int, sample_frac: float | None = None) -> Datasets:
-    """Features on the whole stream; encoder/scaler/IsolationForest fit and balancing on ``fit`` only.
-
-    ``sample_frac`` (timing probes only) subsamples ``fit`` rows after the features are computed;
-    the encoder still sees all ``fit`` rows, ``val`` and ``test`` stay complete.
-    """
+def split_and_balance(df: pd.DataFrame, seed: int, sample_frac: float | None = None):
+    """Features on the whole stream; encoder fit and balancing on ``fit`` only. Returns
+    ``(encoder, F, y, rows, balanced_idx)`` where ``balanced_idx`` indexes the ``fit`` rows: every legit row once,
+    fraud resampled with replacement to the number of legit rows (``random_state=seed``). Shared by the MLP and the
+    XGBoost trainers, so both see the same rows."""
     per = period(df).to_numpy()
     fit_mask = per == "fit"
     encoder = BaseEncoder().fit(df[fit_mask])
@@ -162,17 +165,36 @@ def build_datasets(df: pd.DataFrame, seed: int, sample_frac: float | None = None
         keep = np.sort(rng.choice(len(F["fit"]), size=max(1, int(round(len(F["fit"]) * sample_frac))),
                                   replace=False))
         F["fit"], y["fit"], rows["fit"] = F["fit"][keep], y["fit"][keep], rows["fit"][keep]
+    legit, fraud = y["fit"] == 0, y["fit"] == 1
+    up = resample(np.flatnonzero(fraud), replace=True, n_samples=int(legit.sum()), random_state=seed)
+    idx = np.concatenate([np.flatnonzero(legit), up])
+    return encoder, F, y, rows, idx
 
+
+def build_datasets(df: pd.DataFrame, seed: int, sample_frac: float | None = None) -> Datasets:
+    """Features on the whole stream; encoder/scaler/IsolationForest fit and balancing on ``fit`` only.
+
+    ``sample_frac`` (timing probes only) subsamples ``fit`` rows after the features are computed;
+    the encoder still sees all ``fit`` rows, ``val`` and ``test`` stay complete.
+    """
+    encoder, F, y, rows, idx = split_and_balance(df, seed, sample_frac)
     scaler = StandardScaler().fit(F["fit"])
     Xs_fit = scaler.transform(F["fit"])
     iforest = IsolationForest(random_state=seed).fit(Xs_fit)
     X_fit = np.hstack([Xs_fit, iforest_flag(iforest, Xs_fit)]).astype(np.float32)
-
-    legit, fraud = y["fit"] == 0, y["fit"] == 1
-    up = resample(np.flatnonzero(fraud), replace=True, n_samples=int(legit.sum()), random_state=seed)
-    idx = np.concatenate([np.flatnonzero(legit), up])
     return Datasets(encoder=encoder, scaler=scaler, iforest=iforest, F=F, y=y, rows=rows,
                     X_train=X_fit[idx], y_train=y["fit"][idx], train_rows=rows["fit"][idx])
+
+
+def load_model(model_dir):
+    """The verified model of an artifact directory, of whatever kind (``FraudModel`` for the MLP kind,
+    ``XGBFraudModel`` for ``xgb``): the one loader of the audit, serving, hardening and the CLI."""
+    from .artifacts import load_artifacts
+    a = load_artifacts(Path(model_dir))
+    if a.kind == "xgb":
+        from .xgb import XGBFraudModel
+        return XGBFraudModel.from_artifacts(a)
+    return FraudModel.from_artifacts(a)
 
 
 def quality(y: np.ndarray, p: np.ndarray, tau: float) -> dict:

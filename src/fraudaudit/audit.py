@@ -248,9 +248,8 @@ _WORKER: dict = {}  # per worker process: set once by _init_worker
 
 
 def _load_serving(model_dir) -> Serving:
-    from .model.artifacts import load_artifacts
-    from .model.pipeline import FraudModel
-    return Serving(FraudModel.from_artifacts(load_artifacts(Path(model_dir))))
+    from .model.pipeline import load_model
+    return Serving(load_model(Path(model_dir)))
 
 
 def _init_worker(model_dir, targets, clean, best, tm, merchants, seed) -> None:

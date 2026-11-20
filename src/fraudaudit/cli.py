@@ -27,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=int, default=20, help="20 as in the bachelor listing; lower only for probes")
     train.add_argument("--sample-frac", type=float, default=None,
                        help="subsample fit rows (timing probes only)")
+    train.add_argument("--model-kind", choices=("mlp", "xgb"), default="mlp",
+                       help="mlp (the bachelor model, default) or xgb (gradient-boosted trees; hyperparameters "
+                            "chosen on clean val over the fixed grid unless --xgb-params is given)")
+    train.add_argument("--xgb-params", default=None, metavar="DEPTH,N_ESTIMATORS",
+                       help="xgb only: skip the grid search and train with these values (e.g. 6,200)")
 
     skew = sub.add_parser("skew", help="check that the batch and serving feature paths agree")
     skew.add_argument("--data", type=Path, default=Path("data"))
@@ -248,8 +253,16 @@ def cmd_train(args: argparse.Namespace) -> int:
 
     df = load_raw(args.data)
     print(f"loaded {len(df)} rows", flush=True)
-    model, report = train_model(df, seed=args.seed, epochs=args.epochs,
-                                sample_frac=args.sample_frac, verbose=2)
+    if args.model_kind == "xgb":
+        from fraudaudit.model.xgb import train_xgb_model
+        params = None
+        if args.xgb_params:
+            depth, n_est = (int(v) for v in args.xgb_params.split(","))
+            params = {"max_depth": depth, "n_estimators": n_est}
+        model, report = train_xgb_model(df, seed=args.seed, params=params, sample_frac=args.sample_frac)
+    else:
+        model, report = train_model(df, seed=args.seed, epochs=args.epochs,
+                                    sample_frac=args.sample_frac, verbose=2)
     meta = dict(report, platform={"system": platform.system(), "machine": platform.machine(),
                                   "platform": platform.platform()},
                 **git_info())
@@ -260,12 +273,11 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 def cmd_skew(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
-    from fraudaudit.model.artifacts import load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.skew import skew_check, skew_to_json, summary_markdown
 
     df = load_raw(args.data)
-    model = FraudModel.from_artifacts(load_artifacts(args.model))
+    model = load_model(args.model)
     rep = skew_check(df, model, n_cards=args.cards, seed=args.seed, atol=args.atol, n_jobs=args.n_jobs,
                      model_dir=args.model)
     data = skew_to_json(rep, seed=args.seed, atol=args.atol, model_sha256=_model_sha256(args.model),
@@ -289,8 +301,8 @@ def cmd_audit(args: argparse.Namespace) -> int:
     from fraudaudit.bankpolicy import BankPolicy, file_sha256
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig, decide, passed, run_ensemble
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.report import write_error_outputs, write_gate_outputs
     from fraudaudit.skew import skew_from_json
     from fraudaudit.threat import MerchantTable, SingleTxThreatModel, ThreatModel
@@ -317,7 +329,7 @@ def cmd_audit(args: argparse.Namespace) -> int:
                                  f"(model_sha256 {want}, audited model {got}): rerun `fraudaudit skew --out`")
         model_fpr = _check_model_fpr(args.model, cfg, args.gate)
         df = load_raw(args.data)
-        model = FraudModel.from_artifacts(load_artifacts(args.model))  # SHA-256 before deserialisation
+        model = load_model(args.model)  # SHA-256 before deserialisation
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         msg = f"{type(e).__name__}: {e}"
         print(f"error: audit configuration/artifacts: {msg}", file=sys.stderr)
@@ -391,8 +403,8 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
     from fraudaudit.calibrate import calibration, write_calibration
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig, run_ensemble
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.threat import ThreatModel
 
     t0 = time.perf_counter()
@@ -402,7 +414,7 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         tm = ThreatModel.from_yaml(args.threat)
         _check_model_fpr(args.model, cfg, args.gate)
         df = load_raw(args.data)
-        model = FraudModel.from_artifacts(load_artifacts(args.model))
+        model = load_model(args.model)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         print(f"error: calibration configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -433,8 +445,8 @@ def cmd_harden(args: argparse.Namespace) -> int:
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig
     from fraudaudit.harden import check_generation_attack, harden, write_report
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.threat import ThreatModel
 
     t0 = time.perf_counter()
@@ -446,7 +458,7 @@ def cmd_harden(args: argparse.Namespace) -> int:
         tm = ThreatModel.from_yaml(args.threat)
         _check_model_fpr(args.model, cfg, args.gate)
         df = load_raw(args.data)
-        model = FraudModel.from_artifacts(load_artifacts(args.model))
+        model = load_model(args.model)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         print(f"error: harden configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -483,8 +495,8 @@ def cmd_corridor_sweep(args: argparse.Namespace) -> int:
     from fraudaudit.corridor_sweep import corridor_sweep, write_outputs
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.threat import ThreatModel
 
     try:
@@ -493,7 +505,7 @@ def cmd_corridor_sweep(args: argparse.Namespace) -> int:
         if tm.corridor is None:
             raise ValueError(f"{args.threat} has no corridor section")
         df = load_raw(args.data)
-        model = FraudModel.from_artifacts(load_artifacts(args.model))
+        model = load_model(args.model)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         print(f"error: corridor-sweep configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -519,8 +531,8 @@ def cmd_corridor_posthoc(args: argparse.Namespace) -> int:
     from fraudaudit.corridor_sweep import merge_posthoc, owner_posthoc_sweep, posthoc_markdown
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.threat import ThreatModel
 
     try:
@@ -530,7 +542,7 @@ def cmd_corridor_posthoc(args: argparse.Namespace) -> int:
             raise ValueError(f"{args.threat} has no corridor section")
         sweep = None if args.sweep is None else json.loads(args.sweep.read_text(encoding="utf-8"))
         df = load_raw(args.data)
-        model = FraudModel.from_artifacts(load_artifacts(args.model))
+        model = load_model(args.model)
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         print(f"error: corridor-posthoc configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -558,8 +570,8 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
 
     from fraudaudit.data import load_raw
     from fraudaudit.gate import GateConfig
-    from fraudaudit.model.artifacts import ArtifactIntegrityError, load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.artifacts import ArtifactIntegrityError
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.policy_sweep import parse_reaction, policy_sweep, write_markdown
     from fraudaudit.threat import ThreatModel
 
@@ -582,7 +594,7 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
                 raise ValueError("--corridor-kappa / --corridor-q need --corridor on and a corridor threat model")
             corridor_variants(ctm.corridor, args.corridor_kappa, args.corridor_q)
         df = load_raw(args.data)
-        models = [FraudModel.from_artifacts(load_artifacts(m)) for m in args.model]  # SHA-256 before deserialisation
+        models = [load_model(m) for m in args.model]  # SHA-256 before deserialisation
     except (OSError, ValueError, KeyError, TypeError, AttributeError, yaml.YAMLError, ArtifactIntegrityError) as e:
         print(f"error: policy-sweep configuration/artifacts: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -655,8 +667,7 @@ def cmd_decide(args: argparse.Namespace) -> int:
     import pandas as pd
 
     from fraudaudit.data import load_raw
-    from fraudaudit.model.artifacts import load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.serving.core import Serving
     from fraudaudit.serving.state import CardState, Tx, profile_of
 
@@ -672,14 +683,13 @@ def _decide(args: argparse.Namespace, expose: bool) -> int:
     import pandas as pd
 
     from fraudaudit.data import load_raw
-    from fraudaudit.model.artifacts import load_artifacts
-    from fraudaudit.model.pipeline import FraudModel
+    from fraudaudit.model.pipeline import load_model
     from fraudaudit.serving.core import Serving
     from fraudaudit.serving.state import CardState, Tx, profile_of
 
     rows = [json.loads(line) for line in args.input.read_text(encoding="utf-8").splitlines() if line.strip()]
     df = load_raw(args.data)
-    serving = Serving(FraudModel.from_artifacts(load_artifacts(args.model)))
+    serving = Serving(load_model(args.model))
     states: dict[int, CardState] = {}
     for r in rows:  # first ts of a card: its history ends strictly before
         card = int(r["cc_num"])
