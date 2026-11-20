@@ -267,8 +267,9 @@ def _gru_params(text: str) -> dict:
         k, hidden = (int(x) for x in text.split(","))
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected K,HIDDEN (two integers), got {text!r}") from None
-    if k < 2 or hidden < 1:
-        raise argparse.ArgumentTypeError("K must be >= 2 and HIDDEN positive")
+    from fraudaudit.serving.state import HISTORY_ROWS
+    if not 2 <= k <= HISTORY_ROWS + 1 or hidden < 1:
+        raise argparse.ArgumentTypeError(f"K must be in 2..{HISTORY_ROWS + 1} and HIDDEN positive")
     return {"k": k, "hidden": hidden}
 
 

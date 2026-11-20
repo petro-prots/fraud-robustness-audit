@@ -1,5 +1,8 @@
 """GRU model kind (Task 24, R35/R37): history interface (batch = serving), artifact format, trainer, selection on clean
 val, strict reproducibility, hardening wiring, exact permutation Spearman."""
+import os
+os.environ.setdefault("FRAUDAUDIT_GRU_ALLOW_NONSTRICT", "1")  # in-process tests: TF may have run before
+
 import dataclasses
 import hashlib
 import json
@@ -565,3 +568,23 @@ def test_leave_one_out_range():
     for i, v in enumerate(loo):
         keep = np.arange(8) != i
         assert v == pytest.approx(spearmanr(x[keep], y[keep])[0])
+
+
+def test_k_out_of_range_rejected_before_training():
+    import argparse
+    from fraudaudit.cli import _gru_params
+    from fraudaudit.model.gru import train_gru_model
+    with pytest.raises(argparse.ArgumentTypeError):
+        _gru_params("30,32")
+    with pytest.raises(ValueError):
+        train_gru_model(None, 1, params={"k": 30, "hidden": 8})
+    with pytest.raises(ValueError):
+        train_gru_model(None, 1, grid=[(5, 8), (21, 8)])
+
+
+def test_non_strict_training_refused_without_flag(monkeypatch):
+    from fraudaudit.model import gru
+    monkeypatch.delenv(gru.ALLOW_NONSTRICT_ENV, raising=False)
+    monkeypatch.setattr(gru, "configure_tf", lambda: {"strict": False})
+    with pytest.raises(RuntimeError, match="strict"):
+        gru.train_gru_model(None, 1, params={"k": 5, "hidden": 8})

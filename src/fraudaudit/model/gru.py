@@ -21,6 +21,7 @@ Decisions fixed before any run (brief §1, R37, R38):
 from __future__ import annotations
 
 import math
+import os
 import time
 from pathlib import Path
 
@@ -43,6 +44,7 @@ N_FEATURES = len(FEATURE_COLUMNS)
 SCORE_CHUNK = 4096  # rows per forward pass when scoring a stream
 
 _state: dict = {"configured": False}
+ALLOW_NONSTRICT_ENV = "FRAUDAUDIT_GRU_ALLOW_NONSTRICT"
 
 
 def configure_tf() -> dict:
@@ -205,6 +207,13 @@ def train_gru_model(df: pd.DataFrame, seed: int, params: dict | None = None, gri
     trained and scored on clean ``val`` and the winner (``pick_best``) is kept; the whole grid is in
     ``report["gru"]["selection"]``. ``test`` is only reported, never used."""
     cfg = configure_tf()
+    if not cfg["strict"] and not os.environ.get(ALLOW_NONSTRICT_ENV):
+        raise RuntimeError(f"strict reproducibility mode is not in force ({cfg}); TensorFlow ran before configure_tf. "
+                           f"Train in a fresh process (set {ALLOW_NONSTRICT_ENV}=1 only in tests)")
+    for k, _h in ([(int(params["k"]), 0)] if params is not None else list(grid)):
+        if not 2 <= k <= HISTORY_ROWS + 1:
+            raise ValueError(f"window k must be in 2..{HISTORY_ROWS + 1} (the card state keeps {HISTORY_ROWS} "
+                             f"earlier operations), got {k}")
     t0 = time.perf_counter()
     encoder, F, y, rows, idx, F_all, pos = split_and_balance(df, seed, sample_frac, with_stream=True)
     scaler = StandardScaler().fit(F["fit"])

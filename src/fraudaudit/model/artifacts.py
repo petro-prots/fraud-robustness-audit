@@ -224,8 +224,8 @@ def _check_model_info(info: dict, kind: str = "mlp") -> None:
     if kind == "gru":
         p = info.get("gru_params")
         if not isinstance(p, dict) or any(isinstance(p.get(k), bool) or not isinstance(p.get(k), int) or p.get(k) < 1
-                                          for k in ("k", "hidden")) or p["k"] < 2:
-            raise ArtifactIntegrityError("gru_params must hold integer k >= 2 and hidden >= 1")
+                                          for k in ("k", "hidden")) or not 2 <= p["k"] <= 20:
+            raise ArtifactIntegrityError("gru_params must hold integer 2 <= k <= 20 and hidden >= 1")
     tau = info.get("tau")
     if isinstance(tau, bool) or not isinstance(tau, (int, float)) or not math.isfinite(tau) \
             or not 0.0 <= tau <= 1.0:
