@@ -245,7 +245,8 @@ def git_info(cwd: Path | None = None) -> dict:
 
 
 def _model_sha256(model_dir: Path) -> str:
-    """SHA-256 of ``model.json`` (it holds the manifest hashes of every artifact): identifies the model."""
+    """SHA-256 of ``model.json`` (tau, parameters and training meta incl. timings; the artifact files are checked
+    against the directory's own manifest at load): identifies the model. A retrained model is a different model."""
     import hashlib
     return hashlib.sha256((model_dir / "model.json").read_bytes()).hexdigest()
 
