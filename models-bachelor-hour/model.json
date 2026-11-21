@@ -1,0 +1,103 @@
+{
+  "feature_columns": [
+    "merchant",
+    "amt",
+    "state",
+    "lat",
+    "long",
+    "city_pop",
+    "merch_lat",
+    "merch_long",
+    "age",
+    "trans_month",
+    "trans_year",
+    "latitudinal_distance",
+    "longitudinal_distance",
+    "category_food_dining",
+    "category_gas_transport",
+    "category_grocery_net",
+    "category_grocery_pos",
+    "category_health_fitness",
+    "category_home",
+    "category_kids_pets",
+    "category_misc_net",
+    "category_misc_pos",
+    "category_personal_care",
+    "category_shopping_net",
+    "category_shopping_pos",
+    "category_travel",
+    "gender_M",
+    "hour_sin",
+    "hour_cos",
+    "cnt_1d",
+    "cnt_7d",
+    "cnt_30d",
+    "mean_amt_1d",
+    "mean_amt_7d",
+    "mean_amt_30d",
+    "secs_since_prev"
+  ],
+  "meta": {
+    "batch_size": 32,
+    "epochs": 20,
+    "feature_set": "bachelor+hour",
+    "fraud_rows": {
+      "fit": 6250,
+      "test": 2145,
+      "val": 1256
+    },
+    "git_dirty": false,
+    "git_sha": "1a51b7b9793e83d3ff759236b2badb54976afd7d",
+    "iforest_flag_share_train_balanced": 0.7391111850738525,
+    "n_base_features": 29,
+    "platform": {
+      "machine": "aarch64",
+      "platform": "Linux-6.10.14-linuxkit-aarch64-with-glibc2.41",
+      "system": "Linux"
+    },
+    "rows": {
+      "fit": 1070966,
+      "test": 555719,
+      "val": 225709
+    },
+    "sample_frac": null,
+    "seconds": {
+      "fit": 1435.5,
+      "prepare": 12.6,
+      "total": 1453.1
+    },
+    "seed": 42,
+    "target_fpr": 0.01,
+    "tau": 0.005090115591883659,
+    "test": {
+      "fp": 4620,
+      "fpr": 0.00834576768417592,
+      "n": 555719,
+      "n_fraud": 2145,
+      "precision": 0.3103448275862069,
+      "recall": 0.9692307692307692,
+      "tp": 2079
+    },
+    "train_balanced_rows": 2129432,
+    "val": {
+      "fp": 2000,
+      "fpr": 0.008910551429475213,
+      "n": 225709,
+      "n_fraud": 1256,
+      "precision": 0.38022931515339325,
+      "recall": 0.9769108280254777,
+      "tp": 1227
+    }
+  },
+  "tau": 0.005090115591883659,
+  "versions": {
+    "keras": "3.15.1",
+    "numpy": "2.0.2",
+    "pandas": "2.2.3",
+    "python": "3.12.16",
+    "scikit-learn": "1.5.2",
+    "scipy": "1.18.1",
+    "skops": "0.10.0",
+    "tensorflow": "2.18.0"
+  }
+}

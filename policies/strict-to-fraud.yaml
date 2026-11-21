@@ -1,0 +1,8 @@
+# Demonstration policy of the CI gate (R33): the "strict to fraud" appetite profile of the thesis.
+# Chosen by the bank, not by the gate. Own tau of the hardened M3 (FPR 0.01 = model.json), reaction md3, corridor V1 with
+# kappa 1.25, q 0.98 (V2 and the rest of the corridor come from threat-models/realistic-corridor-v1v2.yaml).
+# Measured on the grid (Task 19b, m3-hard, seeds 1-3): U = 21.9 %, 8.3 % of card-months falsely blocked,
+# 35.9 % of cards blocked at least once, 9.8 % of card-days with owner confirmation.
+name: strict-to-fraud
+max_declines: 3
+corridor: {kappa: 1.25, q: 0.98}

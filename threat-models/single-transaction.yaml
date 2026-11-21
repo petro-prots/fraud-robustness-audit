@@ -1,0 +1,9 @@
+# Baseline of the "conventional audit": each real fraud operation of a target episode is attacked separately,
+# with the card state from the original stream (aggregates are not recomputed), without a bank reaction.
+amount_min: 1.00
+amount_max: 1376.04
+max_shift_days: 7          # time shift of the operation ∈ [0, 7 days) from its original time
+merchant_coord_radius: 1.0 # as in the Sparkov generator: ±1° from home
+knowledge: decision        # the model's decision only (yes/no), no p
+single_tx_budget: 50       # model queries per operation (random search)
+amount_rule: first         # first – first non-declined candidate; max – largest amount among non-declined candidates (all 50 queries)
