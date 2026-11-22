@@ -192,6 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--check-merge", action="store_true",
                     help="only load, merge and check provenance (a preflight); writes nothing")
 
+    msp = sub.add_parser("models-summary", help="Task 25: the 8-model summary (Spearman, policy vs model on 8 "
+                                               "models, Pareto front, cost of hardening) from policy-summary outputs")
+    msp.add_argument("--summary", type=Path, action="append", required=True,
+                     help="summary.json of policy-summary (repeatable; its grid sources are loaded and merged)")
+    msp.add_argument("--out", type=Path, default=Path("out/t24/summary-8"))
+
     bs = sub.add_parser("budget-sensitivity", help="R33: U of the same cells at several reconnaissance budgets against "
                                                   "the budget-2000 reference; pre-registered hypothesis H")
     bs.add_argument("--reference", type=Path, required=True, help="directory with <label>/policy-sweep.json at budget 2000")
@@ -683,6 +689,19 @@ def cmd_policy_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_models_summary(args: argparse.Namespace) -> int:
+    from fraudaudit.audit import _versions
+    from fraudaudit.models_summary import summarize8
+    meta = {**git_info(), "platform": platform.platform(), "versions": _versions()}
+    try:
+        summarize8(args.summary, args.out, meta=meta)
+    except (OSError, ValueError, KeyError) as e:
+        print(f"error: models-summary: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print((args.out / "summary8.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
 def _baseline_brief(b: dict | None) -> dict | None:
     """The headline numbers of ``audit.json["baseline"]`` for the CLI's stdout."""
     if b is None or "error" in b:
@@ -775,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_budget_sensitivity(args)
     if args.command == "policy-summary":
         return cmd_policy_summary(args)
+    if args.command == "models-summary":
+        return cmd_models_summary(args)
     return 0
 
 
