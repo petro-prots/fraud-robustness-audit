@@ -120,7 +120,7 @@ def test_r19_nonpositive_cells_counted_of_24():
     md3 = {lab: (0.5, 0.1, 0.02) for lab in LABELS}
     r19 = _r19(md3)
     r19["xgb-base"]["adv_es"]["md2"]["lower"] = -0.01  # CI includes 0
-    r19["gru-base"]["adv_es"]["md2"]["rel"] = -0.02  # not positive
+    r19["gru-base"]["adv_es"]["md2"].update(rel=-0.02, lower=-0.03, upper=-0.01)  # negative, CI excluding 0
     r19["m2-base"]["adv_es"]["md3"]["lower"] = 0.0  # CI touches 0: not excluding it
     r19["m3-base"]["clean"]["md3"]["lower"] = -0.5  # the clean leg is not counted
     res = msum.r19_nonpositive(r19, LABELS)
@@ -217,6 +217,24 @@ def test_pareto_strict_dominance_ties_and_resolution_flag():
     # b is dominated with a gap ≥ R: off the companion front; e only with gaps < R: on it
     assert res["front"] == ["a", "c", "d"]
     assert res["front_ignoring_gaps_below_resolution"] == ["a", "c", "d", "e"]
+
+
+def test_pareto_resolution_flag_on_the_delta_grid():
+    # 0.36 - 0.32 is 0.03999… in floating point: a 4 pp gap must not be flagged as below the 3.6 pp resolution
+    models = {"a": {"recall": 0.98, "delta_A": 0.32, "delta_A_md1": None},
+              "b": {"recall": 0.97, "delta_A": 0.36, "delta_A_md1": None},
+              "c": {"recall": 0.96, "delta_A": 0.35, "delta_A_md1": None}}
+    pairs = {(p["a"], p["b"]): p for p in msum.pareto_front(models, n_fraud=2000)["pairs"]}
+    assert pairs[("a", "b")]["delta_gap_below_resolution"] is False
+    assert pairs[("a", "c")]["delta_gap_below_resolution"] is True  # 3 pp
+
+
+def test_check_shared_fails_when_targets_missing():
+    grid = {lab: toy_sweep(lab) for lab in LABELS}
+    for c in grid["xgb-base"]["cells"]:
+        c.pop("targets", None)
+    with pytest.raises(ValueError, match="no targets"):
+        msum.check_shared(grid)
 
 
 def test_pareto_model_without_passing_cell_is_kept_off():
@@ -338,3 +356,27 @@ def test_cli_models_summary_parser():
     a = build_parser().parse_args(["models-summary", "--summary", "a.json", "--summary", "b.json", "--out", "o"])
     assert a.command == "models-summary" and [str(x) for x in a.summary] == ["a.json", "b.json"]
     assert str(a.out) == "o"
+
+
+def _three_families(tmp_path):
+    recall = {lab: 0.95 - 0.01 * i for i, lab in enumerate(LABELS)}
+    first = {lab: 0.10 + 0.01 * i for i, lab in enumerate(LABELS)}
+    return [_write_family(tmp_path, "m", LABELS[:4], None, recall, first),
+            _write_family(tmp_path, "x", LABELS[4:6], None, recall, first),
+            _write_family(tmp_path, "g", LABELS[6:], None, recall, first)]
+
+
+def test_summarize8_register_mismatch_writes_nothing(tmp_path):
+    paths = _three_families(tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="register"):
+        msum.summarize8(paths, out, root=tmp_path)  # the default REGISTER does not match the toy data
+    assert not out.exists() or not any(out.iterdir())
+
+
+def test_summarize8_refuses_a_commit_not_named_in_the_sources(tmp_path):
+    paths = _three_families(tmp_path)
+    f = tmp_path / "x" / "xgb-hard" / "policy-sweep.json"
+    f.write_text(f.read_text(encoding="utf-8").replace("abc1234567", "fff0000000"), encoding="utf-8")
+    with pytest.raises(ValueError, match="code version"):
+        msum.summarize8(paths, tmp_path / "out", register=None, root=tmp_path)

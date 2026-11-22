@@ -158,6 +158,8 @@ def check_shared(grid: dict) -> None:
     by: dict = {}
     for lab, s in grid.items():
         for k, c in ps._index(ps.base_cells(s)).items():
+            if c.get("targets") is None:
+                raise ValueError(f"{lab}: cell {k} has no targets (cannot check that the models share them)")
             by.setdefault(k, {})[lab] = json.dumps(c.get("targets"))
     for k, v in sorted(by.items()):
         if len(set(v.values())) != 1:
@@ -303,9 +305,9 @@ def load_inputs(summary_paths) -> tuple[dict, dict, list[str], list[str]]:
                 raise ValueError(f"label {lab!r} is in more than one summary")
             labels.append(lab)
         for lab, src in s["sources"].items():
-            shas += [x["git_sha"] for x in src if x.get("git_sha")]
             if lab.endswith(" (confirmation)"):
                 continue
+            shas += [x["git_sha"] for x in src if x.get("git_sha")]
             files += [x["file"] for x in src]
     grid, conf = ps.load(files)
     if conf:
@@ -336,7 +338,8 @@ def summarize8(summary_paths, out_dir, resolution: float = RESOLUTION, register:
     for path, s in summaries.items():  # the family policy-vs-model must be what the loaded grids give
         mine = ps.policy_vs_model({lab: grid[lab] for lab in s["labels"]})
         for k in ("median_policy_span", "median_model_span", "median_seed_spread"):
-            if not math.isclose(mine[k], s["policy_vs_model"][k], rel_tol=1e-12, abs_tol=1e-15):
+            if mine[k] is None or s["policy_vs_model"].get(k) is None or not math.isclose(
+                    mine[k], s["policy_vs_model"][k], rel_tol=1e-12, abs_tol=1e-15):
                 raise ValueError(f"{path}: policy_vs_model {k} {s['policy_vs_model'][k]} differs from the loaded "
                                  f"grids ({mine[k]})")
     nf = n_fraud_test(grid, root)
