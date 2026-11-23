@@ -113,6 +113,14 @@ def policy_vs_model_8(grid: dict, family_summaries: dict) -> dict:
     return {"eight": eight, "families": fams}
 
 
+def policy_vs_model_practical_8(grid: dict, family_summaries: dict) -> dict:
+    """R47 (2), descriptive: ``policy_vs_model_practical`` (without md1) over the 8 grids and per input family."""
+    return {"eight": ps.policy_vs_model_practical(grid),
+            "families": [{"source": src, "labels": list(s["labels"]),
+                          "result": ps.policy_vs_model_practical({lab: grid[lab] for lab in s["labels"]})}
+                         for src, s in family_summaries.items()]}
+
+
 def _u_by_cell(grid: dict) -> dict:
     by: dict = {}
     for lab, s in grid.items():
@@ -352,7 +360,8 @@ def summarize8(summary_paths, out_dir, resolution: float = RESOLUTION, register:
     res = {"labels": labels, "provenances": prov, "commits": sorted({p["git_sha"] for p in prov}),
            "machines": sorted({p["host_machine"] for p in prov}), "inputs": list(summaries), "resolution": resolution,
            "spearman": spearman_section(r19, labels), "r19_nonpositive": r19_nonpositive(r19, labels),
-           "policy_vs_model": policy_vs_model_8(grid, summaries), "family_spans": family_spans(grid),
+           "policy_vs_model": policy_vs_model_8(grid, summaries),
+           "policy_vs_model_practical": policy_vs_model_practical_8(grid, summaries), "family_spans": family_spans(grid),
            "own_cells": own, "n_fraud_test": nf, "pareto": pareto_front(models, nf["n_fraud"], resolution),
            "families": {f: list(v) for f, v in families.items()}, "cost": cost,
            "register_check": None if register is None else check_register(cost, register),
@@ -494,6 +503,26 @@ def markdown8(res: dict) -> str:
                                                          for f, v in fs["within"].items())
               + f", all families together {_p1(fs['within_all'])}; across families (median over cells of max − min) "
               f"the four bases {_p1(fs['across_base'])}, the four hardened {_p1(fs['across_hard'])}.", ""]
+    # (b′)
+    pr = res["policy_vs_model_practical"]
+    e2 = pr["eight"]
+    yn = {True: "yes", False: "no", None: "–"}
+    lines += ["## (b′) Policy vs model on the practical policies (without md1), descriptive (R47 (2))", "",
+              f"Practical policies = the grid cells without {', '.join(e2['excluded_reactions'])} ({e2['n_cells']} "
+              "cells per model); policy span = max − min U over them per model; model span and seed spread – the R30 "
+              "code over the same cells. Descriptive, no verdict; the R30 result (b) is unchanged.", "",
+              "| models | median policy span | median model span | median seed spread | policy > model | "
+              "policy > seed |", "|---|---:|---:|---:|---|---|",
+              f"| all 8 | {_p1(e2['median_policy_span'])} | {_p1(e2['median_model_span'])} "
+              f"({len(e2['model_span'])} cells) | {_p1(e2['median_seed_spread'])} ({e2['n_seed_spreads']}) | "
+              f"{yn[e2['policy_gt_model']]} | {yn[e2['policy_gt_seed']]} |"]
+    for f in pr["families"]:
+        r = f["result"]
+        lines.append(f"| {', '.join(f['labels'])} | {_p1(r['median_policy_span'])} | {_p1(r['median_model_span'])} "
+                     f"({len(r['model_span'])} cells) | {_p1(r['median_seed_spread'])} ({r['n_seed_spreads']}) | "
+                     f"{yn[r['policy_gt_model']]} | {yn[r['policy_gt_seed']]} |")
+    lines += ["", "Policy span per model (without md1): "
+              + ", ".join(f"{k} {_p1(v)}" for k, v in e2["policy_span"].items()) + ".", ""]
     # (c)
     lines += ["## (c) Strict Pareto front of the 8 models (R41 (5))", "", pareto_markdown(res["pareto"])]
     # (d)

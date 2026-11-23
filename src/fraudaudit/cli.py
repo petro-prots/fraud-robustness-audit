@@ -204,6 +204,16 @@ def build_parser() -> argparse.ArgumentParser:
     bs.add_argument("--budget", action="append", required=True, metavar="B=DIR", help="budget=directory (repeatable)")
     bs.add_argument("--labels", type=_names, required=True, help="comma-separated model labels")
     bs.add_argument("--out", type=Path, required=True)
+    bs.add_argument("--hypothesis-budget", default="20000",
+                    help="budget on which H is decided (default 20000, Task 19c; 50000 – Task 27f H50, R46) or 'none' "
+                         "for a descriptive run without a verdict (Task 27e, seeds 4-9)")
+
+    se = sub.add_parser("seed-extension", help="Task 27a: the front cells on fresh seeds (e.g. 10-15) next to the "
+                                              "earlier confirmation seeds (4-9); descriptive, no verdict")
+    se.add_argument("--cell", action="append", required=True, metavar="LABEL,KEY,GRID,EARLIER,FRESH",
+                    help="label, cell key, grid policy-sweep.json (U on the gate seeds), earlier and fresh "
+                         "confirmation policy-sweep.json (repeatable)")
+    se.add_argument("--out", type=Path, required=True)
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -651,6 +661,26 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seed_extension(args: argparse.Namespace) -> int:
+    from fraudaudit.seed_extension import compare_seeds, markdown
+    try:
+        cells = []
+        for item in args.cell:
+            parts = item.split(",")
+            if len(parts) != 5:
+                raise ValueError(f"--cell expects LABEL,KEY,GRID,EARLIER,FRESH, got {item!r}")
+            cells.append((parts[0], parts[1], Path(parts[2]), Path(parts[3]), Path(parts[4])))
+        res = compare_seeds(cells)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: seed-extension: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "seed-extension.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
+    (args.out / "seed-extension.md").write_text(markdown(res), encoding="utf-8")
+    print((args.out / "seed-extension.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
 def cmd_budget_sensitivity(args: argparse.Namespace) -> int:
     from fraudaudit.budget_sensitivity import compare, markdown
     try:
@@ -662,7 +692,8 @@ def cmd_budget_sensitivity(args: argparse.Namespace) -> int:
             if int(b) in budgets:
                 raise ValueError(f"--budget {b} given twice")
             budgets[int(b)] = Path(p)
-        res = compare(args.reference, budgets, args.labels)
+        hb = args.hypothesis_budget.strip().lower()
+        res = compare(args.reference, budgets, args.labels, hypothesis_budget=None if hb == "none" else int(hb))
     except (OSError, ValueError, KeyError) as e:
         print(f"error: budget-sensitivity: {type(e).__name__}: {e}", file=sys.stderr)
         return 2
@@ -792,6 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_policy_sweep(args)
     if args.command == "budget-sensitivity":
         return cmd_budget_sensitivity(args)
+    if args.command == "seed-extension":
+        return cmd_seed_extension(args)
     if args.command == "policy-summary":
         return cmd_policy_summary(args)
     if args.command == "models-summary":

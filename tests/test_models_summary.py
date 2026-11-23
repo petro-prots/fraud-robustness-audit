@@ -145,6 +145,15 @@ def test_policy_vs_model_8_equals_policy_vs_model_on_the_merged_dict():
     assert res["families"][0]["differs_from_eight"] == (ref["verdict"] != "x")
 
 
+def test_policy_vs_model_practical_8_runs_the_practical_code_on_the_merged_dict_and_per_family():
+    grid = toy_grid8()
+    fam = {"a.json": {"labels": LABELS[:4]}, "b.json": {"labels": LABELS[4:]}}
+    res = msum.policy_vs_model_practical_8(grid, fam)
+    assert res["eight"] == ps.policy_vs_model_practical(grid)
+    assert [f["source"] for f in res["families"]] == ["a.json", "b.json"]
+    assert res["families"][1]["result"] == ps.policy_vs_model_practical({lab: grid[lab] for lab in LABELS[4:]})
+
+
 def test_family_spans_within_and_across():
     grid = toy_grid8()  # offsets 0.01 * i: base/hard of one family differ by 0.01 in every cell
     res = msum.family_spans(grid)
@@ -346,6 +355,11 @@ def test_summarize8_end_to_end(tmp_path):
     assert "(pre-registered rule:" in md
     j = json.loads((out / "summary8.json").read_text(encoding="utf-8"))
     assert j["policy_vs_model"]["eight"]["verdict"] in ("supported", "not supported")
+    # R47 (2): the practical-policy computation (without md1), descriptive, after (b) and before (c)
+    pr = j["policy_vs_model_practical"]
+    assert "verdict" not in pr["eight"] and pr["eight"]["n_cells"] == 12
+    assert len(pr["families"]) == 3 and all("verdict" not in f["result"] for f in pr["families"])
+    assert pos[1] < md.index("## (b′)") < pos[2] and "no verdict" in md[md.index("## (b′)"):pos[2]]
     # a label in two summaries is refused
     with pytest.raises(ValueError, match="more than one summary"):
         msum.summarize8([paths[0], paths[0]], out, register=None, root=tmp_path)

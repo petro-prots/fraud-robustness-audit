@@ -211,29 +211,46 @@ def _extreme(cells, fpr_pick, reaction, corridor):
     return idx.get((fpr_pick(fprs), reaction, corridor)) if fprs else None
 
 
+def _model_spans(sweeps: dict, keep=lambda c: True) -> dict:
+    """``{cell: max − min U over the models}`` for the cells (kept by ``keep``) that at least two models have."""
+    by_cell: dict = {}
+    for lab, s in sweeps.items():
+        for k, c in _index(c for c in base_cells(s) if keep(c)).items():
+            by_cell.setdefault(k, {})[lab] = c["U"]
+    return {f"fpr={k[0]:g}|{k[1]}|corridor={k[2]}": float(max(v.values()) - min(v.values()))
+            for k, v in sorted(by_cell.items()) if len(v) >= 2}
+
+
+def _seed_spreads(sweeps: dict, keep=lambda c: True) -> list[float]:
+    """max − min of the run upper bounds over the seeds of one attack, per (model, cell kept by ``keep``, attack)."""
+    out = []
+    for s in sweeps.values():
+        for c in base_cells(s):
+            if not keep(c):
+                continue
+            by_attack: dict = {}
+            for rk, r in c["runs"].items():
+                by_attack.setdefault(rk.rsplit("/", 1)[0], []).append(r["uplift_upper"])
+            out += [max(v) - min(v) for v in by_attack.values() if len(v) >= 2]
+    return out
+
+
+def _median(xs) -> float | None:
+    xs = list(xs)
+    return float(np.median(xs)) if xs else None
+
+
 def policy_vs_model(sweeps: dict, resolution: float = RESOLUTION) -> dict:
     spans = {}
     for lab, s in sweeps.items():
         g = base_cells(s)
         soft, strict = _extreme(g, min, *SOFTEST), _extreme(g, max, *STRICTEST)
         spans[lab] = None if soft is None or strict is None else float(soft["U"] - strict["U"])
-    by_cell: dict = {}
-    for lab, s in sweeps.items():
-        for k, c in _index(base_cells(s)).items():
-            by_cell.setdefault(k, {})[lab] = c["U"]
-    model_spans = {f"fpr={k[0]:g}|{k[1]}|corridor={k[2]}": float(max(v.values()) - min(v.values()))
-                   for k, v in sorted(by_cell.items()) if len(v) >= 2}
-    seed_spreads = []
-    for s in sweeps.values():
-        for c in base_cells(s):
-            by_attack: dict = {}
-            for rk, r in c["runs"].items():
-                by_attack.setdefault(rk.rsplit("/", 1)[0], []).append(r["uplift_upper"])
-            seed_spreads += [max(v) - min(v) for v in by_attack.values() if len(v) >= 2]
-    ps = [v for v in spans.values() if v is not None]
-    med_p = float(np.median(ps)) if ps else None
-    med_m = float(np.median(list(model_spans.values()))) if model_spans else None
-    med_s = float(np.median(seed_spreads)) if seed_spreads else None
+    model_spans = _model_spans(sweeps)
+    seed_spreads = _seed_spreads(sweeps)
+    med_p = _median(v for v in spans.values() if v is not None)
+    med_m = _median(model_spans.values())
+    med_s = _median(seed_spreads)
     if med_p is None or med_m is None or med_s is None:
         verdict = "not computable"
     else:
@@ -241,6 +258,34 @@ def policy_vs_model(sweeps: dict, resolution: float = RESOLUTION) -> dict:
     return {"policy_span": spans, "median_policy_span": med_p, "model_span": model_spans,
             "median_model_span": med_m, "median_seed_spread": med_s, "n_seed_spreads": len(seed_spreads),
             "verdict": verdict}
+
+
+PRACTICAL_EXCLUDED = ("md1",)  # R33: blocking after the first decline is impractical (row 5.4)
+
+
+def policy_vs_model_practical(sweeps: dict, exclude_reactions=PRACTICAL_EXCLUDED) -> dict:
+    """Descriptive companion of ``policy_vs_model`` (R47 (2), definition fixed before the computation): the practical
+    policies are the grid cells whose reaction is not in ``exclude_reactions``; the policy span of a model is max − min
+    U over them; the model span and the seed spread are the R30 ones over the same cells. No verdict: only whether the
+    medians compare the same way as the R30 rule (``None`` when a median is missing)."""
+    excl = set(exclude_reactions)
+    keep = lambda c: c["reaction"] not in excl  # noqa: E731
+    spans, n_cells = {}, {}
+    for lab, s in sweeps.items():
+        us = [c["U"] for c in base_cells(s) if keep(c)]
+        n_cells[lab] = len(us)
+        spans[lab] = float(max(us) - min(us)) if us else None
+    model_spans = _model_spans(sweeps, keep)
+    seed_spreads = _seed_spreads(sweeps, keep)
+    med_p = _median(v for v in spans.values() if v is not None)
+    med_m = _median(model_spans.values())
+    med_s = _median(seed_spreads)
+    return {"excluded_reactions": sorted(excl), "n_cells": max(n_cells.values(), default=0),
+            "n_cells_per_model": n_cells, "policy_span": spans, "median_policy_span": med_p,
+            "model_span": model_spans, "median_model_span": med_m, "median_seed_spread": med_s,
+            "n_seed_spreads": len(seed_spreads),
+            "policy_gt_model": None if med_p is None or med_m is None else med_p > med_m,
+            "policy_gt_seed": None if med_p is None or med_s is None else med_p > med_s}
 
 
 def green(c: dict, delta: float) -> bool:

@@ -94,6 +94,38 @@ def test_policy_vs_model_toy():
     assert res2["policy_span"]["flat"] == pytest.approx(0.0) and res2["policy_span"]["a"] == pytest.approx(0.11)
 
 
+
+def test_policy_vs_model_practical_excludes_md1_and_uses_the_range():
+    """R47 (2): practical policies = the grid cells without md1; policy span = max − min U over them per model; model
+    span and seed spread over the same cells; descriptive, no verdict; the R30 result is unchanged."""
+    a, b = toy_grid(md1_step=-0.3), toy_grid(offset=0.02, md1_step=-0.3)
+    res = ps.policy_vs_model_practical({"a": a, "b": b})
+    # max (0.005, md3, off) 0.6; min (0.02, md3+esc, on) 0.6 − 0.10 − 0.01 − 0.04 = 0.45
+    assert res["policy_span"]["a"] == pytest.approx(0.15) and res["policy_span"]["b"] == pytest.approx(0.15)
+    assert res["median_policy_span"] == pytest.approx(0.15)
+    assert len(res["model_span"]) == 12 and not any("md1" in k for k in res["model_span"])
+    assert res["median_model_span"] == pytest.approx(0.02) and res["median_seed_spread"] == pytest.approx(0.02)
+    assert res["n_seed_spreads"] == 24  # 12 cells × 1 attack × 2 models
+    assert res["excluded_reactions"] == ["md1"] and res["n_cells"] == 12
+    assert "verdict" not in res
+    assert res["policy_gt_model"] is True and res["policy_gt_seed"] is True
+    # the md1 cells do drive the R30 span here (strictest = md1), but not the practical one
+    r30 = ps.policy_vs_model({"a": a, "b": b})
+    assert r30["policy_span"]["a"] == pytest.approx(0.41)
+    # the model / seed parts equal the R30 code restricted to the same cells
+    assert all(r30["model_span"][k] == v for k, v in res["model_span"].items())
+
+
+def test_policy_vs_model_practical_missing_cells_and_flat():
+    flat = toy_grid(tau_step=0.0, corr_step=0.0, esc_step=0.0)
+    res = ps.policy_vs_model_practical({"flat": flat})
+    assert res["policy_span"]["flat"] == pytest.approx(0.0)
+    assert res["model_span"] == {} and res["median_model_span"] is None
+    assert res["policy_gt_model"] is None
+    only_md1 = dict(flat, cells=[c for c in flat["cells"] if c["reaction"] == "md1"])
+    res2 = ps.policy_vs_model_practical({"x": only_md1})
+    assert res2["policy_span"]["x"] is None and res2["median_policy_span"] is None and res2["n_cells"] == 0
+
 def test_t2_pick_and_confirmation():
     g = toy_grid(offset=-0.45)  # U from 0.15 down to 0.04: some cells green at δ 0.1
     res = ps.t2({"a": g}, {}, 0.10)["a"]

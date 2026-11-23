@@ -111,3 +111,76 @@ def test_cli_duplicate_budget_refused(tmp_path, capsys):
     code = main(["budget-sensitivity", "--reference", str(ref), "--budget", f"20000={b[20000]}",
                  "--budget", f"20000={b[20000]}", "--labels", "m", "--out", str(tmp_path / "o")])
     assert code == 2 and "twice" in capsys.readouterr().err
+
+
+# --- Task 27f (R46: H50 on budget 50 000) and 27e (R45 (4): seeds 4-9, descriptive) --------------------------------
+
+
+def _write_seeds(d, label, budget, ups, seeds, key=KEY, sha="abc"):
+    """``ups``: {(attack, seed): upper bound}; missing runs get 0.01."""
+    runs = {f"{a}/{s}": {"uplift_upper": ups.get((a, s), 0.01)} for a in ("es", "random", "stepwise") for s in seeds}
+    worst = max(runs, key=lambda k: runs[k]["uplift_upper"])
+    u = runs[worst]["uplift_upper"]
+    p = d / label
+    p.mkdir(parents=True)
+    (p / "policy-sweep.json").write_text(json.dumps({
+        "model_json_sha256": sha, "gate": {"delta": 0.1, "attack_seeds": list(seeds)}, "seed": 42, "own_tau": 0.5,
+        "meta": {"threat_sha256": "t", "corridor_threat_sha256": "c"},
+        "cells": [{"key": key, "U": u, "U_usd": u * 5000, "worst_run": worst, "runs": runs, "recon_budget_ops": budget,
+                   "tau": 0.5, "max_declines": 3, "tau_after_decline": None, "corridor_params": {"q": 0.98},
+                   "target_fpr": 0.01}]}))
+
+
+def test_hypothesis_budget_50000_decides_h50_and_needs_that_budget(tmp_path):
+    seeds = (1, 2, 3)
+    _write_seeds(tmp_path / "r", "m", 2000, {("stepwise", 1): 0.20}, seeds)
+    _write_seeds(tmp_path / "b50", "m", 50000, {("stepwise", 2): 0.20 + SEED_SPREAD + 1e-9}, seeds)
+    res = compare(tmp_path / "r", {50000: tmp_path / "b50"}, ["m"], hypothesis_budget=50000)
+    assert res["verdict"]["budget"] == 50000 and res["verdict"]["H"] == "not supported"
+    assert res["verdict"]["max_dU"] == pytest.approx(SEED_SPREAD)
+    md = markdown(res)
+    assert "budget 50000: max dU" in md and "seeds 1-3" in md
+    with pytest.raises(ValueError, match="budget 20000 is required"):  # H on a budget that was not run
+        compare(tmp_path / "r", {50000: tmp_path / "b50"}, ["m"], hypothesis_budget=20000)
+
+
+def test_descriptive_mode_has_no_verdict_and_counts_seeds(tmp_path):
+    seeds = (4, 5, 6, 7, 8, 9)
+    ref = {("stepwise", s): 0.20 for s in seeds}
+    b20 = {("stepwise", s): 0.20 for s in seeds}
+    b20[("es", 5)] = 0.20 + SEED_SPREAD + 1e-9  # seed 5: at the spread -> counted (>=)
+    b20[("random", 7)] = 0.20 + SEED_SPREAD - 0.001  # seed 7: just below -> not counted
+    b20[("stepwise", 9)] = 0.05  # seed 9: a drop
+    _write_seeds(tmp_path / "r", "g", 2000, ref, seeds)
+    _write_seeds(tmp_path / "b20", "g", 20000, b20, seeds)
+    res = compare(tmp_path / "r", {20000: tmp_path / "b20"}, ["g"], hypothesis_budget=None)
+    assert res["verdict"] is None
+    row = res["labels"]["g"][KEY]
+    assert row[2000]["U_s"] == {str(s): pytest.approx(0.20) for s in seeds}
+    assert row[20000]["dU_s"]["5"] == pytest.approx(SEED_SPREAD) and row[20000]["dU_s"]["9"] == pytest.approx(-0.15)
+    assert row[20000]["seeds_dU_ge_spread"] == [{"seed": 5, "dU": pytest.approx(SEED_SPREAD), "attack": "es"}]
+    assert row[20000]["n_seeds_dU_ge_spread"] == 1 and row[20000]["n_seeds"] == 6
+    md = markdown(res)
+    assert "supported" not in md and "descriptive" in md and "seeds 4-9" in md
+    assert "1 of 6" in md
+
+
+def test_seeds_must_match_between_reference_and_budget(tmp_path):
+    _write_seeds(tmp_path / "r", "g", 2000, {}, (4, 5, 6))
+    _write_seeds(tmp_path / "b20", "g", 20000, {}, (1, 2, 3))
+    with pytest.raises(ValueError, match="gate"):
+        compare(tmp_path / "r", {20000: tmp_path / "b20"}, ["g"], hypothesis_budget=None)
+
+
+def test_cli_budget_sensitivity_descriptive_end_to_end(tmp_path):
+    from fraudaudit.cli import main
+    seeds = (4, 5, 6, 7, 8, 9)
+    _write_seeds(tmp_path / "r", "g", 2000, {}, seeds)
+    _write_seeds(tmp_path / "b20", "g", 20000, {("stepwise", 4): 0.5}, seeds)
+    rc = main(["budget-sensitivity", "--reference", str(tmp_path / "r"), "--budget", f"20000={tmp_path / 'b20'}",
+               "--labels", "g", "--hypothesis-budget", "none", "--out", str(tmp_path / "o")])
+    assert rc == 0
+    j = json.loads((tmp_path / "o" / "budget-sensitivity.json").read_text())
+    assert j["verdict"] is None and j["labels"]["g"][KEY]["20000"]["n_seeds_dU_ge_spread"] == 1
+    md = (tmp_path / "o" / "budget-sensitivity.md").read_text()
+    assert "Descriptive only" in md and "supported" not in md
