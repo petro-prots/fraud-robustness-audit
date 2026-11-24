@@ -4,7 +4,9 @@ Descriptive check of the escalation hypothesis on the grid cell FPR 0.01 md3 cor
 targets). The stored records keep no operations, so the cell is rerun per model with ``policy-sweep --trace``
 (``gate-27d-es-1-3.yaml``); ``p`` is the score of the bank's decision (``trace.py``).
 
-From the trace: every **passed** adversarial operation (corridor off, md3, no escalation – so p < τ; a passed operation
+τ is the threshold the bank decided with (the trace's ``tau_decision``: the model.json τ when the cell's τ is within rel
+1e-6 of it, ``sweep_cells.model_at_tau``); the cell's τ is kept as ``cell_tau``. From the trace: every **passed**
+adversarial operation (corridor off, md3, no escalation – so p < τ; a passed operation
 with p ≥ τ is refused as an inconsistent trace). Per model, per seed and pooled over the seeds: the number of passed
 operations (and of model-declined ones, for context); quantiles (min, P10, P25, median, P75, P90, max; numpy linear
 interpolation) of p and of p / τ; the **share of passed operations with p ≥ τ′** (τ′ = ``tau_esc`` of the model, val
@@ -92,9 +94,12 @@ def passed_model(label: str, sweep_p, key: str, grid_p, seeds=SEEDS) -> dict:
         raise ValueError(f"{label} {key}: no trace file {p}")
     tr = load_trace(p)
     check_trace(tr, c, f"{label} {key}")
-    tau, tau_esc = float(tr["tau"]), float(tr["tau_esc"])
-    if tau != float(c["tau"]) or tau_esc != float(d["tau_esc"]):
+    cell_tau, tau_esc = float(tr["tau"]), float(tr["tau_esc"])
+    if cell_tau != float(c["tau"]) or tau_esc != float(d["tau_esc"]):
         raise ValueError(f"{label} {key}: tau / tau_esc of the trace differ from the sweep")
+    if tr.get("tau_decision") is None:
+        raise ValueError(f"{label} {key}: the trace has no tau_decision (the threshold the bank decided with)")
+    tau = float(tr["tau_decision"])  # p < τ check and p / τ use the threshold of the decisions
     if not 0 < tau_esc < tau:
         raise ValueError(f"{label}: tau_esc {tau_esc} must be in (0, tau {tau})")
     per_seed, pooled = {}, []
@@ -102,7 +107,7 @@ def passed_model(label: str, sweep_p, key: str, grid_p, seeds=SEEDS) -> dict:
         rows = tr["runs"][f"{ATTACK}/{int(s)}"]["per_target"]
         per_seed[str(int(s))] = score_stats(rows, tau, tau_esc)
         pooled += rows
-    return {"label": label, "key": key, "tau": tau, "tau_esc": tau_esc, "esc_fpr": d.get("esc_fpr"),
+    return {"label": label, "key": key, "tau": tau, "cell_tau": cell_tau, "tau_esc": tau_esc, "esc_fpr": d.get("esc_fpr"),
             "seeds": [int(s) for s in seeds], "per_seed": per_seed, "pooled": score_stats(pooled, tau, tau_esc),
             "log10_p_over_tau": [math.log10(o["p"] / tau) for t in pooled for o in t["ops"]
                                  if o["passed"] and o["p"] > 0],

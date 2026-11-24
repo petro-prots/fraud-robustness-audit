@@ -34,7 +34,10 @@ Cells already in the JSON but not requested are kept (the R19 cells and the grid
 ``<out_dir>/trace/<safe key>.json.gz`` (``trace.py``): the cell key, its config hash, τ, ``tau_esc`` and per run the best
 candidate and every executed adversarial operation with the score of the bank's decision. The trace is not part of the
 configuration (no hash change) and changes no number; with ``trace`` a finished cell whose trace file is missing (or
-belongs to another config hash) is rerun – its record is overwritten with identical numbers – and skipped otherwise.
+belongs to another config hash) is rerun – after ``check_reuse``, and its record is overwritten only if the rerun's
+``runs`` (every run value and per-target list) equal the stored ones, else ValueError and nothing is written – and
+skipped otherwise. The trace records ``tau`` (the cell's τ, as in the record) and ``tau_decision`` (the τ of the model
+the bank decided with, ``model_at_tau``: the model.json τ when the cell's τ is within rel 1e-6 of it).
 """
 from __future__ import annotations
 
@@ -341,11 +344,13 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                   "tau_after_decline": tau2, "corridor": cpub,
                   "threat": _threat_without_policy(tm), "gate": data["gate"], "seed": int(seed)}
         h = config_hash(config)
+        old_cell = None  # a finished cell rerun only for its trace: the rerun must reproduce its runs exactly
         if key in cells and cells[key].get("config_hash") == h:
+            check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
             if not trace or trace_ok(trace_path(out, key), h):
-                check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
                 say(f"{label} {key}: done, skipped")
                 continue
+            old_cell = cells[key]
             say(f"{label} {key}: done, but its trace file is missing: rerunning with the trace")
         t1 = time.perf_counter()
         mdir, mdl = model_at_tau(model_dir, model, tau, fpr, out / "models" / f"fpr-{fpr:g}",
@@ -353,6 +358,13 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
         rec, runs = run_cell(df, mdl, mdir, tm_c, cfg, seed, n_jobs=n_jobs, threat_path=threat_path,
                              per_target=True, trace=trace)
         usd_uplift(rec, cfg.confidence, seed, cfg.one_sided, N_BOOT)
+        if old_cell is not None:
+            new_runs = json.loads(json.dumps(rec["runs"]))
+            if new_runs != old_cell.get("runs"):
+                bad = sorted(k for k in set(new_runs) | set(old_cell.get("runs") or {})
+                             if new_runs.get(k) != (old_cell.get("runs") or {}).get(k))
+                raise ValueError(f"{path} cell {key}: the rerun for the trace differs from the stored record in runs "
+                                 f"{bad}; nothing overwritten (the trace would not describe the stored numbers)")
         cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
                 "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr,
                 "recon_budget_ops": int(tm_c.recon_budget_ops), **rec,
@@ -368,7 +380,7 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                 merchants = MerchantTable.from_df(df)
             write_trace(trace_path(out, key), {
                 "key": key, "config_hash": h, "label": label, "model_json_sha256": model_sha, "tau": tau,
-                "tau_esc": tau_esc, "tau_after_decline": tau2, "max_declines": sp["max_declines"], "corridor": corr,
+                "tau_decision": float(mdl.tau), "tau_esc": tau_esc, "tau_after_decline": tau2, "max_declines": sp["max_declines"], "corridor": corr,
                 "provenance": prov, "runs": {k: run_trace(r, merchants) for k, r in runs.items()}})
         cells[key] = cell
         say(f"{label} {key}: U {100 * cell['U']:.1f} % ({cell['worst_run']}), U$ {cell['U_usd']:.0f} $, mean uplift "

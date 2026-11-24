@@ -256,6 +256,8 @@ def study_model(label: str, sweep_p, md_key: str, inf_key: str, grid_spec: str, 
     g = rel_overestimation(_ver_matrix(ginf, ATTACK), _ver_matrix(gmd, ATTACK), seed=BOOT_SEED)
     reaction = md["reaction"]
     ref = None if r19_ref is None else ((r19_ref.get(label) or {}).get(f"adv_{ATTACK}") or {}).get(reaction)
+    if r19_ref is not None and ref is None:
+        raise ValueError(f"{label}: the R19 reference has no entry for {label} adv_{ATTACK} {reaction}")
     grid_row = {"seeds": sorted({int(rk.rsplit("/", 1)[1]) for rk in gmd["runs"] if rk.startswith(ATTACK + "/")}),
                 **g, "summary8": ref,
                 "summary8_check": None if ref is None else ("equal" if ref == g else "differs")}

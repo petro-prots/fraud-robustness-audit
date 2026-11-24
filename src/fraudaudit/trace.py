@@ -4,7 +4,8 @@ scores of the passed operations (27d).
 
 ``policy-sweep --trace`` writes one gzip-compressed JSON per cell, ``<out>/<label>/trace/<safe key>.json.gz``
 (``trace_path``; ``|`` → ``__`` and ``=`` → ``-`` in the cell key), with the cell key, its config hash, τ of the cell,
-``tau_esc`` of the model and per run (``es/4``, …) the attack's best candidate (``audit.candidate_dict``) and per target,
+``tau_decision`` (the threshold the bank decided with: the cell's model, whose τ may be the model.json τ within rel
+1e-6 of the cell's), ``tau_esc`` of the model and per run (``es/4``, …) the attack's best candidate (``audit.candidate_dict``) and per target,
 in target order, ``target_trace``: ``card``, ``start``, ``amount``, ``ver_adv``, ``n_ops``, ``n_declines``,
 ``blocked``, ``block_op`` (1-based index of the executed operation on which the card was blocked, None if it was not)
 and ``ops``, every executed adversarial operation in order: ``offset_s`` (seconds from the episode start), ``amt``,

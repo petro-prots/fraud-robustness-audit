@@ -101,6 +101,7 @@ def test_trace_content_is_consistent(env, traced):  # noqa: F811
         tr = load_trace(p)
         assert tr["key"] == c["key"] and tr["config_hash"] == c["config_hash"] and tr["tau"] == c["tau"]
         assert tr["tau_esc"] == data["tau_esc"] and sorted(tr["runs"]) == sorted(c["runs"])
+        assert tr["tau_decision"] == pytest.approx(tr["tau"], rel=1e-6)  # model_at_tau: model.json τ within 1e-6
         esc = c["tau_after_decline"]
         for rk, r in tr["runs"].items():
             assert [t["ver_adv"] for t in r["per_target"]] == c["runs"][rk]["ver_adv"]
@@ -119,7 +120,7 @@ def test_trace_content_is_consistent(env, traced):  # noqa: F811
                 seen_decline = False
                 for o in ops:
                     assert o["escalated"] == (esc is not None and seen_decline)
-                    thr = esc if o["escalated"] else c["tau"]
+                    thr = esc if o["escalated"] else tr["tau_decision"]
                     assert o["declined"] == (o["p"] >= thr)
                     seen_decline = seen_decline or o["declined"]
                 if c["max_declines"] is not None and t["blocked"]:
@@ -164,6 +165,26 @@ def test_trace_resume_reruns_only_cells_without_trace(env, traced, monkeypatch, 
     _sweep(env, work2, True)  # a sweep made without the trace: every cell rerun once, numbers identical
     assert calls == [True, True, True]
     assert _stable(json.loads((work2 / "m" / "policy-sweep.json").read_text())["cells"]) == _stable(plain["cells"])
+
+
+def test_trace_rerun_that_differs_from_the_record_is_refused(env, traced, tmp_path):  # noqa: F811
+    """Review fix 3: a cell rerun only for its trace must reproduce the stored runs; otherwise ValueError and nothing
+    is overwritten (neither the record nor a trace file)."""
+    import shutil
+    _, _, _, out = traced
+    work = tmp_path / "w"
+    shutil.copytree(out, work)
+    k = cell_key(0.01, "md2", "off")
+    trace_path(work / "m", k).unlink()
+    sp = work / "m" / "policy-sweep.json"
+    d = json.loads(sp.read_text())
+    c = next(c for c in d["cells"] if c["key"] == k)
+    c["runs"]["es/1"]["ver_adv"][0] += 1e-9
+    sp.write_text(json.dumps(d, indent=2, sort_keys=True) + "\n")
+    before = sp.read_bytes()
+    with pytest.raises(ValueError, match=r"differs from the stored record in runs \['es/1'\]"):
+        _sweep(env, work, True)
+    assert sp.read_bytes() == before and not trace_path(work / "m", k).exists()
 
 
 def test_trace_file_of_another_config_is_missing(tmp_path):
@@ -322,6 +343,20 @@ def test_cli_md_study_and_reaction_pairs_write_outputs(study, tmp_path):
                  "--out", str(out)]) == 2
 
 
+def test_md_study_refuses_a_reference_without_the_model(study, tmp_path):
+    """Review fix 2: with --r19-reference the label / reaction must be in it."""
+    from fraudaudit.md_study import md_study
+    sp, gp, rp, _, _ = study
+    with pytest.raises(ValueError, match="no entry for gru-base"):
+        md_study([("gru-base", sp, MD2, INF, str(gp))], rp)
+    ref = json.loads(rp.read_text())
+    ref["r19"]["xgb-base"]["adv_es"] = {"md3": ref["r19"]["xgb-base"]["adv_es"]["md2"]}
+    rp.write_text(json.dumps(ref))
+    with pytest.raises(ValueError, match="no entry for xgb-base adv_es md2"):
+        md_study([("xgb-base", sp, MD2, INF, str(gp))], rp)
+    assert md_study([("xgb-base", sp, MD2, INF, str(gp))])["models"][0]["grid"]["summary8_check"] is None
+
+
 def test_md_study_grid_from_two_files(study, tmp_path):
     from fraudaudit.md_study import md_study
     sp, gp, rp, _, _ = study
@@ -463,7 +498,7 @@ def test_reaction_pairs_refusals(tmp_path):
 MD3_OFF = cell_key(0.01, "md3", "off")
 
 
-def _passed_inputs(tmp_path, sha="sha", grid_change=None):
+def _passed_inputs(tmp_path, sha="sha", grid_change=None, tau_decision=0.4):
     seeds = (1, 2, 3)
     c = _tcell(MD3_OFF, 3, seeds, tau=0.4)
     sp = _sweep_file(tmp_path / "new" / "xgb-base" / "policy-sweep.json", [c], seeds=list(seeds), tau_esc=0.05)
@@ -477,7 +512,7 @@ def _passed_inputs(tmp_path, sha="sha", grid_change=None):
                         "blocked": True, "block_op": len(ops), "ops": ops})
         runs[f"es/{s}"] = {"best": {"k": 1, "u": 1.0, "ops": []}, "per_target": per}
     write_trace(trace_path(sp.parent, c["key"]), {"key": c["key"], "config_hash": c["config_hash"], "tau": 0.4,
-                                                  "tau_esc": 0.05, "runs": runs})
+                                                  "tau_decision": tau_decision, "tau_esc": 0.05, "runs": runs})
     g = json.loads(json.dumps(c))
     if grid_change:
         grid_change(g)
@@ -505,6 +540,24 @@ def test_passed_scores_known_answers(tmp_path):
     assert m["per_seed"]["3"]["share_passed_ge_tau_esc"] == pytest.approx(0.75)  # 0.03, 0.06, 0.09, 0.12 vs τ′ 0.05
     assert len(m["log10_p_over_tau"]) == 12
     assert "All runs equal to the grid: yes" in markdown(res)
+
+
+def test_passed_scores_use_the_decision_threshold(tmp_path):
+    """Review fix 1: p / τ and the p < τ check use the threshold the bank decided with (``tau_decision``)."""
+    from fraudaudit.passed_scores import passed_scores
+    sp, gp = _passed_inputs(tmp_path / "a", tau_decision=0.2)
+    m = passed_scores([("xgb-base", sp, MD3_OFF, gp)])["models"][0]
+    assert m["tau"] == 0.2 and m["cell_tau"] == 0.4
+    assert m["pooled"]["p_over_tau"]["max"] == pytest.approx(0.12 / 0.2)
+    sp, gp = _passed_inputs(tmp_path / "b", tau_decision=0.1)  # passed ops up to 0.12 ≥ 0.1: inconsistent
+    with pytest.raises(ValueError, match="inconsistent"):
+        passed_scores([("xgb-base", sp, MD3_OFF, gp)])
+    sp, gp = _passed_inputs(tmp_path / "c")
+    tr = load_trace(trace_path(sp.parent, MD3_OFF))
+    del tr["tau_decision"]
+    write_trace(trace_path(sp.parent, MD3_OFF), tr)
+    with pytest.raises(ValueError, match="tau_decision"):
+        passed_scores([("xgb-base", sp, MD3_OFF, gp)])
 
 
 def test_passed_scores_cross_check_difference_exits_non_zero(tmp_path, capsys):
