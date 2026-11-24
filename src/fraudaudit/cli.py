@@ -168,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "threat files' value, for both --threat and --corridor-threat (R33 sensitivity check; "
                          "delta, thresholds and the rest of the threat model stay)")
     ps.add_argument("--r19", action="store_true", help="also the R19 cells md2 and mdinf at the own tau, corridor off")
+    ps.add_argument("--trace", action="store_true",
+                    help="also write <out>/<label>/trace/<cell>.json.gz per computed cell: the best candidate and every "
+                         "executed adversarial operation with the score of the bank's decision (Task 27b / 27d); "
+                         "changes no number and no config hash; a finished cell without its trace file is rerun")
     ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
                     help="confirmation: a confirmation run with fresh seeds (Task 19 T2: --gate gate-seeds-456.yaml; "
                          "Task 19b front: --gate gate-seeds-4-9.yaml)")
@@ -214,6 +218,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="label, cell key, grid policy-sweep.json (U on the gate seeds), earlier and fresh "
                          "confirmation policy-sweep.json (repeatable)")
     se.add_argument("--out", type=Path, required=True)
+
+    md = sub.add_parser("md-study", help="Task 27b: R19 relative overestimation per fresh ES seed and pooled, the "
+                                         "blocking trace and the ES strategy parameters; descriptive, no verdict")
+    md.add_argument("--cell", action="append", required=True, metavar="LABEL,SWEEP,MD_KEY,INF_KEY,GRID_SWEEP",
+                    help="label, the traced ES sweep (policy-sweep.json), the md and mdinf cell keys, the stored R19 "
+                         "grid policy-sweep.json (several files of one model joined by +) (repeatable)")
+    md.add_argument("--r19-reference", type=Path, default=None,
+                    help="summary8.json: its r19 entry is compared with the gate-seed values (equal / differs)")
+    md.add_argument("--out", type=Path, required=True)
+
+    rp = sub.add_parser("reaction-pairs", help="Task 27c: U_s per seed of two reactions of one cell pair and the "
+                                               "paired difference d_s; descriptive, no verdict")
+    rp.add_argument("--sweep", type=Path, required=True, help="the confirmation policy-sweep.json (seeds 4-15)")
+    rp.add_argument("--a", required=True, help="cell key of reaction a (md3)")
+    rp.add_argument("--b", required=True, help="cell key of reaction b (md3+esc)")
+    rp.add_argument("--reference", type=Path, required=True,
+                    help="grid policy-sweep.json with the same keys (seeds 1-3, printed beside, not pooled)")
+    rp.add_argument("--out", type=Path, required=True)
+
+    pss = sub.add_parser("passed-scores", help="Task 27d: scores of the passed adversarial operations relative to "
+                                               "tau and the escalation threshold, from the trace; exact cross-check "
+                                               "with the grid (exit 1 on a difference)")
+    pss.add_argument("--cell", action="append", required=True, metavar="LABEL,SWEEP,KEY,GRID_SWEEP",
+                     help="label, the traced sweep (policy-sweep.json), the cell key, the grid policy-sweep.json "
+                          "(repeatable)")
+    pss.add_argument("--out", type=Path, required=True)
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -655,7 +685,8 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
                             r19=args.r19, seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out / label,
                             ensemble=not args.friction_only, friction=not args.no_friction, role=args.role,
                             threat_path=args.threat, corridor_path=args.corridor_threat,
-                            gate_path=args.gate, log=lambda m: print(m, file=sys.stderr, flush=True))
+                            gate_path=args.gate, trace=args.trace,
+                            log=lambda m: print(m, file=sys.stderr, flush=True))
         write_markdown(data, args.out / label)
         print((args.out / label / "policy-sweep.md").read_text(encoding="utf-8"), flush=True)
     return 0
@@ -678,6 +709,63 @@ def cmd_seed_extension(args: argparse.Namespace) -> int:
     (args.out / "seed-extension.json").write_text(json.dumps(res, indent=2), encoding="utf-8")
     (args.out / "seed-extension.md").write_text(markdown(res), encoding="utf-8")
     print((args.out / "seed-extension.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
+def _cell_specs(items: list[str], n: int, form: str) -> list[tuple]:
+    out = []
+    for item in items:
+        parts = item.split(",")
+        if len(parts) != n or not all(parts):
+            raise ValueError(f"--cell expects {form}, got {item!r}")
+        out.append(tuple(parts))
+    return out
+
+
+def cmd_md_study(args: argparse.Namespace) -> int:
+    from fraudaudit.md_study import markdown, md_study
+    from fraudaudit.sweep_cells import write_json
+    try:
+        cells = _cell_specs(args.cell, 5, "LABEL,SWEEP,MD_KEY,INF_KEY,GRID_SWEEP")
+        res = md_study([(lab, Path(sp), mk, ik, gs) for lab, sp, mk, ik, gs in cells], args.r19_reference)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: md-study: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    res["meta"] = {**git_info(), "platform": platform.platform()}
+    write_json(args.out / "md-study.json", res)
+    (args.out / "md-study.md").write_text(markdown(res), encoding="utf-8")
+    print((args.out / "md-study.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
+def cmd_reaction_pairs(args: argparse.Namespace) -> int:
+    from fraudaudit.reaction_pairs import reaction_pairs, write
+    try:
+        res = reaction_pairs(args.sweep, args.a, args.b, args.reference)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: reaction-pairs: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    res["meta"] = {**git_info(), "platform": platform.platform()}
+    write(res, args.out)
+    print((args.out / "reaction-pairs.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
+def cmd_passed_scores(args: argparse.Namespace) -> int:
+    from fraudaudit.passed_scores import passed_scores, write
+    try:
+        cells = _cell_specs(args.cell, 4, "LABEL,SWEEP,KEY,GRID_SWEEP")
+        res = passed_scores([(lab, Path(sp), k, Path(gp)) for lab, sp, k, gp in cells])
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: passed-scores: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    res["meta"] = {**git_info(), "platform": platform.platform()}
+    write(res, args.out)
+    print((args.out / "passed-scores.md").read_text(encoding="utf-8"), flush=True)
+    if not res["all_equal"]:
+        print("error: passed-scores: the rerun cell differs from the grid (see the cross-check table)",
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -825,6 +913,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_budget_sensitivity(args)
     if args.command == "seed-extension":
         return cmd_seed_extension(args)
+    if args.command == "md-study":
+        return cmd_md_study(args)
+    if args.command == "reaction-pairs":
+        return cmd_reaction_pairs(args)
+    if args.command == "passed-scores":
+        return cmd_passed_scores(args)
     if args.command == "policy-summary":
         return cmd_policy_summary(args)
     if args.command == "models-summary":

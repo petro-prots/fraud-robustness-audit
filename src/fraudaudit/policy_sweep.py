@@ -29,6 +29,12 @@ corridor meta, as in ``corridor_sweep``) and their effective corridor parameters
 Resumable: the JSON is rewritten (atomically) after every cell and every friction entry; a rerun skips a cell whose
 config hash (model, τ, reaction, corridor, threat model, gate ensemble, seed) is unchanged and reruns it otherwise.
 Cells already in the JSON but not requested are kept (the R19 cells and the grid share one file).
+
+``trace`` (Task 27 chain 2, R48 / R50; ``policy-sweep --trace``): every cell computed by this run also writes
+``<out_dir>/trace/<safe key>.json.gz`` (``trace.py``): the cell key, its config hash, τ, ``tau_esc`` and per run the best
+candidate and every executed adversarial operation with the score of the bank's decision. The trace is not part of the
+configuration (no hash change) and changes no number; with ``trace`` a finished cell whose trace file is missing (or
+belongs to another config hash) is rerun – its record is overwritten with identical numbers – and skipped otherwise.
 """
 from __future__ import annotations
 
@@ -45,6 +51,7 @@ import numpy as np
 
 from . import corridor as corridor_mod
 from .sweep_cells import check_own_tau, model_at_tau, model_target_fpr, run_cell, tau_at, val_scores, write_json
+from .trace import run_trace, trace_ok, trace_path, write_trace
 
 FPR_GRID = (0.005, 0.01, 0.02)
 REACTIONS = ("md1", "md3", "md3+esc")
@@ -204,9 +211,11 @@ def load_scores(path, model_sha: str) -> dict | None:
 def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs=FPR_GRID, reactions=REACTIONS,
                  corridors=CORRIDORS, kappas=None, qs=None, esc_fpr: float = ESC_FPR, r19: bool = False, seed: int = 42,
                  n_jobs: int | None = None, out_dir, ensemble: bool = True, friction: bool = True,
-                 role: str = "grid", threat_path=None, corridor_path=None, gate_path=None, log=None) -> dict:
+                 role: str = "grid", threat_path=None, corridor_path=None, gate_path=None, log=None,
+                 trace: bool = False) -> dict:
     """Run (or resume) the cells of one model; returns the sweep dict also written to ``out_dir/SWEEP_FILE``.
-    ``kappas`` / ``qs``: corridor variants of the corridor-on cells (module docstring); None = the file's value."""
+    ``kappas`` / ``qs``: corridor variants of the corridor-on cells (module docstring); None = the file's value.
+    ``trace``: the trace file of every computed cell (module docstring)."""
     from .audit import N_BOOT, _versions
     from .cli import git_info
     say = log or (lambda m: None)
@@ -320,6 +329,7 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
     todo = [t for t in todo if not (cell_key(t[0], t[1], t[3], t[4]) in seen
                                     or seen.add(cell_key(t[0], t[1], t[3], t[4])))]
 
+    merchants = None  # built once, for the trace's best candidates (categories)
     for fpr, rname, sp, corr, var in (todo if ensemble else []):
         key = cell_key(fpr, rname, corr, var)
         tau = taus[fpr]
@@ -332,14 +342,16 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                   "threat": _threat_without_policy(tm), "gate": data["gate"], "seed": int(seed)}
         h = config_hash(config)
         if key in cells and cells[key].get("config_hash") == h:
-            check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
-            say(f"{label} {key}: done, skipped")
-            continue
+            if not trace or trace_ok(trace_path(out, key), h):
+                check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
+                say(f"{label} {key}: done, skipped")
+                continue
+            say(f"{label} {key}: done, but its trace file is missing: rerunning with the trace")
         t1 = time.perf_counter()
         mdir, mdl = model_at_tau(model_dir, model, tau, fpr, out / "models" / f"fpr-{fpr:g}",
                                  "policy-sweep: same weights, tau at target_fpr on val")
         rec, runs = run_cell(df, mdl, mdir, tm_c, cfg, seed, n_jobs=n_jobs, threat_path=threat_path,
-                             per_target=True)
+                             per_target=True, trace=trace)
         usd_uplift(rec, cfg.confidence, seed, cfg.one_sided, N_BOOT)
         cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
                 "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr,
@@ -350,6 +362,14 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                 **violation_counts(runs, corr == "on"),
                 "U": rec["worst_uplift_upper"], "U_usd": rec["worst_usd_uplift_upper"],
                 "wall_seconds": round(time.perf_counter() - t1, 1), "provenance": prov}
+        if trace:
+            if merchants is None:
+                from .threat import MerchantTable
+                merchants = MerchantTable.from_df(df)
+            write_trace(trace_path(out, key), {
+                "key": key, "config_hash": h, "label": label, "model_json_sha256": model_sha, "tau": tau,
+                "tau_esc": tau_esc, "tau_after_decline": tau2, "max_declines": sp["max_declines"], "corridor": corr,
+                "provenance": prov, "runs": {k: run_trace(r, merchants) for k, r in runs.items()}})
         cells[key] = cell
         say(f"{label} {key}: U {100 * cell['U']:.1f} % ({cell['worst_run']}), U$ {cell['U_usd']:.0f} $, mean uplift "
             f"{100 * cell['mean_uplift']:.1f} %, test recall {cell['test_recall']:.4f}, {cell['wall_seconds']} s")

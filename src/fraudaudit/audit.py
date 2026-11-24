@@ -192,14 +192,16 @@ def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_decline
 
 
 def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm: ThreatModel,
-                    merchants: MerchantTable, seed: int, i: int) -> dict:
+                    merchants: MerchantTable, seed: int, i: int, trace: bool = False) -> dict:
     """Adversarial and clean run of target ``i``; plain types only (crosses process boundaries).
 
     Dispatch on the candidate type (``execute_candidate``): a fixed ``Strategy`` is realised and run by
     ``run_episode``, a ``StepwisePolicy`` runs closed-loop (``run_adaptive_episode``). ``executed`` are the
     operations the bank actually saw; each is checked against the threat model. The replay candidate of the positive
     control (``attacks.replay``) executes the episode's real operations exactly as the clean leg; they are the observed
-    data, not attacker-generated, so they count as feasible (``replay: true``)."""
+    data, not attacker-generated, so they count as feasible (``replay: true``). ``trace`` adds ``trace`` (``block_op``
+    and every executed adversarial operation with the score of the bank's decision, ``trace.target_trace``); without it
+    the dict is exactly as before."""
     from .attacks.replay import ReplayCandidate
     replay = isinstance(best, ReplayCandidate)
     if replay:
@@ -221,6 +223,9 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
            "clean_blocked": bool(clean.blocked)}
     if replay:
         out["replay"] = True
+    if trace:
+        from .trace import target_trace
+        out["trace"] = target_trace(adv, executed, ctx.episode.start)
     if tm.corridor is not None:
         start = ctx.episode.start
         b = corridor_mod.episode_bound(tm.corridor, ctx.state, start, tm.window_days)
@@ -252,15 +257,15 @@ def _load_serving(model_dir) -> Serving:
     return Serving(load_model(Path(model_dir)))
 
 
-def _init_worker(model_dir, targets, clean, best, tm, merchants, seed) -> None:
+def _init_worker(model_dir, targets, clean, best, tm, merchants, seed, trace=False) -> None:
     _WORKER.update(serving=_load_serving(model_dir), targets=targets, clean=clean, best=best, tm=tm,
-                   merchants=merchants, seed=seed)
+                   merchants=merchants, seed=seed, trace=bool(trace))
 
 
 def _target_job(i: int) -> dict:
     w = _WORKER
     return _execute_target(w["serving"], w["targets"][i], w["clean"][i], w["best"], w["tm"], w["merchants"],
-                           w["seed"], i)
+                           w["seed"], i, w.get("trace", False))
 
 
 def _sha256(path: Path) -> str:
@@ -328,7 +333,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
               spares_period: str, one_sided: bool,
               n_jobs: int | None = None, model_dir: Path | str | None = None,
               target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None,
-              attack_seed: int | None = None, confidence: float = CONFIDENCE) -> AuditResult:
+              attack_seed: int | None = None, confidence: float = CONFIDENCE, trace: bool = False) -> AuditResult:
     """Episode audit of ``model`` (see the module docstring).
 
     ``model`` is used in-process (``n_jobs=1``) and for the clean quality; ``n_jobs > 1`` needs
@@ -339,7 +344,8 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     and the target realisations stay those of ``seed``); ``confidence`` is the level of every interval.
     ``spares_period`` (required) chooses the target/spare episodes (``select_episodes``; the gate uses ``"fit"``,
     ``"test"`` is the legacy 50/50 split); ``one_sided`` (required) makes the uplift upper bound one-sided
-    (the gate); VER intervals stay two-sided.
+    (the gate); VER intervals stay two-sided. ``trace`` adds the trace of the adversarial leg to every ``per_target``
+    entry (``trace.py``; no number changes).
     """
     if not isinstance(one_sided, bool):
         raise ValueError(f"one_sided must be a bool, got {one_sided!r}")
@@ -351,7 +357,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     return audit_episodes(df, model, tm, attack, seed, target_eps, spare_eps, spares_period=spares_period,
                           one_sided=one_sided, n_jobs=n_jobs, model_dir=model_dir, target_periods=target_periods,
                           threat_path=threat_path, attack_seed=attack_seed, confidence=confidence,
-                          extra_meta=extra)
+                          extra_meta=extra, trace=trace)
 
 
 def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, target_eps: list,
@@ -359,7 +365,7 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
                    model_dir: Path | str | None = None, target_periods: tuple[str, ...] = ("test",),
                    threat_path: Path | str | None = None, attack_seed: int | None = None,
                    confidence: float = CONFIDENCE, quality_periods: tuple[str, ...] = ("val", "test"),
-                   extra_meta: dict | None = None) -> AuditResult:
+                   extra_meta: dict | None = None, trace: bool = False) -> AuditResult:
     """``run_audit`` on explicit target and spare episodes (``run_audit`` selects them; ``harden``'s
     mini-audit passes the val episodes as targets and H episodes as spares). ``spares_period`` and
     ``target_periods`` are only recorded in ``meta``; ``quality_periods`` are the periods of the clean
@@ -401,10 +407,10 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
     if jobs > 1 and len(targets) > 1:
         with ProcessPoolExecutor(max_workers=min(jobs, len(targets)), mp_context=mp.get_context("spawn"),
                                  initializer=_init_worker,
-                                 initargs=(str(model_dir), targets, clean, best, tm, merchants, seed)) as ex:
+                                 initargs=(str(model_dir), targets, clean, best, tm, merchants, seed, trace)) as ex:
             per_target = list(ex.map(_target_job, idx, chunksize=max(1, len(idx) // (4 * jobs))))
     else:
-        per_target = [_execute_target(serving, targets[i], clean[i], best, tm, merchants, seed, i) for i in idx]
+        per_target = [_execute_target(serving, targets[i], clean[i], best, tm, merchants, seed, i, trace) for i in idx]
 
     v_adv = np.array([t["ver_adv"] for t in per_target])
     v_clean = np.array([t["ver_clean"] for t in per_target])

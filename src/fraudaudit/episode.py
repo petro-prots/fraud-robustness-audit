@@ -18,6 +18,9 @@ or confirmed) enters the corridor profile, whoever sent it (ruling R26: no fraud
 7-day lag, so it cannot change the corridor of an episode of at most 7 days. ``corridor_c7`` / ``corridor_c24`` record
 the 7-day / 24 h corridor the bank used on each day (``corridor.check_used_corridor``); ``auto_ops`` and
 ``confirmed_ops`` the auto-approved and owner-confirmed operations (Proposition 2 per block; V2 post-hoc bound).
+``scores``, ``model_declines`` and ``escalated_ops`` record per executed operation the score p of the bank's decision, the
+model's decline at the active threshold and whether the threshold was already escalated (the trace of Task 27 chain 2,
+``trace.py``); they never enter a result number.
 """
 from __future__ import annotations
 
@@ -48,6 +51,10 @@ class EpisodeOutcome:
     corridor_c24: tuple = ()  # ((day ns, C_24h cents), …) likewise for the 24 h corridor
     auto_ops: tuple = ()  # ((t ns, cents), …) the auto-approved operations, in order
     confirmed_ops: tuple = ()  # ((t ns, cents), …) the owner-confirmed operations, in order
+    # per executed operation, in order (the trace of Task 27 chain 2; never part of a result number):
+    scores: tuple = ()  # p of the bank's decision (``serving.decide(...).p``), not a re-scoring
+    model_declines: tuple = ()  # the model's decline at the active threshold (τ, after an escalation τ′)
+    escalated_ops: tuple = ()  # the threshold was already escalated when this operation was decided
 
 
 def run_episode(serving: Serving, ctx: EpisodeContext, txs: list[Tx], max_declines: int | None,
@@ -111,6 +118,9 @@ class _Bank:
         self.blocked = False
         self.escalated = False
         self.decisions: list[bool] = []
+        self.scores: list[float] = []
+        self.model_declines: list[bool] = []
+        self.escalated_ops: list[bool] = []
 
     def submit(self, tx: Tx, *, owner: bool | None = None) -> bool:
         """Decide ``tx`` and push it into the state; returns the «did not pass» flag (all the attacker sees; without
@@ -124,6 +134,9 @@ class _Bank:
         if self.escalated:
             declined = d.p >= self.tau_after_decline
         declined = bool(declined)
+        self.scores.append(float(d.p))
+        self.model_declines.append(declined)
+        self.escalated_ops.append(bool(self.escalated))
         auto = not declined
         confirm = False
         if auto and self.corridor is not None:
@@ -164,7 +177,8 @@ class _Bank:
                               decisions=tuple(self.decisions), escalated=self.escalated,
                               n_confirms=self.n_confirms, corridor_c7=tuple(sorted(self.c7_used.items())),
                               corridor_c24=tuple(sorted(self.c24_used.items())), auto_ops=tuple(self.auto_ops),
-                              confirmed_ops=tuple(self.confirmed_ops))
+                              confirmed_ops=tuple(self.confirmed_ops), scores=tuple(self.scores),
+                              model_declines=tuple(self.model_declines), escalated_ops=tuple(self.escalated_ops))
 
 
 def run_adaptive_episode(serving, ctx: EpisodeContext, policy, tm: ThreatModel, merchants: MerchantTable,

@@ -1,0 +1,8 @@
+target_fpr: 0.01          # per-operation FPR at which the model's τ was chosen (checked against models/model.json)
+recall_clean_min: 0.5     # recall on clean test operations at τ
+delta: 0.10   # approved by the author 2026-11-15 after calibration (resolution 4.1 pp on 218 episodes); fixed before hardening
+attacks: [es]  # Task 27d (R39 order 5, R48, R50): ES only – the grid cell md3 corridor off rerun with the trace (passed-scores); seeds 1-3 as gate.yaml, the rerun must equal the stored grid runs
+attack_seeds: [1, 2, 3]   # every attack with every seed on the same targets and spares
+confidence: 0.95          # level of all intervals
+one_sided: true           # uplift: one-sided upper bound (only uplift ≤ δ is tested); VER intervals stay two-sided
+spares_period: fit        # recon spares = fit-period fraud episodes; targets = every test episode (R14); test = old 50/50 split

@@ -63,13 +63,15 @@ def model_at_tau(model_dir, model, tau: float, fpr: float, derived_dir, note: st
 
 
 def run_cell(df, model, model_dir, tm, cfg, seed: int, *, n_jobs=None, threat_path=None,
-             per_target: bool = False) -> tuple[dict, dict]:
+             per_target: bool = False, trace: bool = False) -> tuple[dict, dict]:
     """The gate's ensemble (``gate.run_ensemble``) on one cell; returns (record, ``{run_key: AuditResult}``).
     ``per_target`` adds per run the per-target VERs in target order (``ver_adv``, ``ver_clean``) and once the
-    episode amounts (``amounts``)."""
+    episode amounts (``amounts``). ``trace`` audits the runs with the trace of the adversarial leg (in the returned
+    ``AuditResult.per_target`` only; the record is the same)."""
     from .gate import run_ensemble
     t0 = time.perf_counter()
-    runs = run_ensemble(df, model, tm, cfg, seed, n_jobs=n_jobs, model_dir=model_dir, threat_path=threat_path)
+    runs = run_ensemble(df, model, tm, cfg, seed, n_jobs=n_jobs, model_dir=model_dir, threat_path=threat_path,
+                        trace=trace)
     rec = {"runs": {k: {"uplift_mean": r.uplift[0], "uplift_upper": r.uplift[2], "ver_adv_mean": r.ver_adv[0],
                         "ver_clean_mean": r.ver_clean[0], "asr": r.asr} for k, r in runs.items()}}
     bad = [k for k, v in rec["runs"].items() if not math.isfinite(v["uplift_upper"])]
