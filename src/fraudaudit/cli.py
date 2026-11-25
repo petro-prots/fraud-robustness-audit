@@ -172,6 +172,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also write <out>/<label>/trace/<cell>.json.gz per computed cell: the best candidate and every "
                          "executed adversarial operation with the score of the bank's decision (Task 27b / 27d); "
                          "changes no number and no config hash; a finished cell without its trace file is rerun")
+    ps.add_argument("--owner-ops", action="store_true",
+                    help="also audit every computed cell with the owner's real operations of the attack window "
+                         "interleaved, in two variants (the owner's decline counts to max_declines or not), and write "
+                         "<out>/<label>/owner/<cell>.json.gz (Task 28, R54); changes no number and no config hash; a "
+                         "finished cell without its owner file is rerun")
     ps.add_argument("--role", choices=["grid", "confirmation"], default="grid",
                     help="confirmation: a confirmation run with fresh seeds (Task 19 T2: --gate gate-seeds-456.yaml; "
                          "Task 19b front: --gate gate-seeds-4-9.yaml)")
@@ -252,6 +257,22 @@ def build_parser() -> argparse.ArgumentParser:
                      help="label, the traced sweep (policy-sweep.json), the cell key, the grid policy-sweep.json "
                           "(repeatable)")
     pss.add_argument("--out", type=Path, required=True)
+
+    oo = sub.add_parser("owner-ops", help="Task 28 (R54): U of cells with the owner's operations of the attack window "
+                                          "(two variants) against the plain leg; exact cross-check with the stored "
+                                          "record (exit 1 on a difference); descriptive, no verdict")
+    oo.add_argument("--cell", action="append", required=True, metavar="LABEL,SWEEP,KEY,REFERENCE",
+                    help="label, the policy-sweep.json run with --owner-ops, the cell key, the stored policy-sweep.json "
+                         "with the same cell (repeatable)")
+    oo.add_argument("--out", type=Path, required=True)
+
+    ad = sub.add_parser("audit-diff", help="Task 28: compare an audit.json or skew.json with a reference run of the same "
+                                           "command (value differences, keys only on one side); information only")
+    ad.add_argument("--reference", type=Path, required=True)
+    ad.add_argument("--new", type=Path, required=True)
+    ad.add_argument("--label", required=True, help="name of the comparison in the report")
+    ad.add_argument("--out", type=Path, required=True,
+                    help="directory: repro.json / repro.md are updated with this comparison")
 
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
@@ -693,7 +714,7 @@ def cmd_policy_sweep(args: argparse.Namespace) -> int:
                             r19=args.r19, seed=args.seed, n_jobs=args.n_jobs, out_dir=args.out / label,
                             ensemble=not args.friction_only, friction=not args.no_friction, role=args.role,
                             threat_path=args.threat, corridor_path=args.corridor_threat,
-                            gate_path=args.gate, trace=args.trace,
+                            gate_path=args.gate, trace=args.trace, owner_ops=args.owner_ops,
                             log=lambda m: print(m, file=sys.stderr, flush=True))
         write_markdown(data, args.out / label)
         print((args.out / label / "policy-sweep.md").read_text(encoding="utf-8"), flush=True)
@@ -774,6 +795,37 @@ def cmd_passed_scores(args: argparse.Namespace) -> int:
         print("error: passed-scores: the rerun cell differs from the grid (see the cross-check table)",
               file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_owner_ops(args: argparse.Namespace) -> int:
+    from fraudaudit.owner_ops import owner_summary, write
+    try:
+        cells = _cell_specs(args.cell, 4, "LABEL,SWEEP,KEY,REFERENCE")
+        res = owner_summary([(lab, Path(sp), k, Path(rp)) for lab, sp, k, rp in cells])
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: owner-ops: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    res["meta"] = {**git_info(), "platform": platform.platform()}
+    write(res, args.out)
+    print((args.out / "owner-ops.md").read_text(encoding="utf-8"), flush=True)
+    if not res["all_equal"]:
+        print("error: owner-ops: the plain leg differs from the stored record (see the cross-check table)",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_audit_diff(args: argparse.Namespace) -> int:
+    from fraudaudit.audit_diff import add_comparison
+    try:
+        res = add_comparison(args.reference, args.new, args.label, args.out)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: audit-diff: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print(f"{args.label}: {'equal' if res['equal'] else 'differs'} ({res['n_value_differences']} value differences, "
+          f"{len(res['only_reference'])} keys only in the reference, {len(res['only_new'])} only in the new run)",
+          flush=True)
     return 0
 
 
@@ -940,6 +992,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_reaction_pairs(args)
     if args.command == "passed-scores":
         return cmd_passed_scores(args)
+    if args.command == "owner-ops":
+        return cmd_owner_ops(args)
+    if args.command == "audit-diff":
+        return cmd_audit_diff(args)
     if args.command == "policy-summary":
         return cmd_policy_summary(args)
     if args.command == "models-summary":

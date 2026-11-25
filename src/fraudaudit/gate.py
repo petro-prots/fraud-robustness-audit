@@ -178,11 +178,13 @@ def make_attack(name: str, tm):
 
 
 def run_ensemble(df, model, tm, cfg: GateConfig, seed: int, *, n_jobs: int | None = None, model_dir=None,
-                 threat_path=None, log=None, false_blocks: bool = False, trace: bool = False) -> dict:
+                 threat_path=None, log=None, false_blocks: bool = False, trace: bool = False,
+                 owner_ops: bool = False) -> dict:
     """``run_audit`` for every attack × attack seed of ``cfg``, one after another (each run uses its own
     process pool internally), on the same split ``seed``. Returns ``{run_key: AuditResult}``. ``false_blocks``
     adds the informational false-block rate of legitimate cards (computed once, the same for every run). ``trace``
-    audits every run with the trace of its adversarial leg (``audit.run_audit``, ``trace.py``)."""
+    audits every run with the trace of its adversarial leg (``audit.run_audit``, ``trace.py``); ``owner_ops`` with the two
+    owner variants of Task 28 (``audit.run_audit``)."""
     from . import audit
     results = {}
     for name in cfg.attacks:
@@ -190,7 +192,7 @@ def run_ensemble(df, model, tm, cfg: GateConfig, seed: int, *, n_jobs: int | Non
             r = audit.run_audit(df, model, tm, make_attack(name, tm), seed=seed, n_jobs=n_jobs,
                                 model_dir=model_dir, threat_path=threat_path, attack_seed=s,
                                 confidence=cfg.confidence, one_sided=cfg.one_sided,
-                                spares_period=cfg.spares_period, trace=trace)
+                                spares_period=cfg.spares_period, trace=trace, owner_ops=owner_ops)
             results[run_key(name, s)] = r
             if log is not None:
                 log(f"{run_key(name, s)}: uplift mean {r.uplift[0]:.4f}, upper {r.uplift[2]:.4f}, "

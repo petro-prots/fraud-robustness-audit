@@ -183,16 +183,63 @@ REPLAY = {"context": "history ts < episode.start (episode rows excluded)",
           "in_window_legit_ops": "excluded in both runs"}
 
 
+def owner_window_txs(df: pd.DataFrame, episode, window_days: int) -> tuple[list[Tx], int]:
+    """The owner's real operations inside the attack window of ``episode`` (Task 28, R54): the card's rows with
+    ``episode.start <= ts < episode.start + window_days``, not among the episode's rows and with ``is_fraud == 0``, as
+    ``Tx`` in (ts, row) order; and the number of other fraud rows of the card in that window (excluded). The label is
+    used only to pick the experiment's owner operations; the bank never sees it."""
+    start = pd.Timestamp(episode.start)
+    end = start + pd.Timedelta(days=int(window_days))
+    g = df[(df["cc_num"] == episode.card) & (df["ts"] >= start) & (df["ts"] < end) & ~df["row"].isin(episode.rows)]
+    g = g.sort_values(["ts", "row"], kind="stable")
+    own = g[g["is_fraud"] == 0]
+    txs = [Tx(ts=pd.Timestamp(r.ts), amt=float(r.amt), merchant=str(r.merchant), category=str(r.category),
+              merch_lat=float(r.merch_lat), merch_long=float(r.merch_long)) for r in own.itertuples(index=False)]
+    return txs, int((g["is_fraud"] != 0).sum())
+
+
+OWNER_VARIANTS = (("count", True), ("nocount", False))  # (name, the owner's decline counts to max_declines)
+
+
 def _clean_outcome(serving, ctx: EpisodeContext, real_txs: list[Tx], max_declines: int | None, rho: float,
-                   tau_after_decline: float | None = None, corridor=None):
+                   tau_after_decline: float | None = None, corridor=None, *, owner_txs: list[Tx] | None = None,
+                   owner_declines_count: bool = True):
     """The clean leg: the episode's real operations through ``run_episode`` (used by ``clean_ver`` and
-    by ``run_audit``), under the same spending corridor as the adversarial leg."""
+    by ``run_audit``), under the same spending corridor as the adversarial leg; ``owner_txs``: the owner's operations of
+    the window interleaved (Task 28)."""
     return run_episode(serving, ctx, real_txs, max_declines, rho, tau_after_decline=tau_after_decline,
-                       corridor=corridor)
+                       corridor=corridor, owner_txs=owner_txs, owner_declines_count=owner_declines_count)
+
+
+def _owner_legs(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm: ThreatModel, merchants: MerchantTable,
+                seed: int, i: int, owner: tuple[list[Tx], int]) -> dict:
+    """Both owner variants (``OWNER_VARIANTS``) of target ``i``: the same best candidate with the same random stream
+    as the plain leg, and the clean leg, each with the owner's operations of the window interleaved (Task 28)."""
+    from .attacks.replay import ReplayCandidate
+    owner_txs, n_other_fraud = owner
+    out = {"n_window_ops": len(owner_txs), "n_other_fraud_in_window": int(n_other_fraud)}
+    for name, counts in OWNER_VARIANTS:
+        kw = {"owner_txs": owner_txs, "owner_declines_count": counts}
+        if isinstance(best, ReplayCandidate):
+            adv = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline,
+                                 tm.corridor, **kw)
+        else:
+            adv, _ = execute_candidate(serving, ctx, best, tm, merchants,
+                                       np.random.default_rng([seed, _STREAM_TARGET, i]), **kw)
+        clean = _clean_outcome(serving, ctx, clean_txs, tm.max_declines, tm.rho, tm.tau_after_decline, tm.corridor,
+                               **kw)
+        out[name] = {"ver_adv": float(adv.ver), "ver_clean": float(clean.ver), "n_ops": int(adv.n_ops),
+                     "blocked": bool(adv.blocked), "clean_blocked": bool(clean.blocked),
+                     **{f"{leg}{k}": int(getattr(o, k)) for leg, o in (("", adv), ("clean_", clean))
+                        for k in ("owner_ops", "owner_declined", "owner_confirms", "owner_lost")},
+                     "blocked_by_owner": bool(adv.blocked_by_owner),
+                     "clean_blocked_by_owner": bool(clean.blocked_by_owner)}
+    return out
 
 
 def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm: ThreatModel,
-                    merchants: MerchantTable, seed: int, i: int, trace: bool = False) -> dict:
+                    merchants: MerchantTable, seed: int, i: int, trace: bool = False,
+                    owner: tuple[list[Tx], int] | None = None) -> dict:
     """Adversarial and clean run of target ``i``; plain types only (crosses process boundaries).
 
     Dispatch on the candidate type (``execute_candidate``): a fixed ``Strategy`` is realised and run by
@@ -201,7 +248,8 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
     control (``attacks.replay``) executes the episode's real operations exactly as the clean leg; they are the observed
     data, not attacker-generated, so they count as feasible (``replay: true``). ``trace`` adds ``trace`` (``block_op``
     and every executed adversarial operation with the score of the bank's decision, ``trace.target_trace``); without it
-    the dict is exactly as before."""
+    the dict is exactly as before. ``owner`` (``owner_window_txs`` of the target, Task 28) adds ``owner``: both owner
+    variants (``_owner_legs``); every other key is the plain leg, unchanged."""
     from .attacks.replay import ReplayCandidate
     replay = isinstance(best, ReplayCandidate)
     if replay:
@@ -223,6 +271,8 @@ def _execute_target(serving, ctx: EpisodeContext, clean_txs: list[Tx], best, tm:
            "clean_blocked": bool(clean.blocked)}
     if replay:
         out["replay"] = True
+    if owner is not None:
+        out["owner"] = _owner_legs(serving, ctx, clean_txs, best, tm, merchants, seed, i, owner)
     if trace:
         from .trace import target_trace
         out["trace"] = target_trace(adv, executed, ctx.episode.start)
@@ -257,15 +307,16 @@ def _load_serving(model_dir) -> Serving:
     return Serving(load_model(Path(model_dir)))
 
 
-def _init_worker(model_dir, targets, clean, best, tm, merchants, seed, trace=False) -> None:
+def _init_worker(model_dir, targets, clean, best, tm, merchants, seed, trace=False, owners=None) -> None:
     _WORKER.update(serving=_load_serving(model_dir), targets=targets, clean=clean, best=best, tm=tm,
-                   merchants=merchants, seed=seed, trace=bool(trace))
+                   merchants=merchants, seed=seed, trace=bool(trace), owners=owners)
 
 
 def _target_job(i: int) -> dict:
     w = _WORKER
+    owners = w.get("owners")
     return _execute_target(w["serving"], w["targets"][i], w["clean"][i], w["best"], w["tm"], w["merchants"],
-                           w["seed"], i, w.get("trace", False))
+                           w["seed"], i, w.get("trace", False), None if owners is None else owners[i])
 
 
 def _sha256(path: Path) -> str:
@@ -333,7 +384,8 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
               spares_period: str, one_sided: bool,
               n_jobs: int | None = None, model_dir: Path | str | None = None,
               target_periods: tuple[str, ...] = ("test",), threat_path: Path | str | None = None,
-              attack_seed: int | None = None, confidence: float = CONFIDENCE, trace: bool = False) -> AuditResult:
+              attack_seed: int | None = None, confidence: float = CONFIDENCE, trace: bool = False,
+              owner_ops: bool = False) -> AuditResult:
     """Episode audit of ``model`` (see the module docstring).
 
     ``model`` is used in-process (``n_jobs=1``) and for the clean quality; ``n_jobs > 1`` needs
@@ -345,7 +397,8 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     ``spares_period`` (required) chooses the target/spare episodes (``select_episodes``; the gate uses ``"fit"``,
     ``"test"`` is the legacy 50/50 split); ``one_sided`` (required) makes the uplift upper bound one-sided
     (the gate); VER intervals stay two-sided. ``trace`` adds the trace of the adversarial leg to every ``per_target``
-    entry (``trace.py``; no number changes).
+    entry (``trace.py``; no number changes). ``owner_ops`` adds to every ``per_target`` entry the two owner variants
+    (Task 28, ``_owner_legs``; no number of the plain leg changes).
     """
     if not isinstance(one_sided, bool):
         raise ValueError(f"one_sided must be a bool, got {one_sided!r}")
@@ -357,7 +410,7 @@ def run_audit(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: in
     return audit_episodes(df, model, tm, attack, seed, target_eps, spare_eps, spares_period=spares_period,
                           one_sided=one_sided, n_jobs=n_jobs, model_dir=model_dir, target_periods=target_periods,
                           threat_path=threat_path, attack_seed=attack_seed, confidence=confidence,
-                          extra_meta=extra, trace=trace)
+                          extra_meta=extra, trace=trace, owner_ops=owner_ops)
 
 
 def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, seed: int, target_eps: list,
@@ -365,7 +418,7 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
                    model_dir: Path | str | None = None, target_periods: tuple[str, ...] = ("test",),
                    threat_path: Path | str | None = None, attack_seed: int | None = None,
                    confidence: float = CONFIDENCE, quality_periods: tuple[str, ...] = ("val", "test"),
-                   extra_meta: dict | None = None, trace: bool = False) -> AuditResult:
+                   extra_meta: dict | None = None, trace: bool = False, owner_ops: bool = False) -> AuditResult:
     """``run_audit`` on explicit target and spare episodes (``run_audit`` selects them; ``harden``'s
     mini-audit passes the val episodes as targets and H episodes as spares). ``spares_period`` and
     ``target_periods`` are only recorded in ``meta``; ``quality_periods`` are the periods of the clean
@@ -403,14 +456,17 @@ def audit_episodes(df: pd.DataFrame, model, tm: ThreatModel, attack: Attack, see
     best = clip_candidate(run.best, tm, merchants)
 
     clean = [episode_txs(df, ctx.episode) for ctx in targets]
+    owners = [owner_window_txs(df, ctx.episode, tm.window_days) for ctx in targets] if owner_ops else None
     idx = list(range(len(targets)))
     if jobs > 1 and len(targets) > 1:
         with ProcessPoolExecutor(max_workers=min(jobs, len(targets)), mp_context=mp.get_context("spawn"),
                                  initializer=_init_worker,
-                                 initargs=(str(model_dir), targets, clean, best, tm, merchants, seed, trace)) as ex:
+                                 initargs=(str(model_dir), targets, clean, best, tm, merchants, seed, trace,
+                                           owners)) as ex:
             per_target = list(ex.map(_target_job, idx, chunksize=max(1, len(idx) // (4 * jobs))))
     else:
-        per_target = [_execute_target(serving, targets[i], clean[i], best, tm, merchants, seed, i, trace) for i in idx]
+        per_target = [_execute_target(serving, targets[i], clean[i], best, tm, merchants, seed, i, trace,
+                                      None if owners is None else owners[i]) for i in idx]
 
     v_adv = np.array([t["ver_adv"] for t in per_target])
     v_clean = np.array([t["ver_clean"] for t in per_target])

@@ -38,6 +38,11 @@ belongs to another config hash) is rerun – after ``check_reuse``, and its reco
 ``runs`` (every run value and per-target list) equal the stored ones, else ValueError and nothing is written – and
 skipped otherwise. The trace records ``tau`` (the cell's τ, as in the record) and ``tau_decision`` (the τ of the model
 the bank decided with, ``model_at_tau``: the model.json τ when the cell's τ is within rel 1e-6 of it).
+
+``owner_ops`` (Task 28, R54; ``policy-sweep --owner-ops``): every cell computed by this run is audited with the owner's
+operations of the window in two variants (``owner_ops.py``) and also writes ``<out_dir>/owner/<safe key>.json.gz``. Like
+the trace it is not part of the configuration and changes no number; a finished cell whose owner file is missing (or
+belongs to another config hash) is rerun under the same reproduction rule as for the trace.
 """
 from __future__ import annotations
 
@@ -54,6 +59,7 @@ import numpy as np
 
 from . import corridor as corridor_mod
 from .sweep_cells import check_own_tau, model_at_tau, model_target_fpr, run_cell, tau_at, val_scores, write_json
+from .owner_ops import cell_owner, owner_ok, owner_path, write_owner
 from .trace import run_trace, trace_ok, trace_path, write_trace
 
 FPR_GRID = (0.005, 0.01, 0.02)
@@ -215,10 +221,10 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                  corridors=CORRIDORS, kappas=None, qs=None, esc_fpr: float = ESC_FPR, r19: bool = False, seed: int = 42,
                  n_jobs: int | None = None, out_dir, ensemble: bool = True, friction: bool = True,
                  role: str = "grid", threat_path=None, corridor_path=None, gate_path=None, log=None,
-                 trace: bool = False) -> dict:
+                 trace: bool = False, owner_ops: bool = False) -> dict:
     """Run (or resume) the cells of one model; returns the sweep dict also written to ``out_dir/SWEEP_FILE``.
     ``kappas`` / ``qs``: corridor variants of the corridor-on cells (module docstring); None = the file's value.
-    ``trace``: the trace file of every computed cell (module docstring)."""
+    ``trace``: the trace file of every computed cell; ``owner_ops``: the owner file (module docstring)."""
     from .audit import N_BOOT, _versions
     from .cli import git_info
     say = log or (lambda m: None)
@@ -344,27 +350,31 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                   "tau_after_decline": tau2, "corridor": cpub,
                   "threat": _threat_without_policy(tm), "gate": data["gate"], "seed": int(seed)}
         h = config_hash(config)
-        old_cell = None  # a finished cell rerun only for its trace: the rerun must reproduce its runs exactly
+        old_cell = None  # a finished cell rerun only for its trace / owner file: the rerun must reproduce its runs
         if key in cells and cells[key].get("config_hash") == h:
             check_reuse(cells[key].get("provenance"), prov, f"{path} cell {key}")
-            if not trace or trace_ok(trace_path(out, key), h):
+            missing = [n for n, want, ok in (("trace", trace, lambda: trace_ok(trace_path(out, key), h)),
+                                             ("owner", owner_ops, lambda: owner_ok(owner_path(out, key), h)))
+                       if want and not ok()]
+            if not missing:
                 say(f"{label} {key}: done, skipped")
                 continue
             old_cell = cells[key]
-            say(f"{label} {key}: done, but its trace file is missing: rerunning with the trace")
+            say(f"{label} {key}: done, but its {' and '.join(missing)} file is missing: rerunning")
         t1 = time.perf_counter()
         mdir, mdl = model_at_tau(model_dir, model, tau, fpr, out / "models" / f"fpr-{fpr:g}",
                                  "policy-sweep: same weights, tau at target_fpr on val")
         rec, runs = run_cell(df, mdl, mdir, tm_c, cfg, seed, n_jobs=n_jobs, threat_path=threat_path,
-                             per_target=True, trace=trace)
+                             per_target=True, trace=trace, owner_ops=owner_ops)
         usd_uplift(rec, cfg.confidence, seed, cfg.one_sided, N_BOOT)
         if old_cell is not None:
             new_runs = json.loads(json.dumps(rec["runs"]))
             if new_runs != old_cell.get("runs"):
                 bad = sorted(k for k in set(new_runs) | set(old_cell.get("runs") or {})
                              if new_runs.get(k) != (old_cell.get("runs") or {}).get(k))
-                raise ValueError(f"{path} cell {key}: the rerun for the trace differs from the stored record in runs "
-                                 f"{bad}; nothing overwritten (the trace would not describe the stored numbers)")
+                raise ValueError(f"{path} cell {key}: the rerun for the trace / owner file differs from the stored "
+                                 f"record in runs {bad}; nothing overwritten (the file would not describe the stored "
+                                 "numbers)")
         cell = {"key": key, "config_hash": h, "target_fpr": fpr, "tau": tau, "reaction": rname,
                 "max_declines": sp["max_declines"], "tau_after_decline": tau2, "corridor": corr,
                 "recon_budget_ops": int(tm_c.recon_budget_ops), **rec,
@@ -382,6 +392,9 @@ def policy_sweep(df, model, model_dir, label: str, tm, corridor_tm, cfg, *, fprs
                 "key": key, "config_hash": h, "label": label, "model_json_sha256": model_sha, "tau": tau,
                 "tau_decision": float(mdl.tau), "tau_esc": tau_esc, "tau_after_decline": tau2, "max_declines": sp["max_declines"], "corridor": corr,
                 "provenance": prov, "runs": {k: run_trace(r, merchants) for k, r in runs.items()}})
+        if owner_ops:
+            write_owner(owner_path(out, key), {"key": key, "config_hash": h, "label": label,
+                                               "model_json_sha256": model_sha, "provenance": prov, **cell_owner(runs)})
         cells[key] = cell
         say(f"{label} {key}: U {100 * cell['U']:.1f} % ({cell['worst_run']}), U$ {cell['U_usd']:.0f} $, mean uplift "
             f"{100 * cell['mean_uplift']:.1f} %, test recall {cell['test_recall']:.4f}, {cell['wall_seconds']} s")
