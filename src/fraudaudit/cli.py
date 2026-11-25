@@ -212,6 +212,14 @@ def build_parser() -> argparse.ArgumentParser:
                     help="budget on which H is decided (default 20000, Task 19c; 50000 – Task 27f H50, R46) or 'none' "
                          "for a descriptive run without a verdict (Task 27e, seeds 4-9)")
 
+    bf = sub.add_parser("budget-figure", help="R45 (6) / R52 (7): figure dU of the budget sensitivity on the 12 cells "
+                                             "of three families from budget-sensitivity.json files (seeds 1-3 + Task 27e)")
+    bf.add_argument("--gate", type=Path, action="append", required=True,
+                    help="budget-sensitivity.json on the gate seeds 1-3 (repeatable; 19c, 19c-t24, 27f)")
+    bf.add_argument("--fresh", type=Path, action="append", default=[],
+                    help="descriptive budget-sensitivity.json on fresh seeds (repeatable; Task 27e)")
+    bf.add_argument("--out", type=Path, default=Path("out/t27-chain1/summary-du"))
+
     se = sub.add_parser("seed-extension", help="Task 27a: the front cells on fresh seeds (e.g. 10-15) next to the "
                                               "earlier confirmation seeds (4-9); descriptive, no verdict")
     se.add_argument("--cell", action="append", required=True, metavar="LABEL,KEY,GRID,EARLIER,FRESH",
@@ -792,6 +800,17 @@ def cmd_budget_sensitivity(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_budget_figure(args: argparse.Namespace) -> int:
+    from fraudaudit.budget_figure import figure
+    try:
+        figure(args.gate, args.fresh, args.out, meta={**git_info(), "platform": platform.platform()})
+    except (OSError, ValueError, KeyError) as e:
+        print(f"error: budget-figure: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    print((args.out / "budget-du.md").read_text(encoding="utf-8"), flush=True)
+    return 0
+
+
 def cmd_policy_summary(args: argparse.Namespace) -> int:
     from fraudaudit.policy_summary import summarize
     try:
@@ -911,6 +930,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_policy_sweep(args)
     if args.command == "budget-sensitivity":
         return cmd_budget_sensitivity(args)
+    if args.command == "budget-figure":
+        return cmd_budget_figure(args)
     if args.command == "seed-extension":
         return cmd_seed_extension(args)
     if args.command == "md-study":
