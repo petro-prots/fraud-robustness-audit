@@ -1,0 +1,204 @@
+name: Robustness audit
+
+on:
+  pull_request:
+    paths:
+      - models/**
+      - models-hardened-m3/**
+      - policies/**
+      - threat-models/**
+      - gate.yaml
+      - gate-positive-control.yaml
+      - src/**
+      - tests/**
+      - scripts/**
+      - requirements.txt
+      - Dockerfile
+      - .github/workflows/audit.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IMAGE: fraudaudit:runtime
+      # the PR head, not the synthetic merge commit (github.sha): reports record the code under audit
+      GIT_SHA: ${{ github.event.pull_request.head.sha }}
+      GIT_DIRTY: "false"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # pull_request caches are scoped per PR (a new PR downloads once); accepted, no extra triggers
+      - name: Restore Sparkov data cache
+        id: cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: data
+          # the SHA-256 hashes of both files live in the script, so a new dataset version changes the key
+          key: sparkov-${{ hashFiles('scripts/download_data.sh') }}
+
+      - name: Download data (SHA-256 verified)
+        run: scripts/download_data.sh
+
+      # right after the verified download, so a red gate later still saves the cache; never saves a failed download
+      - name: Save Sparkov data cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: data
+          key: sparkov-${{ hashFiles('scripts/download_data.sh') }}
+
+      - name: Build image (runtime stage)
+        run: docker build --target runtime -t "$IMAGE" .
+
+      - name: Tests
+        run: docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app --entrypoint pytest "$IMAGE" -q
+
+      - name: Skew check
+        run: |
+          mkdir -p out
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app \
+            -e GITHUB_STEP_SUMMARY=/app/out/step-summary-skew.md -e GIT_SHA -e GIT_DIRTY \
+            "$IMAGE" skew --data data --model models --cards 50 --n-jobs "$(nproc)" --out out/skew.json
+
+      - name: Robustness audit (gate)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app \
+            -e GITHUB_STEP_SUMMARY=/app/out/step-summary-audit.md -e GIT_SHA -e GIT_DIRTY \
+            "$IMAGE" audit --data data --model models --threat threat-models/realistic.yaml --gate gate.yaml \
+            --skew-report out/skew.json --out out/ --seed 42 --n-jobs "$(nproc)"
+
+      - name: Job summary
+        if: always()
+        run: |
+          for f in out/step-summary-skew.md out/step-summary-audit.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      - name: Upload audit output
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: audit-out
+          path: out/
+          if-no-files-found: warn
+
+  # Positive control (R30): the same audit on models/ with the replay attack, which re-executes every real test
+  # episode unchanged (uplift 0 by construction). It must be GREEN: a red verdict here means the gate's decision
+  # chain is broken. The gate job above stays the gate of record.
+  positive-control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      IMAGE: fraudaudit:runtime
+      GIT_SHA: ${{ github.event.pull_request.head.sha }}
+      GIT_DIRTY: "false"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Restore Sparkov data cache
+        id: cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: data
+          key: sparkov-${{ hashFiles('scripts/download_data.sh') }}
+
+      - name: Download data (SHA-256 verified)
+        run: scripts/download_data.sh
+
+      - name: Build image (runtime stage)
+        run: docker build --target runtime -t "$IMAGE" .
+
+      - name: Positive control (must pass)
+        run: |
+          mkdir -p out-pc
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app \
+            -e GITHUB_STEP_SUMMARY=/app/out-pc/step-summary.md -e GIT_SHA -e GIT_DIRTY \
+            "$IMAGE" audit --data data --model models --threat threat-models/realistic.yaml \
+            --gate gate-positive-control.yaml --no-baseline --out out-pc/ --seed 42 --n-jobs "$(nproc)"
+
+      - name: Job summary
+        if: always()
+        run: if [ -f out-pc/step-summary.md ]; then cat out-pc/step-summary.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload positive-control output
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: positive-control-out
+          path: out-pc/
+          if-no-files-found: warn
+
+  # Bank policy and bar as parameters of the gate (R33): the bank chooses the policy (policies/*.yaml) and the bar δ′; the
+  # gate checks them on the hardened M3. The bar follows the margin rule: δ′ ≥ U + X, with U = 21.9 % measured for this
+  # policy (Task 19b, seeds 1–3) and X = 5.98 pp (the largest worsening on seeds 4–9), i.e. 27.9 % → 28 %. It is chosen
+  # with the margin so that a green run is not a lucky draw. Not the gate of record: that is the `audit` job (δ = 10 %).
+  policy-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IMAGE: fraudaudit:runtime
+      GIT_SHA: ${{ github.event.pull_request.head.sha }}
+      GIT_DIRTY: "false"
+      MODEL: models-hardened-m3
+      POLICY: policies/strict-to-fraud.yaml
+      THREAT: threat-models/realistic-corridor-v1v2.yaml  # base of the corridor settings; the policy replaces κ and q
+      DELTA: "0.28"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Restore Sparkov data cache
+        id: cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: data
+          key: sparkov-${{ hashFiles('scripts/download_data.sh') }}
+
+      - name: Download data (SHA-256 verified)
+        run: scripts/download_data.sh
+
+      - name: Build image (runtime stage)
+        run: docker build --target runtime -t "$IMAGE" .
+
+      - name: Skew check
+        run: |
+          mkdir -p out-policy
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app \
+            -e GITHUB_STEP_SUMMARY=/app/out-policy/step-summary-skew.md -e GIT_SHA -e GIT_DIRTY \
+            "$IMAGE" skew --data data --model "$MODEL" --cards 50 --n-jobs "$(nproc)" --out out-policy/skew.json
+
+      - name: Robustness audit under the bank policy (gate)
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/app -w /app \
+            -e GITHUB_STEP_SUMMARY=/app/out-policy/step-summary-audit.md -e GIT_SHA -e GIT_DIRTY \
+            "$IMAGE" audit --data data --model "$MODEL" --threat "$THREAT" --policy "$POLICY" --delta "$DELTA" \
+            --gate gate.yaml --skew-report out-policy/skew.json --no-baseline --out out-policy/ --seed 42 \
+            --n-jobs "$(nproc)"
+
+      - name: Job summary
+        if: always()
+        run: |
+          for f in out-policy/step-summary-skew.md out-policy/step-summary-audit.md; do
+            if [ -f "$f" ]; then cat "$f" >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+
+      - name: Upload audit output
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: policy-gate-out
+          path: out-policy/
+          if-no-files-found: warn

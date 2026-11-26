@@ -1,0 +1,8 @@
+target_fpr: 0.01          # per-operation FPR at which the model's τ was chosen (checked against models/model.json)
+recall_clean_min: 0.5     # recall on clean test operations at τ
+delta: 0.10   # approved by the author 2026-11-15 after calibration (resolution 4.1 pp on 218 episodes); fixed before hardening
+attacks: [random, es, stepwise]  # attack ensemble: the verdict is the worst run; only stepwise is held out (random search is now used in hardening generation)
+attack_seeds: [4, 5, 6, 7, 8, 9]  # fresh seeds for the confirmation of the Pareto front (Task 19b, R32); everything else equals gate.yaml
+confidence: 0.95          # level of all intervals
+one_sided: true           # uplift: one-sided upper bound (only uplift ≤ δ is tested); VER intervals stay two-sided
+spares_period: fit        # recon spares = fit-period fraud episodes; targets = every test episode (R14); test = old 50/50 split

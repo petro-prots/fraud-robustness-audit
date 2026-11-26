@@ -1,0 +1,7 @@
+data/
+.superpowers/
+out/
+__pycache__/
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/

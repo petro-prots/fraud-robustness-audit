@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "sha256": {
+    "encoder.json": "09f96aca430cea603ab149695bfb1d7f59536d80a4f9e950d85dd3e90acca9fc",
+    "iforest.skops": "9460427c268e5588bd622e3b2608076609b34a5c3b4415fc13813111b7a95be8",
+    "mlp.keras": "f410693b4d06f994e5016c6c669a965cfc2f6b5e9ed7791677d79dfd33168a1a",
+    "model.json": "6c66211e21eb5b627db264f5bcb8cab2a28747bece170f1ab1e0f3721d261fec",
+    "scaler.skops": "5649496b5bba8f216ba2f77a2bac1430908add108a09429162cdda433c0dff99"
+  }
+}
