@@ -274,6 +274,13 @@ def build_parser() -> argparse.ArgumentParser:
     ad.add_argument("--out", type=Path, required=True,
                     help="directory: repro.json / repro.md are updated with this comparison")
 
+    pd_ = sub.add_parser("paired-diff", help="R57 (5): paired difference of the worst run among a subset of attacks "
+                                             "vs the replays of the conventional audit, from stored audit.json; descriptive")
+    pd_.add_argument("--audit", nargs=2, action="append", required=True, metavar=("LABEL", "AUDIT_JSON"),
+                     help="label and audit.json with a baseline (repeatable)")
+    pd_.add_argument("--attacks", nargs="+", required=True, help="attack names of the subset, e.g. random es")
+    pd_.add_argument("--out", type=Path, required=True, help="path without suffix: writes .json and .md")
+
     decide = sub.add_parser("decide", help="decide JSONL operations with the serving path")
     decide.add_argument("--data", type=Path, default=Path("data"), help="card history (before the first input ts)")
     decide.add_argument("--model", type=Path, default=Path("models"))
@@ -816,6 +823,21 @@ def cmd_owner_ops(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paired_diff(args: argparse.Namespace) -> int:
+    from fraudaudit.paired_diff import write
+    try:
+        res = write([(label, Path(p)) for label, p in args.audit], args.attacks, args.out, code=git_info())
+    except (ValueError, KeyError, OSError) as e:
+        print(f"error: paired-diff: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+    for label, r in res["audits"].items():
+        i, ii = r["adv_minus_replay"], r["replay_max_minus_adv"]
+        print(f"{label}: worst {r['worst_run']}; (i) {100 * i['mean']:+.1f} pp [{100 * i['lower']:+.1f}; "
+              f"{100 * i['upper']:+.1f}] {i['word']}; (ii) {100 * ii['mean']:+.1f} pp [{100 * ii['lower']:+.1f}; "
+              f"{100 * ii['upper']:+.1f}] {ii['word']}", flush=True)
+    return 0
+
+
 def cmd_audit_diff(args: argparse.Namespace) -> int:
     from fraudaudit.audit_diff import add_comparison
     try:
@@ -994,6 +1016,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_passed_scores(args)
     if args.command == "owner-ops":
         return cmd_owner_ops(args)
+    if args.command == "paired-diff":
+        return cmd_paired_diff(args)
     if args.command == "audit-diff":
         return cmd_audit_diff(args)
     if args.command == "policy-summary":
